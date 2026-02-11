@@ -2,6 +2,10 @@
 
 One-page operating guide for many agents and many panes.
 
+This document is intentionally complementary to `docs/swarm-playbook.md`.
+- `docs/swarm-playbook.md`: canonical Robot/MCP operating loop and command contract.
+- `docs/swarm-runbook.md` (this file): team operating model, naming, ownership, and ultra-simple wrappers.
+
 ## 0) Ultra-Simple Mode (recommended)
 
 If full `ft robot ...` feels too heavy, use the wrappers:
@@ -16,6 +20,8 @@ Then operate with 5 commands only:
 - `frtail <pane_id> [lines]` -> show pane context
 - `frsend <pane_id> "<cmd>" [pattern] [timeout]` -> dry-run + execute + verify
 - `frfix <pane_id> [cmd] [pattern] [timeout]` -> diagnose pane, optionally execute fix
+
+For the full canonical Robot/MCP loop, use `docs/swarm-playbook.md`.
 
 ## 1) Naming Convention
 
@@ -78,27 +84,13 @@ Run watcher once:
 ft watch --auto-handle --foreground
 ```
 
-Then repeat this loop:
-1. Map current swarm:
-```bash
-ft robot --format toon state
-```
-2. Pull incident queue:
-```bash
-ft robot --format toon events --unhandled --limit 50
-```
-3. Pick top incident (highest risk first).
-4. Open context:
-```bash
-ft robot --format toon get-text <pane_id> --tail 150
-```
-5. Execute safe action:
-```bash
-ft robot --format toon send <pane_id> "<cmd>" --dry-run
-ft robot --format toon send <pane_id> "<cmd>" --wait-for "<pattern>" --timeout-secs 600
-```
-6. Verify result via `events` and `search`.
-7. Release reservation.
+Then follow the canonical loop from `docs/swarm-playbook.md`.
+
+Operator responsibility in this runbook:
+1. Keep aliases/bookmarks consistent.
+2. Enforce reservations before mutating actions.
+3. Prioritize incidents by severity.
+4. Ensure clean handoff between shifts.
 
 ## 5) Incident Priority
 
@@ -108,28 +100,19 @@ Process in this order:
 3. usage/rate limit events
 4. warnings/noise
 
-## 6) Standard Playbooks
+## 6) Standard Playbooks (Operational)
 
 ### A) Build/Test failure
-```bash
-ft robot --format toon search "error OR panic OR failed" --pane <pane_id> --limit 20
-ft robot --format toon send <pane_id> "cargo test -- --nocapture" --wait-for "test result:" --timeout-secs 1800
-```
+Use canonical loop from `docs/swarm-playbook.md`; add this operator rule:
+- annotate/triage the event before reassignment.
 
 ### B) Agent appears stuck
-```bash
-ft robot --format toon get-text <pane_id> --tail 200
-ft robot --format toon wait-for <pane_id> ">" --timeout-secs 60
-```
-If no progress, send controlled nudge:
-```bash
-ft robot --format toon send <pane_id> "status" --wait-for "status" --timeout-secs 120
-```
+Use canonical loop from `docs/swarm-playbook.md`; add this operator rule:
+- if stuck > 10 min, reassign with updated `owner_id` and reason.
 
 ### C) Usage limit handling
-```bash
-ft robot --format toon workflow run handle_usage_limits <pane_id>
-```
+Use canonical loop from `docs/swarm-playbook.md`; add this operator rule:
+- mark as capacity incident and log next reset window in handoff.
 
 ## 7) Shift Handoff Template
 
@@ -150,12 +133,7 @@ Reservations:
 - <reservation_id> | <agent_id> | pane <id> | expires <ts>
 ```
 
-## 8) Minimal Command Set (memorize)
+## 8) Source of Truth
 
-- `ft robot --format toon state`
-- `ft robot --format toon events --unhandled --limit 50`
-- `ft robot --format toon get-text <pane_id> --tail 150`
-- `ft robot --format toon send <pane_id> "<cmd>" --dry-run`
-- `ft robot --format toon send <pane_id> "<cmd>" --wait-for "<pattern>" --timeout-secs 600`
-- `ft robot --format toon reservations reserve ...`
-- `ft robot --format toon reservations release <reservation_id>`
+- Canonical Robot/MCP flow: `docs/swarm-playbook.md`
+- Wrapper commands and team conventions: this file
