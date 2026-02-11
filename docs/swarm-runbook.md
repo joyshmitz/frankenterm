@@ -11,14 +11,19 @@ This document is intentionally complementary to `docs/swarm-playbook.md`.
 If full `ft robot ...` feels too heavy, use the wrappers:
 
 ```bash
-source /Users/sd/projects/joyshmitz/frankenterm/scripts/ft-easy-aliases.sh
+# from repo root
+source scripts/ft-easy-aliases.sh
+
+# or from anywhere (set once)
+export FT_HOME="/absolute/path/to/frankenterm"
+source "$FT_HOME/scripts/ft-easy-aliases.sh"
 ```
 
 Then operate with 5 commands only:
 - `frstart` -> start watcher with auto-handle
 - `frnow` -> show state + unhandled events
 - `frtail <pane_id> [lines]` -> show pane context
-- `frsend <pane_id> "<cmd>" [pattern] [timeout]` -> dry-run + execute + verify
+- `frsend <pane_id> "<cmd>" [pattern] [timeout]` -> dry-run + execute (verify if pattern provided)
 - `frfix <pane_id> [cmd] [pattern] [timeout]` -> diagnose pane, optionally execute fix
 
 For the full canonical Robot/MCP loop, use `docs/swarm-playbook.md`.

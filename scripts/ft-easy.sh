@@ -18,10 +18,20 @@ Usage:
 Examples:
   ft-easy now
   ft-easy tail 3 120
+  ft-easy safe-send 3 "cargo test -- --nocapture"
   ft-easy safe-send 3 "cargo test -- --nocapture" "test result:" 1800
   ft-easy fix 3
+  ft-easy fix 3 "cargo check --all-targets"
   ft-easy fix 3 "cargo check --all-targets" "Finished" 900
 EOF
+}
+
+require_ft_bin() {
+  if ! command -v "$FT_BIN" >/dev/null 2>&1; then
+    echo "ft-easy error: FT binary not found: $FT_BIN" >&2
+    echo "Set FT_BIN=<path-to-ft> or add 'ft' to PATH." >&2
+    exit 127
+  fi
 }
 
 robot() {
@@ -49,20 +59,24 @@ cmd_tail() {
 cmd_safe_send() {
   local pane_id="$1"
   local command="$2"
-  local pattern="${3:-Done}"
+  local pattern="${3:-}"
   local timeout="${4:-600}"
 
   echo "== dry-run =="
   robot send "$pane_id" "$command" --dry-run
   echo
   echo "== execute =="
-  robot send "$pane_id" "$command" --wait-for "$pattern" --timeout-secs "$timeout"
+  if [[ -n "$pattern" ]]; then
+    robot send "$pane_id" "$command" --wait-for "$pattern" --timeout-secs "$timeout"
+  else
+    robot send "$pane_id" "$command"
+  fi
 }
 
 cmd_fix() {
   local pane_id="$1"
   local command="${2:-}"
-  local pattern="${3:-Done}"
+  local pattern="${3:-}"
   local timeout="${4:-600}"
 
   echo "== context =="
@@ -101,14 +115,14 @@ main() {
         usage
         exit 2
       }
-      cmd_safe_send "$2" "$3" "${4:-Done}" "${5:-600}"
+      cmd_safe_send "$2" "$3" "${4:-}" "${5:-600}"
       ;;
     fix)
       [[ $# -ge 2 ]] || {
         usage
         exit 2
       }
-      cmd_fix "$2" "${3:-}" "${4:-Done}" "${5:-600}"
+      cmd_fix "$2" "${3:-}" "${4:-}" "${5:-600}"
       ;;
     help|-h|--help)
       usage
@@ -121,4 +135,5 @@ main() {
   esac
 }
 
+require_ft_bin
 main "$@"
