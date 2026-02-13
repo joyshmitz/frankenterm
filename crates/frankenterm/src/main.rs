@@ -10650,11 +10650,11 @@ async fn run_watcher(
         }
     }
 
-    if let Some(distributed_listener_handle) = distributed_listener_handle {
-        let _ = distributed_listener_handle.await;
-    }
+        if let Some(distributed_listener_handle) = distributed_listener_handle {
+            let _ = distributed_listener_handle.await;
+        }
 
-    tracing::info!("Watcher shutdown complete");
+        tracing::info!("Watcher shutdown complete");
 
     if let Some(backup_handle) = scheduled_backup_handle {
         let _ = backup_handle.await;
