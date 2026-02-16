@@ -65,6 +65,16 @@ assert_eq() {
     fi
 }
 
+assert_float_close() {
+    local actual="$1"
+    local expected="$2"
+    local msg="$3"
+    if ! awk -v a="$actual" -v b="$expected" 'BEGIN { d = a - b; if (d < 0) d = -d; exit (d <= 0.000001 ? 0 : 1) }'; then
+        echo "[test_visual_artifact_detector] assert failed: $msg (actual=$actual expected=$expected)" >&2
+        exit 1
+    fi
+}
+
 run_detector_expect() {
     local expected_rc="$1"
     shift
@@ -79,6 +89,10 @@ run_detector_expect() {
 make_scenario "healthy_case" 200 1 2 10 14 18 0
 make_scenario "warning_case" 200 8 20 10 24 34 2
 make_scenario "failing_case" 200 32 60 10 28 60 8
+cat > "$SCENARIOS_DIR/failing_case/failure_signature.json" <<EOF
+{"schema_version":"wa.failure_signature.v1","signature":"seeded_failure"}
+EOF
+_e2e_emit_visual_artifact_report "failing_case" "$SCENARIOS_DIR/failing_case" 1000
 
 run_detector_expect 2
 
@@ -87,15 +101,23 @@ assert_eq "$(jq -r '.status' "$SUMMARY")" "fail" "summary status after fail case
 assert_eq "$(jq -r '.counts.fail' "$SUMMARY")" "1" "fail count"
 assert_eq "$(jq -r '.counts.warn' "$SUMMARY")" "1" "warn count"
 assert_eq "$(jq -r '.counts.pass' "$SUMMARY")" "1" "pass count"
+assert_eq "$(jq -r '.quality.false_positive_estimate.numerator' "$SUMMARY")" "1" "fp numerator after mixed alerts"
+assert_eq "$(jq -r '.quality.false_positive_estimate.denominator' "$SUMMARY")" "2" "fp denominator after mixed alerts"
+assert_float_close "$(jq -r '.quality.false_positive_estimate.rate' "$SUMMARY")" "0.5" "fp rate after mixed alerts"
+assert_eq "$(jq -r '.trend.sample_count' "$SUMMARY")" "1" "trend sample count after first run"
 
 # Remove failing scenario report; strict warn should now fail with exit code 1.
 rm -f "$SCENARIOS_DIR/failing_case/visual_artifact_report.json"
 run_detector_expect 1 --strict-warn
 assert_eq "$(jq -r '.status' "$SUMMARY")" "warn" "summary status after removing fail case"
+assert_float_close "$(jq -r '.quality.false_positive_estimate.rate' "$SUMMARY")" "1" "fp rate with warn-only alerts"
+assert_eq "$(jq -r '.trend.sample_count' "$SUMMARY")" "2" "trend sample count after second run"
 
 # Remove warning scenario report; strict warn should pass.
 rm -f "$SCENARIOS_DIR/warning_case/visual_artifact_report.json"
 run_detector_expect 0 --strict-warn
 assert_eq "$(jq -r '.status' "$SUMMARY")" "pass" "summary status after removing warn case"
+assert_eq "$(jq -r '.quality.false_positive_estimate.denominator' "$SUMMARY")" "0" "fp denominator with no alerts"
+assert_eq "$(jq -r '.trend.sample_count' "$SUMMARY")" "3" "trend sample count after third run"
 
 echo "[test_visual_artifact_detector] PASS"

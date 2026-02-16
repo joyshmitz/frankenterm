@@ -384,21 +384,21 @@ run_self_check() {
         all_passed=false
     fi
 
-    # Check 3: wa binary
+    # Check 3: ft binary
     local ft_binary="$PROJECT_ROOT/target/release/ft"
     if [[ -x "$ft_binary" ]]; then
-        local wa_version
-        wa_version=$("$ft_binary" --version 2>/dev/null | head -1 || echo "unknown")
-        check_pass "wa binary: $ft_binary ($wa_version)"
+        local binary_version
+        binary_version=$("$ft_binary" --version 2>/dev/null | head -1 || echo "unknown")
+        check_pass "ft binary: $ft_binary ($binary_version)"
     else
         # Try debug build
-        ft_binary="$PROJECT_ROOT/target/debug/wa"
+        ft_binary="$PROJECT_ROOT/target/debug/ft"
         if [[ -x "$ft_binary" ]]; then
-            local wa_version
-            wa_version=$("$ft_binary" --version 2>/dev/null | head -1 || echo "unknown")
-            check_pass "wa binary (debug): $ft_binary ($wa_version)"
+            local binary_version
+            binary_version=$("$ft_binary" --version 2>/dev/null | head -1 || echo "unknown")
+            check_pass "ft binary (debug): $ft_binary ($binary_version)"
         else
-            check_fail "wa binary not found"
+            check_fail "ft binary not found"
             echo "       Hint: Run 'cargo build --release' or 'cargo build'"
             all_passed=false
         fi
@@ -1937,7 +1937,7 @@ EOF
 }
 
 # ==============================================================================
-# WA Binary
+# ft Binary
 # ==============================================================================
 
 FT_BINARY=""
@@ -1945,8 +1945,8 @@ FT_BINARY=""
 find_ft_binary() {
     if [[ -x "$PROJECT_ROOT/target/release/ft" ]]; then
         FT_BINARY="$PROJECT_ROOT/target/release/ft"
-    elif [[ -x "$PROJECT_ROOT/target/debug/wa" ]]; then
-        FT_BINARY="$PROJECT_ROOT/target/debug/wa"
+    elif [[ -x "$PROJECT_ROOT/target/debug/ft" ]]; then
+        FT_BINARY="$PROJECT_ROOT/target/debug/ft"
     else
         return 1
     fi
@@ -10535,12 +10535,12 @@ main() {
         load_soak_resume_checkpoint "$scenarios_json"
     fi
 
-    # Find wa binary
+    # Find ft binary
     if ! find_ft_binary; then
-        log_fail "Could not find wa binary"
+        log_fail "Could not find ft binary"
         exit 5
     fi
-    log_verbose "Using wa binary: $FT_BINARY"
+    log_verbose "Using ft binary: $FT_BINARY"
 
     # Setup artifacts
     setup_artifacts

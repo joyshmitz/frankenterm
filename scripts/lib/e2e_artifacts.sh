@@ -38,6 +38,9 @@ set -euo pipefail
 # Configuration
 # ==============================================================================
 
+# Library location (used for helper script discovery)
+E2E_ARTIFACTS_LIB_DIR="${E2E_ARTIFACTS_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+
 # Default artifacts base (can be overridden)
 E2E_ARTIFACTS_BASE="${E2E_ARTIFACTS_BASE:-${PROJECT_ROOT:-$(pwd)}/e2e-artifacts}"
 
@@ -53,6 +56,12 @@ E2E_REDACT_PATTERNS="${E2E_REDACT_PATTERNS:-}"
 # Canonical artifact schemas
 E2E_TEST_ARTIFACT_SCHEMA_VERSION="${E2E_TEST_ARTIFACT_SCHEMA_VERSION:-wa.test_artifacts.v1}"
 E2E_TEST_SUMMARY_SCHEMA_VERSION="${E2E_TEST_SUMMARY_SCHEMA_VERSION:-wa.e2e.summary.v2}"
+
+# Visual artifact detector integration (best-effort by default)
+E2E_VISUAL_DETECTOR_SCRIPT="${E2E_VISUAL_DETECTOR_SCRIPT:-$E2E_ARTIFACTS_LIB_DIR/../check_visual_artifact_detector.sh}"
+E2E_VISUAL_DETECTOR_ENFORCE="${E2E_VISUAL_DETECTOR_ENFORCE:-false}"
+E2E_VISUAL_DETECTOR_STRICT_WARN="${E2E_VISUAL_DETECTOR_STRICT_WARN:-false}"
+E2E_VISUAL_ARTIFACT_TREND_WINDOW="${E2E_VISUAL_ARTIFACT_TREND_WINDOW:-20}"
 
 # Internal state (use global variables that survive across function calls)
 # These are deliberately NOT local - they need to persist
@@ -1047,6 +1056,54 @@ EOF
 # Finalization
 # ==============================================================================
 
+_e2e_run_visual_artifact_detector() {
+    local run_dir="$1"
+    local summary_path="$run_dir/visual_artifact_summary.json"
+    local detector_log="$run_dir/visual_artifact_detector.log"
+    local history_file="${E2E_VISUAL_ARTIFACT_HISTORY_FILE:-$run_dir/visual_artifact_history.jsonl}"
+    local script_path="$E2E_VISUAL_DETECTOR_SCRIPT"
+    local detector_status="not_run"
+    local detector_exit=0
+
+    if [[ ! -x "$script_path" ]]; then
+        echo "$detector_status|$detector_exit|||"
+        return 0
+    fi
+
+    local -a detector_cmd=(
+        "$script_path"
+        --run-dir "$run_dir"
+        --output "$summary_path"
+        --history-file "$history_file"
+        --trend-window "$E2E_VISUAL_ARTIFACT_TREND_WINDOW"
+    )
+
+    if [[ "$E2E_VISUAL_DETECTOR_STRICT_WARN" == "true" || "$E2E_VISUAL_DETECTOR_STRICT_WARN" == "1" ]]; then
+        detector_cmd+=(--strict-warn)
+    fi
+
+    set +e
+    "${detector_cmd[@]}" >"$detector_log" 2>&1
+    detector_exit=$?
+    set -e
+
+    case "$detector_exit" in
+        0) detector_status="pass" ;;
+        1) detector_status="warn" ;;
+        2) detector_status="fail" ;;
+        *) detector_status="error" ;;
+    esac
+
+    local summary_rel=""
+    local detector_log_rel=""
+    local history_rel=""
+    [[ -f "$summary_path" ]] && summary_rel="$(basename "$summary_path")"
+    [[ -f "$detector_log" ]] && detector_log_rel="$(basename "$detector_log")"
+    [[ -f "$history_file" ]] && history_rel="$(basename "$history_file")"
+
+    echo "$detector_status|$detector_exit|$summary_rel|$detector_log_rel|$history_rel"
+}
+
 # Finalize artifacts and write manifest
 # Usage: e2e_finalize [overall_exit_code]
 e2e_finalize() {
@@ -1100,6 +1157,28 @@ e2e_finalize() {
         ((scenario_index++))
     done
 
+    local visual_detector_status="not_run"
+    local visual_detector_exit=0
+    local visual_summary_rel=""
+    local visual_detector_log_rel=""
+    local visual_history_rel=""
+    local visual_detector_info=""
+    visual_detector_info=$(_e2e_run_visual_artifact_detector "$E2E_RUN_DIR")
+    IFS='|' read -r visual_detector_status visual_detector_exit visual_summary_rel visual_detector_log_rel visual_history_rel <<< "$visual_detector_info"
+
+    local visual_summary_json="null"
+    local visual_detector_log_json="null"
+    local visual_history_json="null"
+    [[ -n "$visual_summary_rel" ]] && visual_summary_json="\"$visual_summary_rel\""
+    [[ -n "$visual_detector_log_rel" ]] && visual_detector_log_json="\"$visual_detector_log_rel\""
+    [[ -n "$visual_history_rel" ]] && visual_history_json="\"$visual_history_rel\""
+
+    if [[ "$E2E_VISUAL_DETECTOR_ENFORCE" == "true" || "$E2E_VISUAL_DETECTOR_ENFORCE" == "1" ]]; then
+        if [[ "$overall_exit" -eq 0 && "$visual_detector_exit" -ne 0 ]]; then
+            overall_exit="$visual_detector_exit"
+        fi
+    fi
+
     cat > "$manifest_file" <<EOF
 {
   "version": "1.0.0",
@@ -1125,11 +1204,15 @@ e2e_finalize() {
     "env": "env.json",
     "manifest": "manifest.json",
     "summary": "summary.json",
+    "visual_artifact_summary": $visual_summary_json,
+    "visual_artifact_detector_log": $visual_detector_log_json,
+    "visual_artifact_history": $visual_history_json,
     "scenarios_dir": "scenarios"
   },
   "settings": {
     "max_file_size": $E2E_MAX_FILE_SIZE,
-    "redact_secrets": $E2E_REDACT_SECRETS
+    "redact_secrets": $E2E_REDACT_SECRETS,
+    "visual_detector_enforce": "$E2E_VISUAL_DETECTOR_ENFORCE"
   }
 }
 EOF
@@ -1145,6 +1228,13 @@ EOF
   "passed": $E2E_PASSED,
   "failed": $E2E_FAILED,
   "skipped": 0,
+  "visual_artifact_detector": {
+    "status": "$visual_detector_status",
+    "exit_code": $visual_detector_exit,
+    "summary_file": $visual_summary_json,
+    "log_file": $visual_detector_log_json,
+    "history_file": $visual_history_json
+  },
   "scenarios": $scenarios_json
 }
 EOF
@@ -1163,6 +1253,7 @@ Total:    $total_scenarios
 Passed:   $E2E_PASSED
 Failed:   $E2E_FAILED
 Duration: ${total_duration_ms}ms
+Visual Detector: ${visual_detector_status} (exit=${visual_detector_exit})
 
 Scenarios
 ---------
@@ -1177,6 +1268,9 @@ EOF
 
     _e2e_info "Artifacts finalized: $E2E_RUN_DIR"
     _e2e_info "Results: $E2E_PASSED passed, $E2E_FAILED failed"
+    if [[ -n "$visual_summary_rel" ]]; then
+        _e2e_info "Visual detector: $visual_detector_status (summary: $visual_summary_rel)"
+    fi
 
     # Print path for CI artifact upload
     echo ""

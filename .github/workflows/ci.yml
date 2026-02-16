@@ -454,6 +454,25 @@ jobs:
           FT_E2E_VERBOSE: "1"
           FT_E2E_KEEP_ARTIFACTS: "1"
 
+      - name: Ensure visual artifact summaries are generated
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ ! -d e2e-artifacts ]]; then
+            echo "No e2e-artifacts directory present; skipping visual summary generation"
+            exit 0
+          fi
+          found=0
+          while IFS= read -r run_dir; do
+            [[ -d "$run_dir/scenarios" ]] || continue
+            found=1
+            echo "Running visual artifact detector for: $run_dir"
+            scripts/check_visual_artifact_detector.sh --run-dir "$run_dir" || true
+          done < <(find e2e-artifacts -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)
+          if [[ "$found" -eq 0 ]]; then
+            echo "No e2e run directories with scenarios found"
+          fi
+
       - name: Summarize approval E2E results
         if: always()
         run: |
@@ -462,6 +481,22 @@ jobs:
             echo '```' >> $GITHUB_STEP_SUMMARY
             tail -10 e2e-approval-output.log >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Visual Artifact Detector" >> $GITHUB_STEP_SUMMARY
+          summaries_found=0
+          while IFS= read -r summary_file; do
+            summaries_found=1
+            run_dir=$(dirname "$summary_file")
+            run_name=$(basename "$run_dir")
+            status=$(jq -r '.status // "unknown"' "$summary_file")
+            alerts=$(jq -r '.counts.alerts // 0' "$summary_file")
+            fp_rate=$(jq -r '.quality.false_positive_estimate.rate // 0' "$summary_file")
+            trend_samples=$(jq -r '.trend.sample_count // 0' "$summary_file")
+            echo "- \`$run_name\`: status=\`$status\`, alerts=$alerts, fp_rate=$fp_rate, trend_samples=$trend_samples" >> $GITHUB_STEP_SUMMARY
+          done < <(find e2e-artifacts -type f -name 'visual_artifact_summary.json' | LC_ALL=C sort)
+          if [[ "$summaries_found" -eq 0 ]]; then
+            echo "- no visual artifact summaries generated" >> $GITHUB_STEP_SUMMARY
           fi
 
       - name: Upload E2E artifacts

@@ -136,25 +136,25 @@ find_ft_binary() {
     # Try release build first, then debug
     for candidate in \
         "$PROJECT_ROOT/target/release/ft" \
-        "$PROJECT_ROOT/target/debug/wa"; do
+        "$PROJECT_ROOT/target/debug/ft"; do
         if [[ -x "$candidate" ]]; then
             FT_BINARY="$candidate"
-            log_pass "wa binary: $FT_BINARY"
+            log_pass "ft binary: $FT_BINARY"
             return 0
         fi
     done
 
     # Build if not found
-    log_info "Building wa binary..."
+    log_info "Building ft binary..."
     if cargo build -p frankenterm --quiet 2>/dev/null; then
-        FT_BINARY="$PROJECT_ROOT/target/debug/wa"
+        FT_BINARY="$PROJECT_ROOT/target/debug/ft"
         if [[ -x "$FT_BINARY" ]]; then
-            log_pass "wa binary built: $FT_BINARY"
+            log_pass "ft binary built: $FT_BINARY"
             return 0
         fi
     fi
 
-    echo -e "${RED}ERROR:${NC} Cannot find or build wa binary" >&2
+    echo -e "${RED}ERROR:${NC} Cannot find or build ft binary" >&2
     exit 5
 }
 
