@@ -598,7 +598,7 @@ mod tests {
         }
         for &k in &[10, 20, 30, 40, 50] {
             let r = treap.rank(&k);
-            let (key, _) = treap.kth(r).unwrap();
+            let (key, ()) = treap.kth(r).unwrap();
             assert_eq!(*key, k);
         }
     }
@@ -725,6 +725,111 @@ mod tests {
         treap.insert(2, "updated".to_string());
         assert_eq!(treap.len(), 3);
         assert_eq!(*treap.get(&2).unwrap(), "updated");
+    }
+
+    #[test]
+    fn contains_key_empty_is_false() {
+        let treap: Treap<i32, ()> = Treap::new();
+        assert!(!treap.contains_key(&0));
+        assert!(!treap.contains_key(&99));
+    }
+
+    #[test]
+    fn get_nonexistent_in_nonempty_treap() {
+        let mut treap = Treap::new();
+        for i in [10, 20, 30, 40] {
+            treap.insert(i, i);
+        }
+        assert!(treap.get(&15).is_none());
+        assert!(treap.get(&50).is_none());
+    }
+
+    #[test]
+    fn remove_root_with_two_children() {
+        let mut treap = Treap::new();
+        treap.insert(2, "root".to_string());
+        treap.insert(1, "left".to_string());
+        treap.insert(3, "right".to_string());
+
+        assert_eq!(treap.remove(&2), Some("root".to_string()));
+        assert_eq!(treap.len(), 2);
+        assert_eq!(*treap.get(&1).unwrap(), "left");
+        assert_eq!(*treap.get(&3).unwrap(), "right");
+        assert!(treap.get(&2).is_none());
+    }
+
+    #[test]
+    fn kth_after_multiple_removals() {
+        let mut treap = Treap::new();
+        for i in 1..=10 {
+            treap.insert(i, i);
+        }
+        for i in [2, 4, 6, 8, 10] {
+            treap.remove(&i);
+        }
+
+        // Remaining sorted keys: 1, 3, 5, 7, 9
+        let remaining = [1, 3, 5, 7, 9];
+        for (idx, expected_key) in remaining.iter().enumerate() {
+            let (k, v) = treap.kth(idx).unwrap();
+            assert_eq!(*k, *expected_key);
+            assert_eq!(*v, *expected_key);
+        }
+        assert!(treap.kth(5).is_none());
+    }
+
+    #[test]
+    fn rank_matches_index_from_sorted_keys() {
+        let mut treap = Treap::new();
+        for i in [12, 7, 19, 3, 15, 1, 9] {
+            treap.insert(i, i * 10);
+        }
+
+        let keys: Vec<i32> = treap.keys().iter().map(|&&k| k).collect();
+        for (idx, key) in keys.iter().enumerate() {
+            assert_eq!(treap.rank(key), idx);
+        }
+    }
+
+    #[test]
+    fn keys_reflect_removals() {
+        let mut treap = Treap::new();
+        for i in 1..=6 {
+            treap.insert(i, i);
+        }
+        treap.remove(&1);
+        treap.remove(&4);
+        treap.remove(&6);
+
+        let keys: Vec<i32> = treap.keys().iter().map(|&&k| k).collect();
+        assert_eq!(keys, vec![2, 3, 5]);
+    }
+
+    #[test]
+    fn with_seed_different_seeds_same_key_order() {
+        let mut t1 = Treap::with_seed(1);
+        let mut t2 = Treap::with_seed(2);
+
+        for i in [30, 10, 50, 20, 40] {
+            t1.insert(i, i);
+            t2.insert(i, i);
+        }
+
+        let keys1: Vec<i32> = t1.keys().iter().map(|&&k| k).collect();
+        let keys2: Vec<i32> = t2.keys().iter().map(|&&k| k).collect();
+        assert_eq!(keys1, vec![10, 20, 30, 40, 50]);
+        assert_eq!(keys1, keys2);
+    }
+
+    #[test]
+    fn serde_roundtrip_empty_treap() {
+        let treap: Treap<i32, i32> = Treap::new();
+        let json = serde_json::to_string(&treap).unwrap();
+        let restored: Treap<i32, i32> = serde_json::from_str(&json).unwrap();
+        assert!(restored.is_empty());
+        assert_eq!(restored.len(), 0);
+        assert!(restored.min().is_none());
+        assert!(restored.max().is_none());
     }
 
     #[test]
