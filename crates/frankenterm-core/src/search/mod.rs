@@ -26,23 +26,23 @@ pub use chunk_vector_store::{
     ChunkVectorStore, ChunkVectorStoreError, SemanticGeneration, SemanticGenerationStatus,
 };
 pub use chunking::{
-    ChunkDirection, ChunkInputEvent, ChunkOverlap, ChunkPolicyConfig, ChunkSourceOffset,
-    RECORDER_CHUNKING_POLICY_V1, SemanticChunk, build_semantic_chunks,
+    build_semantic_chunks, ChunkDirection, ChunkInputEvent, ChunkOverlap, ChunkPolicyConfig,
+    ChunkSourceOffset, SemanticChunk, RECORDER_CHUNKING_POLICY_V1,
 };
 pub use embedder::{EmbedError, Embedder, EmbedderInfo, EmbedderTier};
 pub use hash_embedder::HashEmbedder;
 pub use hybrid_search::{
-    FusedResult, HybridSearchService, SearchMode, TwoTierMetrics, blend_two_tier, kendall_tau,
-    rrf_fuse,
+    blend_two_tier, kendall_tau, rrf_fuse, FusedResult, FusionBackend, HybridSearchService,
+    SearchMode, TwoTierMetrics,
 };
 pub use reranker::{PassthroughReranker, RerankError, Reranker, ScoredDoc};
-pub use vector_index::{FtviIndex, FtviRecord, FtviWriter, write_ftvi_vec};
+pub use vector_index::{write_ftvi_vec, FtviIndex, FtviRecord, FtviWriter};
 
 #[cfg(feature = "semantic-search")]
 pub use fastembed_embedder::FastEmbedEmbedder;
 #[cfg(feature = "semantic-search")]
-pub use model_registry::{ModelInfo, ModelRegistry};
-#[cfg(feature = "semantic-search")]
 pub use model2vec_embedder::Model2VecEmbedder;
+#[cfg(feature = "semantic-search")]
+pub use model_registry::{ModelInfo, ModelRegistry};
 #[cfg(feature = "semantic-search")]
 pub use reranker::CrossEncoderReranker;
