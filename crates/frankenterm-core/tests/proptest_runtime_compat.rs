@@ -161,7 +161,19 @@ proptest! {
             drop(rx);
             let err = runtime_compat::mpsc_send(&tx, val).await;
             assert!(err.is_err(), "send to closed channel must fail");
-            assert_eq!(err.unwrap_err().0, val, "SendError must contain the original value");
+            let send_err = err.unwrap_err();
+
+            #[cfg(feature = "asupersync-runtime")]
+            assert!(
+                matches!(
+                    send_err,
+                    mpsc::SendError::Disconnected(value) if value == val
+                ),
+                "SendError must contain the original value",
+            );
+
+            #[cfg(not(feature = "asupersync-runtime"))]
+            assert_eq!(send_err.0, val, "SendError must contain the original value");
         });
     }
 
