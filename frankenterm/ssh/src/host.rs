@@ -1,6 +1,6 @@
+use crate::runtime::channel::{bounded, Sender};
 use crate::session::SessionEvent;
 use anyhow::Context;
-use smol::channel::{bounded, Sender};
 
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn host_verification_event_debug() {
-        let (tx, _rx) = smol::channel::bounded(1);
+        let (tx, _rx) = bounded(1);
         let event = HostVerificationEvent {
             message: "Trust this host?".to_string(),
             reply: tx,
@@ -95,36 +95,36 @@ mod tests {
 
     #[test]
     fn host_verification_event_try_answer_trust() {
-        let (tx, rx) = smol::channel::bounded(1);
+        let (tx, rx) = bounded(1);
         let event = HostVerificationEvent {
             message: "Trust?".to_string(),
             reply: tx,
         };
         event.try_answer(true).unwrap();
-        let result = smol::block_on(rx.recv()).unwrap();
+        let result = crate::runtime::block_on(rx.recv()).unwrap();
         assert!(result);
     }
 
     #[test]
     fn host_verification_event_try_answer_reject() {
-        let (tx, rx) = smol::channel::bounded(1);
+        let (tx, rx) = bounded(1);
         let event = HostVerificationEvent {
             message: "Trust?".to_string(),
             reply: tx,
         };
         event.try_answer(false).unwrap();
-        let result = smol::block_on(rx.recv()).unwrap();
+        let result = crate::runtime::block_on(rx.recv()).unwrap();
         assert!(!result);
     }
 
     #[test]
     fn host_verification_event_async_answer() {
-        let (tx, rx) = smol::channel::bounded(1);
+        let (tx, rx) = bounded(1);
         let event = HostVerificationEvent {
             message: "Trust?".to_string(),
             reply: tx,
         };
-        smol::block_on(async {
+        crate::runtime::block_on(async {
             event.answer(true).await.unwrap();
             let result = rx.recv().await.unwrap();
             assert!(result);
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn host_verification_event_message_accessible() {
-        let (tx, _rx) = smol::channel::bounded(1);
+        let (tx, _rx) = bounded(1);
         let event = HostVerificationEvent {
             message: "Do you trust this host?".to_string(),
             reply: tx,
@@ -169,12 +169,12 @@ mod tests {
 
     #[test]
     fn host_verification_event_async_reject() {
-        let (tx, rx) = smol::channel::bounded(1);
+        let (tx, rx) = bounded(1);
         let event = HostVerificationEvent {
             message: "Trust?".to_string(),
             reply: tx,
         };
-        smol::block_on(async {
+        crate::runtime::block_on(async {
             event.answer(false).await.unwrap();
             let result = rx.recv().await.unwrap();
             assert!(!result);
@@ -210,7 +210,7 @@ impl crate::sessioninner::SessionInner {
                     }))
                     .context("sending HostVerify request to user")?;
 
-                let trusted = smol::block_on(confirm.recv())
+                let trusted = crate::runtime::block_on(confirm.recv())
                     .context("waiting for host verification confirmation from user")?;
 
                 if !trusted {
@@ -324,7 +324,7 @@ impl crate::sessioninner::SessionInner {
                         }))
                         .context("sending HostVerify request to user")?;
 
-                    let trusted = smol::block_on(confirm.recv())
+                    let trusted = crate::runtime::block_on(confirm.recv())
                         .context("waiting for host verification confirmation from user")?;
 
                     if !trusted {

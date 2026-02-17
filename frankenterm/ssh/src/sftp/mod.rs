@@ -1,10 +1,10 @@
 use super::{SessionRequest, SessionSender};
+use crate::runtime::channel::{bounded, RecvError, Sender};
 use crate::sftp::dir::{Dir, DirRequest};
 use crate::sftp::file::{File, FileRequest};
 use crate::sftp::types::{Metadata, OpenFileType, OpenOptions, RenameOptions, WriteMode};
 use camino::Utf8PathBuf;
 use error::SftpError;
-use smol::channel::{bounded, RecvError, Sender};
 use std::convert::TryInto;
 use std::io;
 use thiserror::Error;

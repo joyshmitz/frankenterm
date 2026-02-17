@@ -12,7 +12,15 @@ publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["libssh-rs", "ssh2"]
+default = ["libssh-rs", "ssh2", "async-smol"]
+async-smol = ["async_ossl/async-io", "frankenterm-uds/async-io"]
+# Transitional: keep smol active until source-level runtime migration lands.
+async-asupersync = [
+    "dep:asupersync",
+    "async_ossl/async-asupersync",
+    "frankenterm-uds/async-asupersync",
+    "async-smol",
+]
 vendored-openssl = ["ssh2/vendored-openssl", "libssh-rs/vendored-openssl"]
 vendored-openssl-ssh2 = ["ssh2/vendored-openssl"]
 vendored-openssl-libssh-rs = ["libssh-rs/vendored-openssl"]
@@ -33,6 +41,7 @@ libssh-rs = {workspace=true, features=["vendored"], optional = true}
 log.workspace = true
 portable-pty.workspace = true
 regex.workspace = true
+asupersync = { workspace = true, optional = true }
 smol.workspace = true
 socket2.workspace = true
 sha2.workspace = true

@@ -43,3 +43,27 @@ pub use sftp::*;
 pub use camino::{Utf8Path, Utf8PathBuf};
 pub use filedescriptor::FileDescriptor;
 pub use portable_pty::{Child, ChildKiller, MasterPty, PtySize};
+
+pub mod runtime {
+    pub mod channel {
+        pub use smol::channel::{bounded, Receiver, RecvError, Sender, TryRecvError};
+    }
+
+    #[cfg(feature = "async-asupersync")]
+    static ASUPERSYNC_RUNTIME: std::sync::LazyLock<asupersync::runtime::Runtime> =
+        std::sync::LazyLock::new(|| {
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("failed to build frankenterm-ssh asupersync runtime")
+        });
+
+    #[cfg(feature = "async-asupersync")]
+    pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        ASUPERSYNC_RUNTIME.block_on(future)
+    }
+
+    #[cfg(not(feature = "async-asupersync"))]
+    pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        smol::block_on(future)
+    }
+}

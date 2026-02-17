@@ -1,5 +1,5 @@
 use super::{Metadata, SessionRequest, SessionSender, SftpChannelResult, SftpRequest};
-use smol::channel::{bounded, Sender};
+use crate::runtime::channel::{bounded, Sender};
 use smol::future::FutureExt;
 use std::future::Future;
 use std::pin::Pin;
