@@ -1,6 +1,6 @@
+use crate::runtime::channel::{bounded, Sender};
 use crate::session::SessionEvent;
 use anyhow::Context;
-use smol::channel::{bounded, Sender};
 
 #[derive(Debug)]
 pub struct AuthenticationPrompt {
@@ -88,7 +88,7 @@ mod tests {
             reply: tx,
         };
         event.try_answer(vec!["secret".to_string()]).unwrap();
-        let result = smol::block_on(rx.recv()).unwrap();
+        let result = crate::runtime::block_on(rx.recv()).unwrap();
         assert_eq!(result, vec!["secret".to_string()]);
     }
 
@@ -110,7 +110,7 @@ mod tests {
             ],
             reply: tx,
         };
-        smol::block_on(async {
+        crate::runtime::block_on(async {
             event
                 .answer(vec!["pass123".to_string(), "123456".to_string()])
                 .await
@@ -169,7 +169,7 @@ mod tests {
             reply: tx,
         };
         event.try_answer(vec![]).unwrap();
-        let result = smol::block_on(rx.recv()).unwrap();
+        let result = crate::runtime::block_on(rx.recv()).unwrap();
         assert!(result.is_empty());
     }
 
@@ -262,7 +262,7 @@ impl crate::sessioninner::SessionInner {
                             }))
                             .context("sending Authenticate request to user")?;
 
-                        let answers = smol::block_on(answers.recv())
+                        let answers = crate::runtime::block_on(answers.recv())
                             .context("waiting for authentication answers from user")?;
 
                         if answers.is_empty() {
@@ -308,7 +308,7 @@ impl crate::sessioninner::SessionInner {
             }))
             .unwrap();
 
-            let mut answers = smol::block_on(answers.recv())
+            let mut answers = crate::runtime::block_on(answers.recv())
                 .context("waiting for authentication answers from user")
                 .unwrap();
             Ok(answers.remove(0))
@@ -358,7 +358,7 @@ impl crate::sessioninner::SessionInner {
                                 }))
                                 .context("sending Authenticate request to user")?;
 
-                            let answers = smol::block_on(answers.recv())
+                            let answers = crate::runtime::block_on(answers.recv())
                                 .context("waiting for authentication answers from user")?;
 
                             sess.userauth_keyboard_interactive_set_answers(&answers)?;
@@ -390,7 +390,7 @@ impl crate::sessioninner::SessionInner {
                     }))
                     .unwrap();
 
-                let mut answers = smol::block_on(answers.recv())
+                let mut answers = crate::runtime::block_on(answers.recv())
                     .context("waiting for authentication answers from user")
                     .unwrap();
                 let pw = answers.remove(0);
@@ -454,7 +454,7 @@ impl crate::sessioninner::SessionInner {
                     }))
                     .context("sending Authenticate request to user")?;
 
-                let answers = smol::block_on(answers.recv())
+                let answers = crate::runtime::block_on(answers.recv())
                     .context("waiting for authentication answers from user")?;
 
                 if answers.is_empty() {
@@ -497,7 +497,7 @@ impl crate::sessioninner::SessionInner {
                             return vec![];
                         }
 
-                        match smol::block_on(answers.recv()) {
+                        match crate::runtime::block_on(answers.recv()) {
                             Err(err) => {
                                 log::error!(
                                     "waiting for authentication answers from user: {:#}",

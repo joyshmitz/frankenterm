@@ -2,11 +2,11 @@ use crate::auth::*;
 use crate::config::ConfigMap;
 use crate::host::*;
 use crate::pty::*;
+use crate::runtime::channel::{bounded, Receiver, Sender};
 use crate::sessioninner::*;
 use crate::sftp::{Sftp, SftpRequest};
 use filedescriptor::{socketpair, FileDescriptor};
 use portable_pty::PtySize;
-use smol::channel::{bounded, Receiver, Sender};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn session_event_host_verify_debug() {
-        let (tx, _rx) = smol::channel::bounded(1);
+        let (tx, _rx) = bounded(1);
         let event = SessionEvent::HostVerify(HostVerificationEvent {
             message: "Trust this host?".to_string(),
             reply: tx,
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn session_event_authenticate_debug() {
-        let (tx, _rx) = smol::channel::bounded(1);
+        let (tx, _rx) = bounded(1);
         let event = SessionEvent::Authenticate(AuthenticationEvent {
             username: "testuser".to_string(),
             instructions: "".to_string(),

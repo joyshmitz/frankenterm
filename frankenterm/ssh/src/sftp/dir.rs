@@ -1,6 +1,6 @@
 use super::{Metadata, SessionRequest, SessionSender, SftpChannelResult, SftpRequest};
+use crate::runtime::channel::{bounded, Sender};
 use camino::Utf8PathBuf;
-use smol::channel::{bounded, Sender};
 use std::fmt;
 
 pub(crate) type DirId = usize;

@@ -1,9 +1,9 @@
+use crate::runtime::channel::{bounded, Receiver, TryRecvError};
 use crate::session::{SessionRequest, SessionSender, SignalChannel};
 use crate::sessioninner::{ChannelId, ChannelInfo, DescriptorState};
 use crate::sessionwrap::SessionWrap;
 use filedescriptor::{socketpair, FileDescriptor};
 use portable_pty::{ExitStatus, PtySize};
-use smol::channel::{bounded, Receiver, TryRecvError};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::Mutex;
@@ -139,7 +139,7 @@ impl portable_pty::Child for SshChildProcess {
         if let Some(status) = self.exited.as_ref() {
             return Ok(status.clone());
         }
-        match smol::block_on(self.exit.recv()) {
+        match crate::runtime::block_on(self.exit.recv()) {
             Ok(status) => {
                 self.exited.replace(status.clone());
                 Ok(status)

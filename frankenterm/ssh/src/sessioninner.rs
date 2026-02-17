@@ -3,6 +3,7 @@ use crate::config::ConfigMap;
 use crate::dirwrap::DirWrap;
 use crate::filewrap::FileWrap;
 use crate::pty::*;
+use crate::runtime::channel::{bounded, Receiver, Sender, TryRecvError};
 use crate::session::{Exec, ExecResult, SessionEvent, SessionRequest, SignalChannel};
 use crate::sessionwrap::SessionWrap;
 use crate::sftp::dir::{Dir, DirId, DirRequest};
@@ -15,7 +16,6 @@ use filedescriptor::{
     poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN, POLLOUT,
 };
 use portable_pty::ExitStatus;
-use smol::channel::{bounded, Receiver, Sender, TryRecvError};
 use socket2::{Domain, Socket, Type};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -558,7 +558,7 @@ impl SessionInner {
                     log::trace!("channel {id} has exit status {status:?}");
                     chan.exited = true;
                     let exit = chan.exit.take().unwrap();
-                    smol::block_on(exit.send(status)).ok();
+                    crate::runtime::block_on(exit.send(status)).ok();
                 }
             }
 

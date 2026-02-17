@@ -8,12 +8,15 @@ use async_trait::async_trait;
 use config::{Shell, SshBackend, SshDomain};
 use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
 use frankenterm_ssh::{
+    runtime::{
+        self as ssh_runtime,
+        channel::{bounded, Receiver as AsyncReceiver, TryRecvError as AsyncTryRecvError},
+    },
     ConfigMap, HostVerificationFailed, Session, SessionEvent, SshChildProcess, SshPty,
 };
 use frankenterm_term::TerminalSize;
 use portable_pty::cmdbuilder::CommandBuilder;
 use portable_pty::{ChildKiller, ExitStatus, MasterPty, PtySize};
-use smol::channel::{bounded, Receiver as AsyncReceiver};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufWriter, Read, Write};
@@ -69,7 +72,7 @@ pub fn ssh_connect_with_ui(
         ui.output_str(&format!("Connecting to {} using SSH\n", remote_address));
         let (session, events) = Session::connect(ssh_config.clone())?;
 
-        while let Ok(event) = smol::block_on(events.recv()) {
+        while let Ok(event) = ssh_runtime::block_on(events.recv()) {
             match event {
                 SessionEvent::Banner(banner) => {
                     if let Some(banner) = banner {
@@ -86,7 +89,7 @@ pub fn ssh_connect_with_ui(
                     } else {
                         false
                     };
-                    smol::block_on(verify.answer(ok)).context("send verify response")?;
+                    ssh_runtime::block_on(verify.answer(ok)).context("send verify response")?;
                 }
                 SessionEvent::Authenticate(auth) => {
                     if !auth.username.is_empty() {
@@ -113,7 +116,7 @@ pub fn ssh_connect_with_ui(
                             anyhow::bail!("Authentication was cancelled");
                         }
                     }
-                    smol::block_on(auth.answer(answers))?;
+                    ssh_runtime::block_on(auth.answer(answers))?;
                 }
                 SessionEvent::HostVerificationFailed(failed) => {
                     let message = format_host_verification_for_terminal(failed);
@@ -423,7 +426,7 @@ struct StartNewSessionResult {
 /// Carry out the authentication process and create the initial pty.
 fn connect_ssh_session(
     session: Session,
-    events: smol::channel::Receiver<SessionEvent>,
+    events: AsyncReceiver<SessionEvent>,
     mut stdin_read: FileDescriptor,
     stdin_tx: Sender<BoxedWriter>,
     stdout_write: &mut BufWriter<FileDescriptor>,
@@ -593,7 +596,7 @@ fn connect_ssh_session(
     }
 
     // Process authentication related events
-    while let Ok(event) = smol::block_on(events.recv()) {
+    while let Ok(event) = ssh_runtime::block_on(events.recv()) {
         match event {
             SessionEvent::Banner(banner) => {
                 if let Some(banner) = banner {
@@ -614,7 +617,7 @@ fn connect_ssh_session(
                 } else {
                     false
                 };
-                smol::block_on(verify.answer(ok)).context("send verify response")?;
+                ssh_runtime::block_on(verify.answer(ok)).context("send verify response")?;
             }
             SessionEvent::Authenticate(auth) => {
                 if !auth.username.is_empty() {
@@ -640,7 +643,7 @@ fn connect_ssh_session(
                         anyhow::bail!("Authentication was cancelled");
                     }
                 }
-                smol::block_on(auth.answer(answers))?;
+                ssh_runtime::block_on(auth.answer(answers))?;
             }
             SessionEvent::Error(err) => {
                 shim.output_line(&format!("Error: {}", err))?;
@@ -652,7 +655,7 @@ fn connect_ssh_session(
             SessionEvent::Authenticated => {
                 // Our session has been authenticated: we can now
                 // set up the real pty for the pane
-                match smol::block_on(session.request_pty(
+                match ssh_runtime::block_on(session.request_pty(
                     &config::configuration().term,
                     crate::terminal_size_to_pty_size(*size.lock().unwrap())?,
                     command_line.as_ref().map(|s| s.as_str()),
@@ -887,7 +890,7 @@ impl portable_pty::Child for WrappedSshChild {
                     self.exited.replace(status.clone());
                     Ok(Some(status))
                 }
-                Err(smol::channel::TryRecvError::Empty) => Ok(None),
+                Err(AsyncTryRecvError::Empty) => Ok(None),
                 Err(err) => {
                     log::debug!("WrappedSshChild::try_wait err: {:#?}", err);
                     let status = ExitStatus::with_exit_code(1);
@@ -906,7 +909,7 @@ impl portable_pty::Child for WrappedSshChild {
         }
 
         if self.status.is_none() {
-            match smol::block_on(async { self.rx.recv() }) {
+            match ssh_runtime::block_on(async { self.rx.recv() }) {
                 Ok(c) => {
                     self.got_child(c);
                 }
@@ -920,7 +923,7 @@ impl portable_pty::Child for WrappedSshChild {
         }
 
         let rx = self.status.as_mut().unwrap();
-        match smol::block_on(rx.recv()) {
+        match ssh_runtime::block_on(rx.recv()) {
             Ok(status) => {
                 self.exited.replace(status.clone());
                 Ok(status)
