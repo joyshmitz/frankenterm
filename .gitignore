@@ -108,3 +108,6 @@ storage.sqlite3-*
 
 # Beads backup files (auto-generated during sync/migration)
 .beads/*.bak*
+
+# Codegen sub-crate lock files (generated, not the workspace root Cargo.lock)
+**/codegen/Cargo.lock
