@@ -35729,7 +35729,8 @@ log_level = "debug"
         record.schedule_interval_ms = Some(1_000);
         storage.insert_saved_search(record.clone()).await.unwrap();
 
-        let scheduler_handle = tokio::spawn(run_saved_search_scheduler(
+        let scheduler_handle = frankenterm_core::runtime_compat::task::spawn(
+            run_saved_search_scheduler(
             storage.clone(),
             Arc::clone(&bus),
             Arc::clone(&shutdown_flag),
@@ -35829,7 +35830,8 @@ log_level = "debug"
         record.schedule_interval_ms = Some(1_000);
         storage.insert_saved_search(record.clone()).await.unwrap();
 
-        let scheduler_handle = tokio::spawn(run_saved_search_scheduler(
+        let scheduler_handle = frankenterm_core::runtime_compat::task::spawn(
+            run_saved_search_scheduler(
             storage.clone(),
             Arc::clone(&bus),
             Arc::clone(&shutdown_flag),
@@ -35882,7 +35884,8 @@ log_level = "debug"
         record.last_run_at = Some(now);
         storage.insert_saved_search(record.clone()).await.unwrap();
 
-        let scheduler_handle = tokio::spawn(run_saved_search_scheduler(
+        let scheduler_handle = frankenterm_core::runtime_compat::task::spawn(
+            run_saved_search_scheduler(
             storage.clone(),
             Arc::clone(&bus),
             Arc::clone(&shutdown_flag),

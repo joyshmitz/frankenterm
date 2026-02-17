@@ -392,20 +392,7 @@ trybuild = { version = "1", default-features = false }
 rustls = "0.23"
 rustls-pemfile = "2"
 fastmcp = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", package = "fastmcp-rust" }
-fastmcp-core = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-fastmcp-transport = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-fastmcp-protocol = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-fastmcp-server = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-fastmcp-client = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-fastmcp-macros = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-fastmcp-console = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
 fastapi = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec", package = "fastapi-rust" }
-fastapi-core = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec" }
-fastapi-http = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec" }
-fastapi-router = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec" }
-fastapi-macros = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec" }
-fastapi-openapi = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec" }
-fastapi-output = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec" }
 
 # FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
 frankensearch = { version = "0.1.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3ad4326fd63a3f53d0d90d48f0e5ea1c74c2a4da", default-features = false, features = ["hybrid"] }
