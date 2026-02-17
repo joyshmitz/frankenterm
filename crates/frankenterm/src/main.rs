@@ -172,6 +172,8 @@ SEE ALSO:
     ft robot state                    Get all panes as JSON
     ft robot get-text 3               Get pane text (machine-readable)
     ft robot send 3 "ls"              Send text via robot interface
+    ft robot agents list              List detected installed agents
+    ft robot agents running           List running pane agents
     ft robot events --unhandled       Unhandled events as JSON
     ft robot -f json state            Force JSON output format
 
@@ -2281,6 +2283,12 @@ enum RobotCommands {
         code: String,
     },
 
+    /// Agent inventory commands (installed + running + detect)
+    Agents {
+        #[command(subcommand)]
+        command: RobotAgentsCommands,
+    },
+
     /// Account management commands (list, refresh, pick preview)
     Accounts {
         #[command(subcommand)]
@@ -2521,6 +2529,23 @@ enum RobotAccountsCommands {
         /// Service to refresh (default: "openai")
         #[arg(long, default_value = "openai")]
         service: String,
+    },
+}
+
+/// Robot agents subcommands
+#[derive(Subcommand)]
+enum RobotAgentsCommands {
+    /// List installed agents from filesystem detection cache
+    List,
+
+    /// List currently running agents inferred from active panes
+    Running,
+
+    /// Run installed-agent detection (use --refresh to force re-probe)
+    Detect {
+        /// Force refresh by re-running filesystem probes and replacing cache
+        #[arg(long)]
+        refresh: bool,
     },
 }
 
@@ -3576,6 +3601,7 @@ const ROBOT_ERR_UNKNOWN_SUBCOMMAND: &str = "robot.unknown_subcommand";
 const ROBOT_ERR_CONFIG: &str = "robot.config_error";
 const ROBOT_ERR_FTS_QUERY: &str = "robot.fts_query_error";
 const ROBOT_ERR_STORAGE: &str = "robot.storage_error";
+const ROBOT_ERR_FEATURE_NOT_AVAILABLE: &str = "robot.feature_not_available";
 const ROBOT_BATCH_GET_TEXT_MAX_CONCURRENT: usize = 16;
 const CLI_HYBRID_RRF_K: u32 = 60;
 /// Cooldown period between account refreshes (milliseconds)
@@ -4725,6 +4751,99 @@ struct RobotReleaseData {
 struct RobotReservationsListData {
     reservations: Vec<RobotReservationInfo>,
     total: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RobotAgentInventorySummary {
+    installed: usize,
+    running: usize,
+    configured: usize,
+    installed_but_idle: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RobotAgentsListData {
+    installed_agents: Vec<frankenterm_core::agent_correlator::InstalledAgentInventoryEntry>,
+    summary: RobotAgentInventorySummary,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RobotAgentsRunningData {
+    running_agents: BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
+    summary: RobotAgentInventorySummary,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RobotAgentsDetectData {
+    refresh: bool,
+    installed_agents: Vec<frankenterm_core::agent_correlator::InstalledAgentInventoryEntry>,
+    summary: RobotAgentInventorySummary,
+}
+
+fn build_robot_agent_inventory_summary(
+    installed_agents: &[frankenterm_core::agent_correlator::InstalledAgentInventoryEntry],
+    running_agents: &BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
+) -> RobotAgentInventorySummary {
+    let detected_installed: Vec<&frankenterm_core::agent_correlator::InstalledAgentInventoryEntry> =
+        installed_agents
+            .iter()
+            .filter(|entry| entry.detected)
+            .collect();
+    let running_slugs: HashSet<&str> = running_agents
+        .values()
+        .map(|entry| entry.slug.as_str())
+        .collect();
+
+    RobotAgentInventorySummary {
+        installed: detected_installed.len(),
+        running: running_agents.len(),
+        configured: detected_installed
+            .iter()
+            .filter(|entry| {
+                entry
+                    .config_path
+                    .as_deref()
+                    .is_some_and(|path| !path.is_empty())
+            })
+            .count(),
+        installed_but_idle: detected_installed
+            .iter()
+            .filter(|entry| !running_slugs.contains(entry.slug.as_str()))
+            .count(),
+    }
+}
+
+fn sorted_detected_installed_agents(
+    mut entries: Vec<frankenterm_core::agent_correlator::InstalledAgentInventoryEntry>,
+) -> Vec<frankenterm_core::agent_correlator::InstalledAgentInventoryEntry> {
+    entries.retain(|entry| entry.detected);
+    entries.sort_by(|a, b| a.slug.cmp(&b.slug));
+    entries
+}
+
+fn load_installed_agent_inventory(
+    refresh: bool,
+) -> std::result::Result<
+    Vec<frankenterm_core::agent_correlator::InstalledAgentInventoryEntry>,
+    String,
+> {
+    let entries = if refresh {
+        frankenterm_core::agent_correlator::installed_inventory_refresh()?
+    } else {
+        frankenterm_core::agent_correlator::installed_inventory_cached()?
+    };
+    Ok(sorted_detected_installed_agents(entries))
+}
+
+fn infer_running_agents_from_panes(
+    panes: &[frankenterm_core::wezterm::PaneInfo],
+) -> BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry> {
+    let mut correlator = frankenterm_core::agent_correlator::AgentCorrelator::new();
+    for pane in panes {
+        correlator.update_from_pane_info(pane);
+    }
+
+    correlator.inventory().running.into_iter().collect()
 }
 
 fn redact_for_output(text: &str) -> String {
@@ -6588,6 +6707,18 @@ fn build_robot_help() -> RobotHelp {
                 description: "Fetch recent events (optional workflow preview)",
             },
             RobotCommandInfo {
+                name: "agents list",
+                description: "List installed agents from filesystem detection",
+            },
+            RobotCommandInfo {
+                name: "agents running",
+                description: "List active pane agents with inferred runtime state",
+            },
+            RobotCommandInfo {
+                name: "agents detect",
+                description: "Run installed-agent detection (use --refresh for a re-probe)",
+            },
+            RobotCommandInfo {
                 name: "workflow run",
                 description: "Run a workflow by name on a pane",
             },
@@ -6761,6 +6892,24 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                     "ft robot events --rule-id codex.usage_reached",
                     "ft robot events --would-handle --dry-run",
                 ],
+            },
+            QuickStartCommand {
+                name: "agents list",
+                args: "",
+                summary: "List installed coding agents detected on this machine",
+                examples: vec!["ft robot agents list"],
+            },
+            QuickStartCommand {
+                name: "agents running",
+                args: "",
+                summary: "List agents currently inferred as active in pane sessions",
+                examples: vec!["ft robot agents running"],
+            },
+            QuickStartCommand {
+                name: "agents detect",
+                args: "[--refresh]",
+                summary: "Run agent installation probes (use --refresh to force a re-probe)",
+                examples: vec!["ft robot agents detect", "ft robot agents detect --refresh"],
             },
             QuickStartCommand {
                 name: "workflow run",
@@ -13912,6 +14061,225 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             err.hint,
                                             elapsed_ms(start),
                                         );
+                                    print_robot_response(&response, format, stats)?;
+                                }
+                            }
+                        }
+                        RobotCommands::Agents { command } => {
+                            if !frankenterm_core::agent_correlator::filesystem_detection_available()
+                            {
+                                match command {
+                                    RobotAgentsCommands::List => {
+                                        let response =
+                                            RobotResponse::<RobotAgentsListData>::error_with_code(
+                                                ROBOT_ERR_FEATURE_NOT_AVAILABLE,
+                                                "Agent detection feature is not available in this build",
+                                                Some(
+                                                    "Rebuild ft with filesystem agent detection enabled."
+                                                        .to_string(),
+                                                ),
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                    }
+                                    RobotAgentsCommands::Running => {
+                                        let response =
+                                            RobotResponse::<RobotAgentsRunningData>::error_with_code(
+                                                ROBOT_ERR_FEATURE_NOT_AVAILABLE,
+                                                "Agent detection feature is not available in this build",
+                                                Some(
+                                                    "Rebuild ft with filesystem agent detection enabled."
+                                                        .to_string(),
+                                                ),
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                    }
+                                    RobotAgentsCommands::Detect { .. } => {
+                                        let response =
+                                            RobotResponse::<RobotAgentsDetectData>::error_with_code(
+                                                ROBOT_ERR_FEATURE_NOT_AVAILABLE,
+                                                "Agent detection feature is not available in this build",
+                                                Some(
+                                                    "Rebuild ft with filesystem agent detection enabled."
+                                                        .to_string(),
+                                                ),
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                    }
+                                }
+                                return Ok(());
+                            }
+
+                            match command {
+                                RobotAgentsCommands::List => {
+                                    let installed_agents = match load_installed_agent_inventory(
+                                        false,
+                                    ) {
+                                        Ok(installed) => installed,
+                                        Err(err) => {
+                                            let response =
+                                                RobotResponse::<RobotAgentsListData>::error_with_code(
+                                                    "robot.agent_detection_error",
+                                                    format!(
+                                                        "Failed to load installed agent inventory: {err}"
+                                                    ),
+                                                    None,
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    let wezterm =
+                                        frankenterm_core::wezterm::wezterm_handle_from_config(
+                                            &config,
+                                        );
+                                    let running_agents = match wezterm.list_panes().await {
+                                        Ok(panes) => infer_running_agents_from_panes(&panes),
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                error = %err,
+                                                "Failed to infer running agents while building list summary"
+                                            );
+                                            BTreeMap::new()
+                                        }
+                                    };
+                                    let summary = build_robot_agent_inventory_summary(
+                                        &installed_agents,
+                                        &running_agents,
+                                    );
+                                    let data = RobotAgentsListData {
+                                        installed_agents,
+                                        summary,
+                                    };
+                                    let elapsed = elapsed_ms(start);
+                                    tracing::info!(
+                                        command = "robot.agents.list",
+                                        response_time_ms = elapsed,
+                                        agents_detected = data.installed_agents.len(),
+                                        "robot agents list completed"
+                                    );
+                                    let response = RobotResponse::success(data, elapsed);
+                                    print_robot_response(&response, format, stats)?;
+                                }
+                                RobotAgentsCommands::Running => {
+                                    let installed_agents = match load_installed_agent_inventory(
+                                        false,
+                                    ) {
+                                        Ok(installed) => installed,
+                                        Err(err) => {
+                                            let response =
+                                                RobotResponse::<RobotAgentsRunningData>::error_with_code(
+                                                    "robot.agent_detection_error",
+                                                    format!(
+                                                        "Failed to load installed agent inventory: {err}"
+                                                    ),
+                                                    None,
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    let wezterm =
+                                        frankenterm_core::wezterm::wezterm_handle_from_config(
+                                            &config,
+                                        );
+                                    let panes = match wezterm.list_panes().await {
+                                        Ok(panes) => panes,
+                                        Err(err) => {
+                                            let response =
+                                                RobotResponse::<RobotAgentsRunningData>::error_with_code(
+                                                    "robot.wezterm_error",
+                                                    format!(
+                                                        "Failed to list panes for running agent inventory: {err}"
+                                                    ),
+                                                    Some(
+                                                        "Is the active backend bridge (current: WezTerm) running?"
+                                                            .to_string(),
+                                                    ),
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    let running_agents = infer_running_agents_from_panes(&panes);
+                                    let summary = build_robot_agent_inventory_summary(
+                                        &installed_agents,
+                                        &running_agents,
+                                    );
+                                    let data = RobotAgentsRunningData {
+                                        running_agents,
+                                        summary,
+                                    };
+                                    let elapsed = elapsed_ms(start);
+                                    tracing::info!(
+                                        command = "robot.agents.running",
+                                        response_time_ms = elapsed,
+                                        agents_detected = data.running_agents.len(),
+                                        "robot agents running completed"
+                                    );
+                                    let response = RobotResponse::success(data, elapsed);
+                                    print_robot_response(&response, format, stats)?;
+                                }
+                                RobotAgentsCommands::Detect { refresh } => {
+                                    let installed_agents = match load_installed_agent_inventory(
+                                        refresh,
+                                    ) {
+                                        Ok(installed) => installed,
+                                        Err(err) => {
+                                            let response =
+                                                RobotResponse::<RobotAgentsDetectData>::error_with_code(
+                                                    "robot.agent_detection_error",
+                                                    format!("Agent detection failed: {err}"),
+                                                    Some(
+                                                        "Retry with `ft robot agents detect --refresh`."
+                                                            .to_string(),
+                                                    ),
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    let wezterm =
+                                        frankenterm_core::wezterm::wezterm_handle_from_config(
+                                            &config,
+                                        );
+                                    let running_agents = match wezterm.list_panes().await {
+                                        Ok(panes) => infer_running_agents_from_panes(&panes),
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                error = %err,
+                                                "Failed to infer running agents while building detect summary"
+                                            );
+                                            BTreeMap::new()
+                                        }
+                                    };
+                                    let summary = build_robot_agent_inventory_summary(
+                                        &installed_agents,
+                                        &running_agents,
+                                    );
+                                    let data = RobotAgentsDetectData {
+                                        refresh,
+                                        installed_agents,
+                                        summary,
+                                    };
+                                    let elapsed = elapsed_ms(start);
+                                    tracing::info!(
+                                        command = "robot.agents.detect",
+                                        response_time_ms = elapsed,
+                                        agents_detected = data.installed_agents.len(),
+                                        "robot agents detect completed"
+                                    );
+                                    let response = RobotResponse::success(data, elapsed);
                                     print_robot_response(&response, format, stats)?;
                                 }
                             }
@@ -34017,6 +34385,177 @@ log_level = "debug"
         assert_eq!(rt_workflows[1]["name"], "handle_usage_limits");
     }
 
+    #[test]
+    fn test_robot_agents_list_json() {
+        let installed_agents = vec![
+            frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+                slug: "codex".to_string(),
+                detected: true,
+                evidence: vec!["version: 1.2.3".to_string()],
+                root_paths: vec!["/tmp/codex".to_string()],
+                config_path: Some("/tmp/codex".to_string()),
+                binary_path: Some("/usr/local/bin/codex".to_string()),
+                version: Some("1.2.3".to_string()),
+            },
+        ];
+        let running_agents = BTreeMap::new();
+        let summary = build_robot_agent_inventory_summary(&installed_agents, &running_agents);
+        let data = RobotAgentsListData {
+            installed_agents,
+            summary,
+        };
+        let resp = RobotResponse::success(data, 7);
+        let json = serde_json::to_value(&resp).expect("serialize");
+        let first = &json["data"]["installed_agents"][0];
+        assert_eq!(first["slug"], "codex");
+        assert_eq!(first["version"], "1.2.3");
+        assert_eq!(first["config_path"], "/tmp/codex");
+        assert!(first["evidence"].is_array());
+    }
+
+    #[test]
+    fn test_robot_agents_list_toon() {
+        let installed_agents = vec![
+            frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+                slug: "gemini".to_string(),
+                detected: true,
+                evidence: vec!["version: 2.0.0".to_string()],
+                root_paths: vec!["/tmp/gemini".to_string()],
+                config_path: Some("/tmp/gemini".to_string()),
+                binary_path: None,
+                version: Some("2.0.0".to_string()),
+            },
+        ];
+        let running_agents = BTreeMap::new();
+        let summary = build_robot_agent_inventory_summary(&installed_agents, &running_agents);
+        let resp = RobotResponse::success(
+            RobotAgentsListData {
+                installed_agents,
+                summary,
+            },
+            3,
+        );
+        let json_value = serde_json::to_value(&resp).expect("json value");
+        let toon = toon_rust::encode(json_value.clone(), None);
+        let decoded = toon_rust::try_decode(&toon, None).expect("decode toon");
+        let json_str = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
+        let roundtripped: serde_json::Value = serde_json::from_str(&json_str).expect("json parse");
+        assert_eq!(roundtripped["ok"], true);
+        assert_eq!(
+            roundtripped["data"]["installed_agents"][0]["slug"],
+            "gemini"
+        );
+    }
+
+    #[test]
+    fn test_robot_agents_running_empty() {
+        let installed_agents = vec![
+            frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+                slug: "codex".to_string(),
+                detected: true,
+                evidence: vec![],
+                root_paths: vec!["/tmp/codex".to_string()],
+                config_path: Some("/tmp/codex".to_string()),
+                binary_path: None,
+                version: None,
+            },
+        ];
+        let running_agents: BTreeMap<
+            u64,
+            frankenterm_core::agent_correlator::RunningAgentInventoryEntry,
+        > = BTreeMap::new();
+        let summary = build_robot_agent_inventory_summary(&installed_agents, &running_agents);
+        assert_eq!(summary.running, 0);
+        assert_eq!(summary.installed, 1);
+        assert_eq!(summary.installed_but_idle, 1);
+    }
+
+    #[test]
+    fn test_robot_agents_running_with_agents() {
+        fn pane(
+            pane_id: u64,
+            title: Option<&str>,
+            foreground_process: Option<&str>,
+        ) -> frankenterm_core::wezterm::PaneInfo {
+            let mut extra = HashMap::new();
+            if let Some(process) = foreground_process {
+                extra.insert(
+                    "foreground_process_name".to_string(),
+                    serde_json::Value::String(process.to_string()),
+                );
+            }
+            frankenterm_core::wezterm::PaneInfo {
+                pane_id,
+                tab_id: 1,
+                window_id: 1,
+                domain_id: None,
+                domain_name: Some("local".to_string()),
+                workspace: None,
+                size: None,
+                rows: None,
+                cols: None,
+                title: title.map(ToOwned::to_owned),
+                cwd: None,
+                tty_name: None,
+                cursor_x: None,
+                cursor_y: None,
+                cursor_visibility: None,
+                left_col: None,
+                top_row: None,
+                is_active: false,
+                is_zoomed: false,
+                extra,
+            }
+        }
+
+        let panes = vec![
+            pane(7, Some("codex"), None),
+            pane(8, None, Some("gemini-cli")),
+        ];
+        let running = infer_running_agents_from_panes(&panes);
+        assert_eq!(running.len(), 2);
+        assert_eq!(
+            running.get(&7).map(|entry| entry.slug.as_str()),
+            Some("codex")
+        );
+        assert_eq!(
+            running.get(&8).map(|entry| entry.slug.as_str()),
+            Some("gemini")
+        );
+    }
+
+    #[test]
+    fn test_robot_agents_detect_refresh() {
+        let cli = Cli::try_parse_from(["ft", "robot", "agents", "detect", "--refresh"])
+            .expect("robot agents detect --refresh should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Agents {
+                    command: RobotAgentsCommands::Detect { refresh },
+                }) => assert!(refresh),
+                _ => panic!("expected RobotCommands::Agents::Detect"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn test_feature_disabled_graceful() {
+        if frankenterm_core::agent_correlator::filesystem_detection_available() {
+            assert!(
+                load_installed_agent_inventory(false).is_ok(),
+                "inventory load should succeed when feature is available"
+            );
+            return;
+        }
+
+        let err = load_installed_agent_inventory(false).expect_err("feature-disabled error");
+        assert!(
+            err.contains("not enabled"),
+            "expected feature-disabled error, got: {err}"
+        );
+    }
+
     // ========================================================================
     // CLI Parsing Tests — workflow subcommands (bd-qvbz)
     // ========================================================================
@@ -34691,6 +35230,38 @@ log_level = "debug"
     }
 
     #[test]
+    fn cli_robot_agents_list_parses() {
+        let cli = Cli::try_parse_from(["ft", "robot", "agents", "list"])
+            .expect("robot agents list should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Agents {
+                    command: RobotAgentsCommands::List,
+                }) => {}
+                _ => panic!("expected RobotCommands::Agents::List"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_agents_running_parses() {
+        let cli = Cli::try_parse_from(["ft", "robot", "agents", "running"])
+            .expect("robot agents running should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Agents {
+                    command: RobotAgentsCommands::Running,
+                }) => {}
+                _ => panic!("expected RobotCommands::Agents::Running"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
     fn cli_robot_get_text_parses_panes_selector() {
         let cli = Cli::try_parse_from([
             "ft",
@@ -35158,7 +35729,8 @@ log_level = "debug"
         record.schedule_interval_ms = Some(1_000);
         storage.insert_saved_search(record.clone()).await.unwrap();
 
-        let scheduler_handle = tokio::spawn(run_saved_search_scheduler(
+        let scheduler_handle = frankenterm_core::runtime_compat::task::spawn(
+            run_saved_search_scheduler(
             storage.clone(),
             Arc::clone(&bus),
             Arc::clone(&shutdown_flag),
@@ -35258,7 +35830,8 @@ log_level = "debug"
         record.schedule_interval_ms = Some(1_000);
         storage.insert_saved_search(record.clone()).await.unwrap();
 
-        let scheduler_handle = tokio::spawn(run_saved_search_scheduler(
+        let scheduler_handle = frankenterm_core::runtime_compat::task::spawn(
+            run_saved_search_scheduler(
             storage.clone(),
             Arc::clone(&bus),
             Arc::clone(&shutdown_flag),
@@ -35311,7 +35884,8 @@ log_level = "debug"
         record.last_run_at = Some(now);
         storage.insert_saved_search(record.clone()).await.unwrap();
 
-        let scheduler_handle = tokio::spawn(run_saved_search_scheduler(
+        let scheduler_handle = frankenterm_core::runtime_compat::task::spawn(
+            run_saved_search_scheduler(
             storage.clone(),
             Arc::clone(&bus),
             Arc::clone(&shutdown_flag),

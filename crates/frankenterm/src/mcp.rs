@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use anyhow::{Context, bail};
-use fastmcp::StdioTransport;
 
 use frankenterm_core::config::Config;
 
@@ -23,7 +22,7 @@ fn serve_mcp(transport: &str, config: &Config, workspace_root: &Path) -> anyhow:
     let layout = config
         .workspace_layout(Some(workspace_root))
         .context("Failed to resolve workspace layout for MCP server")?;
-    let server = frankenterm_core::mcp::build_server_with_db(config, Some(layout.db_path))?;
-    let transport = StdioTransport::stdio();
-    server.run_transport(transport);
+    frankenterm_core::mcp::run_stdio_server(config, Some(layout.db_path))
+        .context("Failed to start MCP stdio transport")?;
+    Ok(())
 }
