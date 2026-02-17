@@ -158,6 +158,24 @@ pub enum Event {
         event_id: Option<i64>,
     },
 
+    /// Agent identified in a pane with method provenance
+    AgentDetected {
+        pane_id: u64,
+        /// Runtime agent type slug (e.g., `codex`, `claude_code`)
+        agent_type: String,
+        /// Detection method provenance (`filesystem`, `pattern_engine`, etc.)
+        detection_method: String,
+    },
+
+    /// Agent exited from a pane
+    AgentExited {
+        pane_id: u64,
+        /// Runtime agent type slug (e.g., `codex`, `claude_code`)
+        agent_type: String,
+        /// Best-effort exit code when known
+        exit_code: Option<i32>,
+    },
+
     /// Pane discovered
     PaneDiscovered {
         pane_id: u64,
@@ -209,6 +227,8 @@ impl Event {
             Self::SegmentCaptured { .. } => "segment_captured",
             Self::GapDetected { .. } => "gap_detected",
             Self::PatternDetected { .. } => "pattern_detected",
+            Self::AgentDetected { .. } => "agent_detected",
+            Self::AgentExited { .. } => "agent_exited",
             Self::PaneDiscovered { .. } => "pane_discovered",
             Self::PaneDisappeared { .. } => "pane_disappeared",
             Self::WorkflowStarted { .. } => "workflow_started",
@@ -225,6 +245,8 @@ impl Event {
             Self::SegmentCaptured { pane_id, .. }
             | Self::GapDetected { pane_id, .. }
             | Self::PatternDetected { pane_id, .. }
+            | Self::AgentDetected { pane_id, .. }
+            | Self::AgentExited { pane_id, .. }
             | Self::PaneDiscovered { pane_id, .. }
             | Self::PaneDisappeared { pane_id }
             | Self::WorkflowStarted { pane_id, .. }
@@ -505,7 +527,9 @@ impl EventBus {
             Event::SegmentCaptured { .. } | Event::GapDetected { .. } => {
                 self.send_routed(event, &self.delta_sender, &self.delta_times)
             }
-            Event::PatternDetected { .. } => {
+            Event::PatternDetected { .. }
+            | Event::AgentDetected { .. }
+            | Event::AgentExited { .. } => {
                 self.send_routed(event, &self.detection_sender, &self.detection_times)
             }
             Event::PaneDiscovered { .. }
@@ -3025,7 +3049,7 @@ mod tests {
     // --- Event ---
 
     #[test]
-    fn event_type_name_all_nine_variants() {
+    fn event_type_name_all_eleven_variants() {
         let events: Vec<(Event, &str)> = vec![
             (
                 Event::SegmentCaptured {
@@ -3054,6 +3078,22 @@ mod tests {
                     event_id: None,
                 },
                 "pattern_detected",
+            ),
+            (
+                Event::AgentDetected {
+                    pane_id: 1,
+                    agent_type: "codex".into(),
+                    detection_method: "pattern_engine".into(),
+                },
+                "agent_detected",
+            ),
+            (
+                Event::AgentExited {
+                    pane_id: 1,
+                    agent_type: "codex".into(),
+                    exit_code: Some(0),
+                },
+                "agent_exited",
             ),
             (
                 Event::PaneDiscovered {
@@ -3122,6 +3162,15 @@ mod tests {
             }
             .pane_id(),
             Some(42)
+        );
+        assert_eq!(
+            Event::AgentDetected {
+                pane_id: 7,
+                agent_type: "codex".into(),
+                detection_method: "pattern_engine".into(),
+            }
+            .pane_id(),
+            Some(7)
         );
         assert_eq!(Event::PaneDisappeared { pane_id: 99 }.pane_id(), Some(99));
         // Variants without pane_id

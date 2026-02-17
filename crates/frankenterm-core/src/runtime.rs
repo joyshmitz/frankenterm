@@ -867,6 +867,8 @@ pub struct ObservationRuntime {
     cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
     /// Per-pane detection contexts for deduplication
     detection_contexts: Arc<RwLock<HashMap<u64, DetectionContext>>>,
+    /// Runtime agent correlator for installed/running inventory + lifecycle events.
+    agent_correlator: Arc<RwLock<crate::agent_correlator::AgentCorrelator>>,
     /// Shutdown flag for signaling tasks
     shutdown_flag: Arc<AtomicBool>,
     /// Runtime metrics for health/shutdown
@@ -929,6 +931,9 @@ impl ObservationRuntime {
             registry: Arc::new(RwLock::new(registry)),
             cursors: Arc::new(RwLock::new(HashMap::new())),
             detection_contexts: Arc::new(RwLock::new(HashMap::new())),
+            agent_correlator: Arc::new(
+                RwLock::new(crate::agent_correlator::AgentCorrelator::new()),
+            ),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             metrics,
             config_tx: Arc::new(config_tx),
@@ -1603,6 +1608,7 @@ impl ObservationRuntime {
         let registry = Arc::clone(&self.registry);
         let cursors = Arc::clone(&self.cursors);
         let detection_contexts = Arc::clone(&self.detection_contexts);
+        let agent_correlator = Arc::clone(&self.agent_correlator);
         let storage = Arc::clone(&self.storage);
         let metrics = Arc::clone(&self.metrics);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
@@ -1610,6 +1616,7 @@ impl ObservationRuntime {
         let mut config_rx = self.config_rx.clone();
         let heartbeats = Arc::clone(&self.heartbeats);
         let wezterm = Arc::clone(&self.wezterm_handle);
+        let event_bus = self.event_bus.clone();
 
         task::spawn(async move {
             let mut current_interval = initial_interval;
@@ -1715,6 +1722,16 @@ impl ObservationRuntime {
                                     "Pane ignored by observation filter"
                                 );
                             }
+
+                            let maybe_agent_event = {
+                                let mut correlator = agent_correlator.write().await;
+                                correlator.update_from_pane_info_with_event(&entry.info)
+                            };
+                            if let (Some(bus), Some(agent_event)) =
+                                (event_bus.as_ref(), maybe_agent_event)
+                            {
+                                let _ = bus.publish(agent_event);
+                            }
                         }
 
                         // Handle closed panes
@@ -1729,6 +1746,16 @@ impl ObservationRuntime {
                                 contexts.remove(pane_id);
                             }
 
+                            let maybe_agent_exit = {
+                                let mut correlator = agent_correlator.write().await;
+                                correlator.remove_pane_with_event(*pane_id, None)
+                            };
+                            if let (Some(bus), Some(agent_event)) =
+                                (event_bus.as_ref(), maybe_agent_exit)
+                            {
+                                let _ = bus.publish(agent_event);
+                            }
+
                             debug!(pane_id = pane_id, "Stopped observing pane (closed)");
                         }
 
@@ -1736,6 +1763,29 @@ impl ObservationRuntime {
                         for pane_id in &diff.new_generations {
                             // Do NOT reset cursor seq to 0, it causes DB constraint violations.
                             // We keep capturing monotonically on the same pane_id.
+                            let pane_info = {
+                                let reg = registry.read().await;
+                                reg.get_entry(*pane_id).map(|entry| entry.info.clone())
+                            };
+
+                            let (maybe_exit, maybe_detected) = {
+                                let mut correlator = agent_correlator.write().await;
+                                let exit = correlator.remove_pane_with_event(*pane_id, None);
+                                let detected = pane_info.as_ref().and_then(|info| {
+                                    correlator.update_from_pane_info_with_event(info)
+                                });
+                                (exit, detected)
+                            };
+
+                            if let Some(bus) = event_bus.as_ref() {
+                                if let Some(event) = maybe_exit {
+                                    let _ = bus.publish(event);
+                                }
+                                if let Some(event) = maybe_detected {
+                                    let _ = bus.publish(event);
+                                }
+                            }
+
                             debug!(
                                 pane_id = pane_id,
                                 "Restarted observing pane (new generation)"
@@ -2162,6 +2212,7 @@ impl ObservationRuntime {
         let storage = Arc::clone(&self.storage);
         let pattern_engine = Arc::clone(&self.pattern_engine);
         let detection_contexts = Arc::clone(&self.detection_contexts);
+        let agent_correlator = Arc::clone(&self.agent_correlator);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let metrics = Arc::clone(&self.metrics);
         let event_bus = self.event_bus.clone();
@@ -2312,6 +2363,22 @@ impl ObservationRuntime {
                                 count = detections.len(),
                                 "Pattern detections"
                             );
+
+                            let agent_events = {
+                                let mut correlator = agent_correlator.write().await;
+                                correlator.ingest_detections_with_events(pane_id, &detections)
+                            };
+                            if let Some(ref bus) = event_bus {
+                                for agent_event in agent_events {
+                                    let delivered = bus.publish(agent_event);
+                                    if delivered == 0 {
+                                        debug!(
+                                            pane_id = pane_id,
+                                            "No subscribers for agent event bus"
+                                        );
+                                    }
+                                }
+                            }
 
                             let pane_uuid = {
                                 let registry_guard = registry.read().await;
@@ -3076,6 +3143,8 @@ fn event_counts_as_activity(event: &Event) -> bool {
         Event::SegmentCaptured { .. }
             | Event::GapDetected { .. }
             | Event::PatternDetected { .. }
+            | Event::AgentDetected { .. }
+            | Event::AgentExited { .. }
             | Event::PaneDiscovered { .. }
             | Event::PaneDisappeared { .. }
             | Event::WorkflowStarted { .. }
@@ -3098,9 +3167,10 @@ fn snapshot_trigger_from_event(event: &Event) -> Option<crate::snapshot_engine::
             }
         }
         Event::UserVarReceived { payload, .. } => snapshot_trigger_from_user_var(payload),
-        Event::PaneDiscovered { .. } | Event::PaneDisappeared { .. } => {
-            Some(SnapshotTrigger::StateTransition)
-        }
+        Event::PaneDiscovered { .. }
+        | Event::PaneDisappeared { .. }
+        | Event::AgentDetected { .. }
+        | Event::AgentExited { .. } => Some(SnapshotTrigger::StateTransition),
         Event::SegmentCaptured { .. }
         | Event::GapDetected { .. }
         | Event::WorkflowStarted { .. }

@@ -128,6 +128,10 @@ fn rpc_required_scope(args: &[String]) -> IpcScope {
             Some("reserve" | "release") => IpcScope::Write,
             _ => IpcScope::Read,
         },
+        "agents" => match args.get(1).map(String::as_str) {
+            Some("detect") if args.iter().any(|arg| arg == "--refresh") => IpcScope::Write,
+            _ => IpcScope::Read,
+        },
         _ => IpcScope::Read,
     }
 }
@@ -817,6 +821,10 @@ async fn handle_request_with_context(
                 payload["resize_control_plane_watchdog"] = serde_json::Value::Null;
                 payload["resize_degradation_ladder"] = serde_json::Value::Null;
             }
+            #[cfg(feature = "agent-detection")]
+            {
+                payload["agent_inventory"] = build_agent_inventory_status_payload(ctx).await;
+            }
             IpcResponse::ok_with_data(payload)
         }
         IpcRequest::PaneState { pane_id } => handle_pane_state(pane_id, ctx).await,
@@ -837,6 +845,88 @@ async fn handle_request_with_context(
             .await
         }
     }
+}
+
+#[cfg(feature = "agent-detection")]
+#[derive(Debug, Serialize)]
+struct AgentInventoryStatusPayload {
+    installed_agents: Vec<crate::agent_correlator::InstalledAgentInventoryEntry>,
+    running_agents:
+        std::collections::BTreeMap<u64, crate::agent_correlator::RunningAgentInventoryEntry>,
+    summary: AgentInventoryStatusSummary,
+}
+
+#[cfg(feature = "agent-detection")]
+#[derive(Debug, Serialize)]
+struct AgentInventoryStatusSummary {
+    installed: usize,
+    running: usize,
+    configured: usize,
+    installed_but_idle: usize,
+}
+
+#[cfg(feature = "agent-detection")]
+async fn build_agent_inventory_status_payload(ctx: &IpcHandlerContext) -> serde_json::Value {
+    let mut installed_agents = match crate::agent_correlator::installed_inventory_cached() {
+        Ok(entries) => entries
+            .into_iter()
+            .filter(|record| record.detected)
+            .collect::<Vec<_>>(),
+        Err(err) => {
+            tracing::warn!(error = %err, "Failed to load installed-agent records for IPC status");
+            Vec::new()
+        }
+    };
+    installed_agents.sort_by(|a, b| a.slug.cmp(&b.slug));
+
+    let running_agents = build_running_agent_inventory_from_registry(ctx.registry.as_ref()).await;
+    let running_slugs: std::collections::HashSet<&str> = running_agents
+        .values()
+        .map(|entry| entry.slug.as_str())
+        .collect();
+
+    let summary = AgentInventoryStatusSummary {
+        installed: installed_agents.len(),
+        running: running_agents.len(),
+        configured: installed_agents
+            .iter()
+            .filter(|record| {
+                record
+                    .config_path
+                    .as_deref()
+                    .is_some_and(|path| !path.is_empty())
+            })
+            .count(),
+        installed_but_idle: installed_agents
+            .iter()
+            .filter(|record| !running_slugs.contains(record.slug.as_str()))
+            .count(),
+    };
+
+    let payload = AgentInventoryStatusPayload {
+        installed_agents,
+        running_agents,
+        summary,
+    };
+
+    serde_json::to_value(payload).unwrap_or(serde_json::Value::Null)
+}
+
+#[cfg(feature = "agent-detection")]
+async fn build_running_agent_inventory_from_registry(
+    registry_lock: Option<&Arc<RwLock<PaneRegistry>>>,
+) -> std::collections::BTreeMap<u64, crate::agent_correlator::RunningAgentInventoryEntry> {
+    let Some(registry_lock) = registry_lock else {
+        return std::collections::BTreeMap::new();
+    };
+
+    let registry = registry_lock.read().await;
+    let mut correlator = crate::agent_correlator::AgentCorrelator::new();
+    for (_, entry) in registry.entries() {
+        correlator.update_from_pane_info(&entry.info);
+    }
+
+    correlator.inventory().running.into_iter().collect()
 }
 
 async fn handle_pane_state(pane_id: u64, ctx: &IpcHandlerContext) -> IpcResponse {
@@ -1729,6 +1819,121 @@ mod tests {
                 streaming_health.get("dirty_rows_total"),
                 Some(&serde_json::json!(80))
             );
+            #[cfg(feature = "agent-detection")]
+            assert!(
+                data.get("agent_inventory").is_some(),
+                "agent_inventory should be present when agent-detection feature is enabled"
+            );
+            #[cfg(not(feature = "agent-detection"))]
+            assert!(
+                data.get("agent_inventory").is_none(),
+                "agent_inventory should be omitted when agent-detection feature is disabled"
+            );
+
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
+        });
+    }
+
+    #[cfg(feature = "agent-detection")]
+    #[test]
+    fn test_ipc_agent_inventory_present() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("agent-inventory-present.sock");
+
+            let server = IpcServer::bind(&socket_path).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(100));
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+            let server_handle = crate::runtime_compat::task::spawn(async move {
+                server.run(event_bus, shutdown_rx).await;
+            });
+
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            let client = IpcClient::new(&socket_path);
+            let response = client.status().await.unwrap();
+            assert!(response.ok);
+            let data = response.data.expect("status payload");
+            assert!(data.get("agent_inventory").is_some());
+
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
+        });
+    }
+
+    #[cfg(feature = "agent-detection")]
+    #[test]
+    fn test_ipc_agent_inventory_structure() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("agent-inventory-structure.sock");
+
+            let server = IpcServer::bind(&socket_path).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(100));
+            let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+
+            {
+                let mut pane = make_pane_info(11);
+                pane.title = Some("codex".to_string());
+                let mut guard = registry.write().await;
+                guard.discovery_tick(vec![pane]);
+            }
+
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+            let server_handle = crate::runtime_compat::task::spawn(async move {
+                server
+                    .run_with_registry(event_bus, registry, shutdown_rx)
+                    .await;
+            });
+
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            let client = IpcClient::new(&socket_path);
+            let response = client.status().await.unwrap();
+            assert!(response.ok);
+            let data = response.data.expect("status payload");
+            let inventory = data.get("agent_inventory").expect("agent_inventory field");
+
+            assert!(inventory.get("installed_agents").is_some());
+            assert!(inventory.get("running_agents").is_some());
+            assert!(inventory.get("summary").is_some());
+            let summary = inventory.get("summary").expect("summary object");
+            assert!(summary.get("installed").is_some());
+            assert!(summary.get("running").is_some());
+            assert!(summary.get("configured").is_some());
+            assert!(summary.get("installed_but_idle").is_some());
+            assert!(
+                inventory
+                    .get("running_agents")
+                    .and_then(|running| running.get("11"))
+                    .is_some(),
+                "running_agents should contain pane 11"
+            );
+
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
+        });
+    }
+
+    #[cfg(not(feature = "agent-detection"))]
+    #[test]
+    fn test_ipc_feature_disabled() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("ipc-feature-disabled.sock");
+
+            let server = IpcServer::bind(&socket_path).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(100));
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+            let server_handle = crate::runtime_compat::task::spawn(async move {
+                server.run(event_bus, shutdown_rx).await;
+            });
+
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            let client = IpcClient::new(&socket_path);
+            let response = client.status().await.unwrap();
+            assert!(response.ok);
+            let data = response.data.expect("status payload");
+            assert!(data.get("agent_inventory").is_none());
 
             send_shutdown(&shutdown_tx).await;
             let _ = server_handle.await;
@@ -1958,6 +2163,22 @@ mod tests {
     #[test]
     fn rpc_required_scope_reservations_list_is_read() {
         let args = vec!["reservations".to_string(), "list".to_string()];
+        assert_eq!(rpc_required_scope(&args), IpcScope::Read);
+    }
+
+    #[test]
+    fn rpc_required_scope_agents_detect_refresh_is_write() {
+        let args = vec![
+            "agents".to_string(),
+            "detect".to_string(),
+            "--refresh".to_string(),
+        ];
+        assert_eq!(rpc_required_scope(&args), IpcScope::Write);
+    }
+
+    #[test]
+    fn rpc_required_scope_agents_list_is_read() {
+        let args = vec!["agents".to_string(), "list".to_string()];
         assert_eq!(rpc_required_scope(&args), IpcScope::Read);
     }
 

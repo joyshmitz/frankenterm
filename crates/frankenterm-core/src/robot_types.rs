@@ -851,6 +851,82 @@ pub struct ReservationInfo {
 }
 
 // ============================================================================
+// Agents
+// ============================================================================
+
+/// Shared summary counts for `ft robot agents` responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInventorySummaryInfo {
+    pub installed: usize,
+    pub running: usize,
+    pub configured: usize,
+    pub installed_but_idle: usize,
+}
+
+/// Installed-agent inventory entry from filesystem probes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledAgentEntry {
+    pub slug: String,
+    pub detected: bool,
+    pub evidence: Vec<String>,
+    pub root_paths: Vec<String>,
+    #[serde(default)]
+    pub config_path: Option<String>,
+    #[serde(default)]
+    pub binary_path: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+/// Installation metadata attached to a running pane agent entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInstallationInfo {
+    pub slug: String,
+    #[serde(default)]
+    pub config_path: Option<String>,
+    #[serde(default)]
+    pub binary_path: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+/// Running pane-level agent inventory entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunningAgentEntry {
+    pub pane_id: u64,
+    pub slug: String,
+    pub agent_type: String,
+    pub detection_source: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub state: String,
+    #[serde(default)]
+    pub installation: Option<AgentInstallationInfo>,
+}
+
+/// Response data for `ft robot agents list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentsListData {
+    pub installed_agents: Vec<InstalledAgentEntry>,
+    pub summary: AgentInventorySummaryInfo,
+}
+
+/// Response data for `ft robot agents running`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentsRunningData {
+    pub running_agents: BTreeMap<u64, RunningAgentEntry>,
+    pub summary: AgentInventorySummaryInfo,
+}
+
+/// Response data for `ft robot agents detect`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentsDetectData {
+    pub refresh: bool,
+    pub installed_agents: Vec<InstalledAgentEntry>,
+    pub summary: AgentInventorySummaryInfo,
+}
+
+// ============================================================================
 // Meta / Diagnostics
 // ============================================================================
 

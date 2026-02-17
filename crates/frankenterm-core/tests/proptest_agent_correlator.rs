@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 fn arb_detection_source() -> impl Strategy<Value = DetectionSource> {
     prop_oneof![
+        Just(DetectionSource::Filesystem),
         Just(DetectionSource::PatternEngine),
         Just(DetectionSource::PaneTitle),
         Just(DetectionSource::ProcessName),
@@ -151,6 +152,7 @@ proptest! {
     fn prop_detection_source_snake_case(source in arb_detection_source()) {
         let json = serde_json::to_string(&source).unwrap();
         let expected = match source {
+            DetectionSource::Filesystem => "\"filesystem\"",
             DetectionSource::PatternEngine => "\"pattern_engine\"",
             DetectionSource::PaneTitle => "\"pane_title\"",
             DetectionSource::ProcessName => "\"process_name\"",
