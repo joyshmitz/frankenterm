@@ -638,7 +638,10 @@ impl Scenario {
                 "[TYPING:{}]",
                 event.content
             ))),
-            EventAction::Paste => Ok(MockEvent::AppendOutput(format!("[PASTE:{}]", event.content))),
+            EventAction::Paste => Ok(MockEvent::AppendOutput(format!(
+                "[PASTE:{}]",
+                event.content
+            ))),
             EventAction::Mouse => {
                 let token = if event.name.trim().is_empty() {
                     event.content.trim()

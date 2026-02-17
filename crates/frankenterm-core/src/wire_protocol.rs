@@ -346,6 +346,8 @@ impl AgentStreamer {
 
             // Workflow events and user-var events are local-only; not streamed.
             Event::PaneDisappeared { .. }
+            | Event::AgentDetected { .. }
+            | Event::AgentExited { .. }
             | Event::WorkflowStarted { .. }
             | Event::WorkflowStep { .. }
             | Event::WorkflowCompleted { .. }

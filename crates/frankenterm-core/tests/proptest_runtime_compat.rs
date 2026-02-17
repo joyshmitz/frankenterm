@@ -53,7 +53,6 @@ fn arb_semaphore_permits() -> impl Strategy<Value = usize> {
     1usize..=50
 }
 
-
 fn arb_worker_threads() -> impl Strategy<Value = usize> {
     1usize..=8
 }
