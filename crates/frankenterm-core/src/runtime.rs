@@ -44,14 +44,14 @@ use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
 use crate::runtime_compat::{
     RwLock, mpsc, sleep,
-    task::{self, JoinHandle, JoinSet},
+    task::{self, JoinHandle},
     timeout, watch,
 };
 use crate::spsc_ring_buffer::{SpscConsumer, SpscProducer, channel as spsc_channel};
 #[cfg(feature = "native-wezterm")]
 use crate::storage::PaneRecord;
 use crate::storage::{MaintenanceRecord, StorageHandle, StoredEvent};
-use crate::tailer::{CaptureEvent, TailerConfig, TailerSupervisor};
+use crate::tailer::{CaptureEvent, TailerConfig, TailerPollTaskSet, TailerSupervisor};
 use crate::watchdog::HeartbeatRegistry;
 use crate::wezterm::{
     PaneInfo, WeztermHandle, WeztermHandleSource, WeztermInterface, wezterm_handle_with_timeout,
@@ -1812,7 +1812,7 @@ impl ObservationRuntime {
             // Sync tailers periodically with discovery interval.
             // Keep the first sync immediate to preserve prior interval behavior.
             let mut next_sync_tick = Instant::now();
-            let mut join_set = JoinSet::new();
+            let mut poll_tasks = TailerPollTaskSet::new();
 
             loop {
                 // Determine poll interval dynamically from supervisor config
@@ -1905,7 +1905,7 @@ impl ObservationRuntime {
                         );
                     }
                     // Handle completed captures
-                    Some(result) = join_set.join_next(), if !join_set.is_empty() => {
+                    Some(result) = poll_tasks.join_next(), if !poll_tasks.is_empty() => {
                         match result {
                             Ok((pane_id, outcome)) => supervisor.handle_poll_result(pane_id, outcome),
                             Err(e) => {
@@ -1918,7 +1918,7 @@ impl ObservationRuntime {
                          if shutdown_flag.load(Ordering::SeqCst) {
                             break;
                         }
-                        supervisor.spawn_ready(&mut join_set);
+                        supervisor.spawn_ready(&mut poll_tasks);
                     }
                 }
             }

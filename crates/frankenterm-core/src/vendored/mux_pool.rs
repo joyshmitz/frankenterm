@@ -434,8 +434,8 @@ impl MuxPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::timeout;
     use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
+    use crate::runtime_compat::{task, timeout};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -478,14 +478,14 @@ mod tests {
             .await
             .expect("bind mock mux listener");
 
-        tokio::spawn(async move {
+        task::spawn(async move {
             loop {
                 let (mut stream, _) = match listener.accept().await {
                     Ok(conn) => conn,
                     Err(_) => break,
                 };
 
-                tokio::spawn(async move {
+                task::spawn(async move {
                     let mut read_buf = Vec::new();
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -567,7 +567,7 @@ mod tests {
 
         let first_bad = Arc::new(AtomicBool::new(true));
 
-        tokio::spawn(async move {
+        task::spawn(async move {
             loop {
                 let (mut stream, _) = match listener.accept().await {
                     Ok(conn) => conn,
@@ -575,7 +575,7 @@ mod tests {
                 };
 
                 let first_bad = Arc::clone(&first_bad);
-                tokio::spawn(async move {
+                task::spawn(async move {
                     let mut read_buf = Vec::new();
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -688,7 +688,7 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..4 {
             let pool = pool.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(task::spawn(async move {
                 pool.list_panes().await.expect("concurrent list_panes");
             }));
         }

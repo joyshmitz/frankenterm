@@ -2126,7 +2126,7 @@ mod tests {
         }));
 
         let c = Arc::clone(&collector);
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             c.run().await;
         });
 

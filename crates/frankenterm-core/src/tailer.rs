@@ -11,9 +11,11 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use crate::runtime_compat::mpsc;
-use crate::runtime_compat::task::JoinSet;
+use crate::runtime_compat::task::{self, JoinError, JoinHandle};
 use crate::runtime_compat::timeout;
 use crate::runtime_compat::{RwLock, Semaphore};
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use tracing::{debug, trace, warn};
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, get_or_register_circuit};
@@ -440,12 +442,49 @@ pub trait PollTaskSet {
         F: Future<Output = (u64, PollOutcome)> + Send + 'static;
 }
 
-impl PollTaskSet for JoinSet<(u64, PollOutcome)> {
+/// Tailer-owned task set wrapper for poll workers.
+///
+/// Runtime and tests use this wrapper instead of depending on a concrete task-set
+/// implementation directly.
+pub struct TailerPollTaskSet {
+    inner: FuturesUnordered<JoinHandle<(u64, PollOutcome)>>,
+}
+
+impl TailerPollTaskSet {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: FuturesUnordered::new(),
+        }
+    }
+
+    pub async fn join_next(&mut self) -> Option<Result<(u64, PollOutcome), JoinError>> {
+        self.inner.next().await
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+impl Default for TailerPollTaskSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PollTaskSet for TailerPollTaskSet {
     fn spawn_poll_task<F>(&mut self, future: F)
     where
         F: Future<Output = (u64, PollOutcome)> + Send + 'static,
     {
-        self.spawn(future);
+        self.inner.push(task::spawn(future));
     }
 }
 
@@ -1219,7 +1258,6 @@ impl StreamingHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::task::JoinSet;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1426,8 +1464,8 @@ mod tests {
         }
         supervisor.sync_tailers(&panes);
 
-        let mut join_set = JoinSet::new();
-        supervisor.spawn_ready(&mut join_set);
+        let mut poll_tasks = TailerPollTaskSet::new();
+        supervisor.spawn_ready(&mut poll_tasks);
 
         // Wait for a bit to let tasks start
         crate::runtime_compat::sleep(Duration::from_millis(5)).await;
@@ -1436,7 +1474,7 @@ mod tests {
         assert!(max_seen <= 2, "max concurrency observed: {max_seen}");
 
         // Cleanup
-        while let Some(result) = join_set.join_next().await {
+        while let Some(result) = poll_tasks.join_next().await {
             if let Ok((pane_id, outcome)) = result {
                 supervisor.handle_poll_result(pane_id, outcome);
             }
@@ -1479,10 +1517,10 @@ mod tests {
         // Wait for tailers to become ready to poll.
         crate::runtime_compat::sleep(Duration::from_millis(2)).await;
 
-        let mut join_set = JoinSet::new();
-        supervisor.spawn_ready(&mut join_set);
+        let mut poll_tasks = TailerPollTaskSet::new();
+        supervisor.spawn_ready(&mut poll_tasks);
 
-        let (pane_id, outcome) = join_set
+        let (pane_id, outcome) = poll_tasks
             .join_next()
             .await
             .expect("expected one task")
@@ -1537,11 +1575,11 @@ mod tests {
         // Wait for tailers to become ready to poll (min_interval must elapse)
         crate::runtime_compat::sleep(Duration::from_millis(5)).await;
 
-        let mut join_set = JoinSet::new();
-        supervisor.spawn_ready(&mut join_set);
+        let mut poll_tasks = TailerPollTaskSet::new();
+        supervisor.spawn_ready(&mut poll_tasks);
 
         let mut outcomes = Vec::new();
-        while let Some(result) = join_set.join_next().await {
+        while let Some(result) = poll_tasks.join_next().await {
             if let Ok((pane_id, outcome)) = result {
                 outcomes.push((pane_id, format!("{outcome:?}")));
                 supervisor.handle_poll_result(pane_id, outcome);
@@ -1757,7 +1795,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (tx, mut rx) = mpsc::channel(10);
+        let (tx, rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1779,11 +1817,11 @@ mod tests {
         // Wait for min_interval
         crate::runtime_compat::sleep(Duration::from_millis(5)).await;
 
-        let mut join_set = JoinSet::new();
-        supervisor.spawn_ready(&mut join_set);
+        let mut poll_tasks = TailerPollTaskSet::new();
+        supervisor.spawn_ready(&mut poll_tasks);
 
         // Collect outcomes
-        while let Some(result) = join_set.join_next().await {
+        while let Some(result) = poll_tasks.join_next().await {
             if let Ok((pane_id, outcome)) = result {
                 assert_eq!(pane_id, 1);
                 assert!(
@@ -1821,7 +1859,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (tx, mut rx) = mpsc::channel(10);
+        let (tx, rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1844,10 +1882,10 @@ mod tests {
 
         crate::runtime_compat::sleep(Duration::from_millis(5)).await;
 
-        let mut join_set = JoinSet::new();
-        supervisor.spawn_ready(&mut join_set);
+        let mut poll_tasks = TailerPollTaskSet::new();
+        supervisor.spawn_ready(&mut poll_tasks);
 
-        while let Some(result) = join_set.join_next().await {
+        while let Some(result) = poll_tasks.join_next().await {
             if let Ok((pane_id, outcome)) = result {
                 supervisor.handle_poll_result(pane_id, outcome);
             }
@@ -2093,14 +2131,14 @@ mod tests {
         // Wait for tailers to become ready.
         crate::runtime_compat::sleep(Duration::from_millis(5)).await;
 
-        let mut join_set = JoinSet::new();
-        supervisor.spawn_ready(&mut join_set);
+        let mut poll_tasks = TailerPollTaskSet::new();
+        supervisor.spawn_ready(&mut poll_tasks);
 
         // With budget of 1 capture/sec and 10 permits, only 1 should spawn.
         assert!(
-            join_set.len() <= 1,
+            poll_tasks.len() <= 1,
             "Expected at most 1 task spawned with budget=1, got {}",
-            join_set.len()
+            poll_tasks.len()
         );
     }
 

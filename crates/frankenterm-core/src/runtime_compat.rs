@@ -1670,7 +1670,7 @@ mod tests {
         // Verify Semaphore can be shared across tasks
         let sem = std::sync::Arc::new(Semaphore::new(1));
         let sem2 = sem.clone();
-        let handle = tokio::spawn(async move {
+        let handle = task::spawn(async move {
             let _p = sem2.acquire().await.expect("acquire in spawned task");
         });
         handle.await.expect("spawned task should complete");
@@ -1681,7 +1681,7 @@ mod tests {
         // Verify Mutex can be shared across tasks
         let m = std::sync::Arc::new(Mutex::new(0));
         let m2 = m.clone();
-        let handle = tokio::spawn(async move {
+        let handle = task::spawn(async move {
             let mut guard = m2.lock().await;
             *guard = 42;
         });
@@ -1695,7 +1695,7 @@ mod tests {
         // Verify RwLock can be shared across tasks
         let rw = std::sync::Arc::new(RwLock::new(0));
         let rw2 = rw.clone();
-        let handle = tokio::spawn(async move {
+        let handle = task::spawn(async move {
             let mut guard = rw2.write().await;
             *guard = 99;
         });

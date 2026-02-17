@@ -731,7 +731,7 @@ mod tests {
             for i in 0..10 {
                 let bridge = bridge.clone();
                 let text_provider = Arc::clone(&text_provider);
-                tasks.push(tokio::spawn(async move {
+                tasks.push(crate::runtime_compat::task::spawn(async move {
                     let query = format!("search quality {i}");
                     let request =
                         SearchBridgeRequest::new(query, 5).with_text_provider_arc(text_provider);

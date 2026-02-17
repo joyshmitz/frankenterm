@@ -855,6 +855,17 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
     Ok(server)
 }
 
+/// Build and run the MCP server over stdio transport.
+///
+/// This keeps transport details inside `frankenterm-core` so callers don't
+/// need a direct `fastmcp` dependency.
+pub fn run_stdio_server(config: &Config, db_path: Option<PathBuf>) -> Result<()> {
+    let server = build_server_with_db(config, db_path)?;
+    let transport = fastmcp::StdioTransport::stdio();
+    server.run_transport(transport);
+    Ok(())
+}
+
 fn tool_output_as_resource(uri: &str, contents: Vec<Content>) -> McpResult<Vec<ResourceContent>> {
     let text = contents
         .into_iter()

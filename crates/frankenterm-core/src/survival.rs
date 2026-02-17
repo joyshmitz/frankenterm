@@ -1796,7 +1796,7 @@ mod tests {
         }
 
         let m = Arc::clone(&model);
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             m.run().await;
         });
 

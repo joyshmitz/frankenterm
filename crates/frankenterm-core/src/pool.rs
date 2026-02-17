@@ -443,12 +443,12 @@ mod tests {
         let pool2 = pool.clone();
         let pool3 = pool.clone();
 
-        let h1 = tokio::spawn(async move {
+        let h1 = crate::runtime_compat::task::spawn(async move {
             let _r = pool2.acquire().await.expect("acquire 1");
             crate::runtime_compat::sleep(Duration::from_millis(50)).await;
         });
 
-        let h2 = tokio::spawn(async move {
+        let h2 = crate::runtime_compat::task::spawn(async move {
             let _r = pool3.acquire().await.expect("acquire 2");
             crate::runtime_compat::sleep(Duration::from_millis(50)).await;
         });
@@ -849,7 +849,7 @@ mod tests {
 
         for i in 0..3u64 {
             let p = pool.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(crate::runtime_compat::task::spawn(async move {
                 let r = p.acquire().await.expect("acquire");
                 crate::runtime_compat::sleep(Duration::from_millis(10)).await;
                 drop(r);

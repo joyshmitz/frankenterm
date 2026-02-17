@@ -310,7 +310,7 @@ mod tests {
         let (tx, rx) = channel(1);
         tx.send(1).await.unwrap();
 
-        let sender = tokio::spawn(async move { tx.send(2).await });
+        let sender = crate::runtime_compat::task::spawn(async move { tx.send(2).await });
 
         crate::runtime_compat::sleep(Duration::from_millis(20)).await;
         assert!(!sender.is_finished());
@@ -370,7 +370,7 @@ mod tests {
     #[tokio::test]
     async fn large_batch_1000_items() {
         let (tx, rx) = channel(64);
-        let sender = tokio::spawn(async move {
+        let sender = crate::runtime_compat::task::spawn(async move {
             for i in 0..1000u32 {
                 tx.send(i).await.unwrap();
             }
@@ -423,7 +423,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_1_stress() {
         let (tx, rx) = channel(1);
-        let sender = tokio::spawn(async move {
+        let sender = crate::runtime_compat::task::spawn(async move {
             for i in 0..100u32 {
                 tx.send(i).await.unwrap();
             }
@@ -501,13 +501,13 @@ mod tests {
         let (tx, rx) = channel(16);
         let n = 5000u32;
 
-        let producer = tokio::spawn(async move {
+        let producer = crate::runtime_compat::task::spawn(async move {
             for i in 0..n {
                 tx.send(i).await.unwrap();
             }
         });
 
-        let consumer = tokio::spawn(async move {
+        let consumer = crate::runtime_compat::task::spawn(async move {
             let mut received = Vec::with_capacity(n as usize);
             for _ in 0..n {
                 received.push(rx.recv().await.unwrap());
@@ -528,7 +528,7 @@ mod tests {
     async fn recv_wakes_on_close() {
         let (tx, rx) = channel::<u32>(4);
 
-        let consumer = tokio::spawn(async move { rx.recv().await });
+        let consumer = crate::runtime_compat::task::spawn(async move { rx.recv().await });
 
         // Give consumer time to block on empty queue
         crate::runtime_compat::sleep(Duration::from_millis(20)).await;

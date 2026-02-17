@@ -21,6 +21,7 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+futures.workspace = true
 
 # Pattern matching
 aho-corasick.workspace = true
@@ -69,7 +70,6 @@ fastmcp = { workspace = true, optional = true }
 toon_rust = { workspace = true, optional = true }
 # Web server (optional, behind feature)
 fastapi = { workspace = true, optional = true }
-fastapi-core = { workspace = true, optional = true }
 # Sync (optional, behind feature)
 asupersync = { workspace = true, optional = true, features = ["tls"] }
 # Distributed mode (optional, behind feature)
@@ -279,7 +279,7 @@ frankenterm = ["frankenterm-deps"]
 vendored = ["frankenterm"]  # backward compat alias
 browser = ["browser-automation"]
 mcp = ["mcp-server"]
-web = ["dep:fastapi", "dep:fastapi-core", "dep:asupersync"]
+web = ["dep:fastapi", "dep:asupersync"]
 streaming = ["web"]
 tui = ["dep:ratatui", "dep:crossterm"]
 ftui = ["dep:ftui"]
