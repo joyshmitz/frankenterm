@@ -189,6 +189,10 @@ name = "bocpd"
 harness = false
 
 [[bench]]
+name = "simd_scan"
+harness = false
+
+[[bench]]
 name = "causal_dag"
 harness = false
 
