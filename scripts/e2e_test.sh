@@ -9142,6 +9142,10 @@ run_scenario_alt_screen_conformance() {
     local runner_script="$temp_workspace/run_alt_profile.sh"
     local profile_results="[]"
     local -a spawned_panes=()
+    local events_file="$scenario_dir/alt_screen_conformance_events.jsonl"
+    local enter_seq_file="$PROJECT_ROOT/tests/e2e/alt_screen_enter.txt"
+    local leave_seq_file="$PROJECT_ROOT/tests/e2e/alt_screen_leave.txt"
+    local fixture_dummy_script="$PROJECT_ROOT/fixtures/e2e/dummy_alt_screen.sh"
 
     ipc_pane_state() {
         local target_pane="$1"
@@ -9170,6 +9174,72 @@ sys.stdout.write(data.decode("utf-8").strip())
 PY
     }
 
+    emit_conformance_event() {
+        local app="$1"
+        local pane_id="$2"
+        local sequence_no="$3"
+        local scheduler_decision="$4"
+        local frame_id="$5"
+        local queue_wait_ms="$6"
+        local reflow_ms="$7"
+        local render_ms="$8"
+        local present_ms="$9"
+        local outcome="${10:-ok}"
+        local error_code="${11:-null}"
+        local event_kind="${12:-stage}"
+        local total_ms=0
+        local p50_ms=0
+        local p95_ms=0
+        local p99_ms=0
+        local row=""
+
+        total_ms=$((queue_wait_ms + reflow_ms + render_ms + present_ms))
+        p50_ms="$total_ms"
+        p95_ms="$total_ms"
+        p99_ms="$total_ms"
+
+        row=$(jq -cn \
+            --arg resize_transaction_id "${RUN_ID}:${app}:${sequence_no}:${event_kind}" \
+            --argjson pane_id "$pane_id" \
+            --argjson tab_id 0 \
+            --argjson sequence_no "$sequence_no" \
+            --arg scheduler_decision "$scheduler_decision" \
+            --argjson frame_id "$frame_id" \
+            --arg test_case_id "alt_screen_conformance_${app}" \
+            --argjson queue_wait_ms "$queue_wait_ms" \
+            --argjson reflow_ms "$reflow_ms" \
+            --argjson render_ms "$render_ms" \
+            --argjson present_ms "$present_ms" \
+            --argjson p50_ms "$p50_ms" \
+            --argjson p95_ms "$p95_ms" \
+            --argjson p99_ms "$p99_ms" \
+            --arg outcome "$outcome" \
+            --arg error_code "$error_code" \
+            --arg event_kind "$event_kind" \
+            '{
+                resize_transaction_id: $resize_transaction_id,
+                pane_id: $pane_id,
+                tab_id: $tab_id,
+                sequence_no: $sequence_no,
+                scheduler_decision: $scheduler_decision,
+                frame_id: $frame_id,
+                test_case_id: $test_case_id,
+                queue_wait_ms: $queue_wait_ms,
+                reflow_ms: $reflow_ms,
+                render_ms: $render_ms,
+                present_ms: $present_ms,
+                p50_ms: $p50_ms,
+                p95_ms: $p95_ms,
+                p99_ms: $p99_ms,
+                event_kind: $event_kind,
+                outcome: $outcome,
+                error_code: (if $error_code == "null" then null else $error_code end)
+            }')
+
+        echo "$row" >> "$events_file"
+        printf '%s\n' "$row"
+    }
+
     cleanup_alt_screen_conformance() {
         log_verbose "Cleaning up alt_screen_conformance scenario"
         if [[ -n "$ft_pid" ]] && kill -0 "$ft_pid" 2>/dev/null; then
@@ -9193,16 +9263,30 @@ PY
             cp "$config_file" "$scenario_dir/wezterm.lua" 2>/dev/null || true
             cp "$runner_script" "$scenario_dir/run_alt_profile.sh" 2>/dev/null || true
         fi
+        cp "$enter_seq_file" "$scenario_dir/alt_screen_enter_fixture.txt" 2>/dev/null || true
+        cp "$leave_seq_file" "$scenario_dir/alt_screen_leave_fixture.txt" 2>/dev/null || true
+        cp "$fixture_dummy_script" "$scenario_dir/dummy_alt_screen.sh" 2>/dev/null || true
         rm -rf "$temp_workspace"
     }
     trap cleanup_alt_screen_conformance EXIT
 
     log_info "Workspace: $temp_workspace"
     log_info "WezTerm socket: $wezterm_socket"
+    : > "$events_file"
+
     echo "scenario: alt_screen_conformance" >> "$scenario_dir/scenario.log"
     echo "workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
     echo "wezterm_socket: $wezterm_socket" >> "$scenario_dir/scenario.log"
     echo "run_id: $RUN_ID" >> "$scenario_dir/scenario.log"
+    echo "events_file: $(basename "$events_file")" >> "$scenario_dir/scenario.log"
+    echo "enter_seq_file: $enter_seq_file" >> "$scenario_dir/scenario.log"
+    echo "leave_seq_file: $leave_seq_file" >> "$scenario_dir/scenario.log"
+    echo "dummy_alt_script: $fixture_dummy_script" >> "$scenario_dir/scenario.log"
+
+    if [[ ! -f "$enter_seq_file" || ! -f "$leave_seq_file" ]]; then
+        log_fail "Missing alt-screen regression fixture files"
+        return 1
+    fi
 
     export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
@@ -9220,17 +9304,43 @@ set -euo pipefail
 
 profile="${1:-unknown}"
 duration="${2:-5}"
+enter_fixture="${ALT_ENTER_SEQ_FILE:-}"
+leave_fixture="${ALT_LEAVE_SEQ_FILE:-}"
+dummy_alt_script="${ALT_DUMMY_SCRIPT:-}"
+
+emit_enter_seq() {
+    if [[ -n "$enter_fixture" && -f "$enter_fixture" ]]; then
+        printf '%b' "$(cat "$enter_fixture")"
+    else
+        printf '\033[?1049h'
+    fi
+}
+
+emit_leave_seq() {
+    if [[ -n "$leave_fixture" && -f "$leave_fixture" ]]; then
+        printf '%b' "$(cat "$leave_fixture")"
+    else
+        printf '\033[?1049l'
+    fi
+}
 
 fallback_alt_screen() {
     local label="$1"
-    printf '\033[?1049h'
+    emit_enter_seq
     printf 'ALT-CONFORMANCE:%s\n' "$label"
     sleep 1
-    printf '\033[?1049l'
+    emit_leave_seq
     sleep 1
 }
 
 case "$profile" in
+    fixture)
+        if [[ -n "$dummy_alt_script" && -x "$dummy_alt_script" ]]; then
+            timeout "$duration" "$dummy_alt_script" 2 >/dev/null 2>&1 || true
+        else
+            fallback_alt_screen "fixture-fallback"
+        fi
+        ;;
     vim)
         if command -v vim >/dev/null 2>&1; then
             tmp_file="$(mktemp /tmp/ft-alt-vim-XXXXXX)"
@@ -9285,6 +9395,7 @@ EOS
     local check_mux_cmd="WEZTERM_UNIX_SOCKET=\"$wezterm_socket\" wezterm cli --no-auto-start list >/dev/null 2>&1"
     if ! wait_for_condition "wezterm mux ready" "$check_mux_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for wezterm mux"
+        emit_conformance_event "bootstrap" 0 0 "alt_screen_conformance_mux_ready" 0 0 0 0 0 "failed" "wezterm_mux_timeout" "bootstrap" >/dev/null
         return 1
     fi
 
@@ -9295,44 +9406,71 @@ EOS
     ft_pid=$!
     if ! wait_for_condition "ft watch running" "kill -0 $ft_pid 2>/dev/null" 10; then
         log_fail "ft watch exited immediately"
+        emit_conformance_event "bootstrap" 0 1 "alt_screen_conformance_watch_boot" 1 0 0 0 0 "failed" "watch_boot_failed" "bootstrap" >/dev/null
         return 1
     fi
 
     local app=""
     local app_index=0
-    for app in vim less htop tmux; do
+    for app in fixture vim less htop tmux; do
         app_index=$((app_index + 1))
         local app_status="passed"
         local app_failures="[]"
         local app_dir="$scenario_dir/app_$(printf '%02d' "$app_index")_${app}"
         local app_log="$app_dir/${app}.log"
         local pulse_file="$app_dir/resize_pulses.jsonl"
-        local pane_id=""
+        local pane_id=0
         local spawn_output=""
         local resize_pulses_sent=0
         local command_available=false
+        local pulse_row=""
 
         mkdir -p "$app_dir"
-        if command -v "$app" >/dev/null 2>&1; then
+        : > "$pulse_file"
+        if [[ "$app" == "fixture" ]]; then
+            if [[ -x "$fixture_dummy_script" ]]; then
+                command_available=true
+            fi
+        elif command -v "$app" >/dev/null 2>&1; then
             command_available=true
         fi
 
         log_info "Alt-screen profile: $app (available=$command_available)"
         spawn_output=$(WEZTERM_UNIX_SOCKET="$wezterm_socket" wezterm cli --no-auto-start spawn \
-            --cwd "$temp_workspace" -- "$runner_script" "$app" 6 2>&1)
+            --cwd "$temp_workspace" -- env \
+            ALT_ENTER_SEQ_FILE="$enter_seq_file" \
+            ALT_LEAVE_SEQ_FILE="$leave_seq_file" \
+            ALT_DUMMY_SCRIPT="$fixture_dummy_script" \
+            "$runner_script" "$app" 6 2>&1)
         echo "$spawn_output" > "$app_dir/spawn_output.log"
         pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
 
         if [[ -z "$pane_id" ]]; then
+            pane_id=0
             log_fail "Failed to spawn profile pane for $app"
             app_status="failed"
-            app_failures="$(jq -c --arg reason "spawn_failed" '. + [$reason]' <<< "$app_failures")"
+            app_failures="$(jq -c --arg reason "spawn_failed" --arg resize_transaction_id "${RUN_ID}:${app}:0:spawn" '. + [{reason: $reason, resize_transaction_id: $resize_transaction_id}]' <<< "$app_failures")"
+            emit_conformance_event "$app" "$pane_id" 0 "alt_screen_conformance_spawn" 0 0 0 0 0 "failed" "spawn_failed" "spawn" >/dev/null
             result=1
             profile_results=$(jq -c \
                 --arg app "$app" \
                 --arg status "$app_status" \
+                --argjson command_available "$command_available" \
+                --argjson pane_id "$pane_id" \
+                --argjson resize_pulses_sent "$resize_pulses_sent" \
                 --argjson failures "$app_failures" \
-                '. + [{app: $app, status: $status, failures: $failures}]' <<< "$profile_results")
+                --arg context_file "$(basename "$app_dir")/app_context.json" \
+                --arg pulse_log "$(basename "$app_dir")/resize_pulses.jsonl" \
+                '. + [{
+                    app: $app,
+                    status: $status,
+                    command_available: $command_available,
+                    pane_id: $pane_id,
+                    resize_pulses_sent: $resize_pulses_sent,
+                    failures: $failures,
+                    context_file: $context_file,
+                    pulse_log: $pulse_log
+                }]' <<< "$profile_results")
             continue
         fi
 
@@ -9343,64 +9481,60 @@ EOS
         if ! wait_for_condition "pane observed ($app)" "$observed_cmd" "$wait_timeout"; then
             log_fail "Pane not observed for $app"
             app_status="failed"
-            app_failures="$(jq -c --arg reason "pane_not_observed" '. + [$reason]' <<< "$app_failures")"
+            app_failures="$(jq -c --arg reason "pane_not_observed" --arg resize_transaction_id "${RUN_ID}:${app}:1:pane_observed" '. + [{reason: $reason, resize_transaction_id: $resize_transaction_id}]' <<< "$app_failures")"
+            emit_conformance_event "$app" "$pane_id" 1 "alt_screen_conformance_pane_observed" 1 0 0 0 0 "failed" "pane_not_observed" "pane_observed" >/dev/null
             result=1
+        else
+            emit_conformance_event "$app" "$pane_id" 1 "alt_screen_conformance_pane_observed" 1 0 0 0 0 "ok" "null" "pane_observed" >/dev/null
         fi
 
         local alt_true_cmd="ipc_pane_state \"$pane_id\" | jq -e '.ok == true and .data.known == true and ((.data.cursor_alt_screen // .data.alt_screen // false) == true)' >/dev/null 2>&1"
         if ! wait_for_condition "alt-screen true ($app)" "$alt_true_cmd" 20; then
             log_fail "Alt-screen true not observed for $app"
             app_status="failed"
-            app_failures="$(jq -c --arg reason "alt_screen_true_missing" '. + [$reason]' <<< "$app_failures")"
+            app_failures="$(jq -c --arg reason "alt_screen_true_missing" --arg resize_transaction_id "${RUN_ID}:${app}:2:alt_true" '. + [{reason: $reason, resize_transaction_id: $resize_transaction_id}]' <<< "$app_failures")"
+            emit_conformance_event "$app" "$pane_id" 2 "alt_screen_conformance_alt_true" 2 0 0 0 0 "failed" "alt_screen_true_missing" "alt_true" >/dev/null
             result=1
+        else
+            emit_conformance_event "$app" "$pane_id" 2 "alt_screen_conformance_alt_true" 2 0 0 0 0 "ok" "null" "alt_true" >/dev/null
         fi
 
         # Aggressive deterministic resize-pulse stream: emit request sequences and
         # capture correlation/timing rows per pulse for downstream triage.
-        : > "$pulse_file"
         local pulse=0
         for pulse in $(seq 1 10); do
-            local rows=$((22 + (pulse % 6) * 3))
-            local cols=$((78 + (pulse % 7) * 6))
-            local pulse_payload
+            local rows=0
+            local cols=0
+            local pulse_payload=""
+            local queue_wait_ms=0
+            local reflow_ms=0
+            local render_ms=0
+            local present_ms=0
+            local pulse_outcome="ok"
+            local pulse_error_code="null"
+            local scheduler_decision="alt_screen_conformance_resize_pulse"
+            rows=$((22 + (pulse % 6) * 3))
+            cols=$((78 + (pulse % 7) * 6))
             pulse_payload=$(printf '\033[8;%d;%dt' "$rows" "$cols")
+            queue_wait_ms=$((pulse % 3))
+            reflow_ms=$((1 + (pulse % 2)))
+            render_ms=1
+            present_ms=1
 
             if FT_WORKSPACE="$temp_workspace" FT_DATA_DIR="$FT_DATA_DIR" WEZTERM_UNIX_SOCKET="$wezterm_socket" \
                 "$FT_BINARY" robot send "$pane_id" "$pulse_payload" >/dev/null 2>&1; then
                 resize_pulses_sent=$((resize_pulses_sent + 1))
+            else
+                pulse_outcome="failed"
+                pulse_error_code="resize_pulse_send_failed"
+                scheduler_decision="alt_screen_conformance_resize_pulse_send_failed"
+                app_status="failed"
+                app_failures="$(jq -c --arg reason "$pulse_error_code" --arg resize_transaction_id "${RUN_ID}:${app}:${pulse}:resize_pulse" '. + [{reason: $reason, resize_transaction_id: $resize_transaction_id}]' <<< "$app_failures")"
+                result=1
             fi
 
-            jq -cn \
-                --arg resize_transaction_id "${RUN_ID}:${app}:${pulse}" \
-                --argjson pane_id "$pane_id" \
-                --argjson tab_id 0 \
-                --argjson sequence_no "$pulse" \
-                --arg scheduler_decision "alt_screen_conformance_resize_pulse" \
-                --argjson frame_id "$pulse" \
-                --arg test_case_id "alt_screen_conformance_${app}" \
-                --argjson queue_wait_ms 0 \
-                --argjson reflow_ms 1 \
-                --argjson render_ms 1 \
-                --argjson present_ms 1 \
-                --argjson p50_ms 1 \
-                --argjson p95_ms 1 \
-                --argjson p99_ms 1 \
-                '{
-                    resize_transaction_id: $resize_transaction_id,
-                    pane_id: $pane_id,
-                    tab_id: $tab_id,
-                    sequence_no: $sequence_no,
-                    scheduler_decision: $scheduler_decision,
-                    frame_id: $frame_id,
-                    test_case_id: $test_case_id,
-                    queue_wait_ms: $queue_wait_ms,
-                    reflow_ms: $reflow_ms,
-                    render_ms: $render_ms,
-                    present_ms: $present_ms,
-                    p50_ms: $p50_ms,
-                    p95_ms: $p95_ms,
-                    p99_ms: $p99_ms
-                }' >> "$pulse_file"
+            pulse_row=$(emit_conformance_event "$app" "$pane_id" "$pulse" "$scheduler_decision" "$pulse" "$queue_wait_ms" "$reflow_ms" "$render_ms" "$present_ms" "$pulse_outcome" "$pulse_error_code" "resize_pulse")
+            printf '%s\n' "$pulse_row" >> "$pulse_file"
             sleep 0.1
         done
 
@@ -9408,13 +9542,30 @@ EOS
         if ! wait_for_condition "alt-screen false ($app)" "$alt_false_cmd" 30; then
             log_fail "Alt-screen false not observed for $app"
             app_status="failed"
-            app_failures="$(jq -c --arg reason "alt_screen_false_missing" '. + [$reason]' <<< "$app_failures")"
+            app_failures="$(jq -c --arg reason "alt_screen_false_missing" --arg resize_transaction_id "${RUN_ID}:${app}:99:alt_false" '. + [{reason: $reason, resize_transaction_id: $resize_transaction_id}]' <<< "$app_failures")"
+            emit_conformance_event "$app" "$pane_id" 99 "alt_screen_conformance_alt_false" 99 0 0 0 0 "failed" "alt_screen_false_missing" "alt_false" >/dev/null
             result=1
+        else
+            emit_conformance_event "$app" "$pane_id" 99 "alt_screen_conformance_alt_false" 99 0 0 0 0 "ok" "null" "alt_false" >/dev/null
         fi
 
         ipc_pane_state "$pane_id" > "$app_dir/pane_state_final.json" 2>&1 || true
         WEZTERM_UNIX_SOCKET="$wezterm_socket" wezterm cli --no-auto-start get-text --pane-id "$pane_id" \
             > "$app_log" 2>&1 || true
+
+        jq -n \
+            --arg run_id "$RUN_ID" \
+            --arg app "$app" \
+            --arg status "$app_status" \
+            --argjson command_available "$command_available" \
+            --argjson pane_id "$pane_id" \
+            --argjson resize_pulses_sent "$resize_pulses_sent" \
+            --argjson failures "$app_failures" \
+            --arg pulse_log "$(basename "$app_dir")/resize_pulses.jsonl" \
+            --arg pane_state_file "$(basename "$app_dir")/pane_state_final.json" \
+            --arg pane_text_file "$(basename "$app_dir")/${app}.log" \
+            '{run_id: $run_id, app: $app, status: $status, command_available: $command_available, pane_id: $pane_id, resize_pulses_sent: $resize_pulses_sent, failures: $failures, pulse_log: $pulse_log, pane_state_file: $pane_state_file, pane_text_file: $pane_text_file}' \
+            > "$app_dir/app_context.json"
 
         profile_results=$(jq -c \
             --arg app "$app" \
@@ -9423,26 +9574,132 @@ EOS
             --argjson pane_id "$pane_id" \
             --argjson resize_pulses_sent "$resize_pulses_sent" \
             --argjson failures "$app_failures" \
+            --arg context_file "$(basename "$app_dir")/app_context.json" \
+            --arg pulse_log "$(basename "$app_dir")/resize_pulses.jsonl" \
             '. + [{
                 app: $app,
                 status: $status,
                 command_available: $command_available,
                 pane_id: $pane_id,
                 resize_pulses_sent: $resize_pulses_sent,
-                failures: $failures
+                failures: $failures,
+                context_file: $context_file,
+                pulse_log: $pulse_log
             }]' <<< "$profile_results")
     done
+
+    local failed_profiles="[]"
+    local failed_count=0
+    failed_profiles=$(jq -c '[.[] | select(.status != "passed")]' <<< "$profile_results")
+    failed_count=$(jq -r 'length' <<< "$failed_profiles")
 
     jq -n \
         --arg run_id "$RUN_ID" \
         --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --arg events_file "$(basename "$events_file")" \
+        --arg enter_seq_fixture "$enter_seq_file" \
+        --arg leave_seq_fixture "$leave_seq_file" \
+        --arg dummy_alt_fixture "$fixture_dummy_script" \
         --argjson profiles "$profile_results" \
+        --argjson failed_profiles "$failed_profiles" \
         '{
             scenario: "alt_screen_conformance",
             run_id: $run_id,
             generated_at: $generated_at,
-            profiles: $profiles
+            events_file: $events_file,
+            fixtures: {
+                enter_seq_file: $enter_seq_fixture,
+                leave_seq_file: $leave_seq_fixture,
+                dummy_alt_script: $dummy_alt_fixture
+            },
+            profiles: $profiles,
+            failed_profiles: $failed_profiles
         }' > "$scenario_dir/alt_screen_conformance_summary.json"
+
+    if [[ "$failed_count" -gt 0 ]]; then
+        local scenario_tail=""
+        local watch_tail=""
+        local failure_events="[]"
+        local histogram_json=""
+        local generated_at=""
+        generated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        scenario_tail=$(tail -n 200 "$scenario_dir/scenario.log" 2>/dev/null || true)
+        watch_tail=$(tail -n 200 "$scenario_dir/wa_watch.log" 2>/dev/null || true)
+        failure_events=$(jq -s '[.[] | select((.outcome // "ok") != "ok")]' "$events_file" 2>/dev/null || echo "[]")
+        histogram_json=$(jq -s '
+            def quantile($arr; $p):
+                if ($arr | length) == 0 then 0
+                else $arr[((((($arr | length) - 1) * $p) | floor))] end;
+            [ .[] | ((.queue_wait_ms // 0) + (.reflow_ms // 0) + (.render_ms // 0) + (.present_ms // 0)) ] as $latencies
+            | ($latencies | sort) as $sorted
+            | {
+                frame_count: ($latencies | length),
+                dropped_frame_count: ([.[] | select((.outcome // "ok") != "ok")] | length),
+                p50_ms: quantile($sorted; 0.50),
+                p95_ms: quantile($sorted; 0.95),
+                p99_ms: quantile($sorted; 0.99),
+                bucket_ms: $latencies
+            }
+        ' "$events_file" 2>/dev/null || echo '{"frame_count":0,"dropped_frame_count":0,"p50_ms":0,"p95_ms":0,"p99_ms":0,"bucket_ms":[]}')
+
+        jq -n \
+            --arg schema_version "wa.trace_bundle.v2" \
+            --arg generated_at "$generated_at" \
+            --arg test_case_id "alt_screen_conformance" \
+            --arg run_id "$RUN_ID" \
+            --arg events_file "$(basename "$events_file")" \
+            --arg scenario_log_tail "$scenario_tail" \
+            --arg watch_log_tail "$watch_tail" \
+            --argjson failed_profiles "$failed_profiles" \
+            --argjson failure_events "$failure_events" \
+            '{
+                schema_version: $schema_version,
+                generated_at: $generated_at,
+                test_case_id: $test_case_id,
+                run_id: $run_id,
+                events_file: $events_file,
+                failed_profiles: $failed_profiles,
+                failure_events: $failure_events,
+                tails: {
+                    scenario_log: $scenario_log_tail,
+                    watch_log: $watch_log_tail
+                }
+            }' > "$scenario_dir/trace_bundle.json"
+
+        jq -n \
+            --arg schema_version "wa.frame_histogram.v2" \
+            --arg generated_at "$generated_at" \
+            --arg test_case_id "alt_screen_conformance" \
+            --arg run_id "$RUN_ID" \
+            --argjson histogram "$histogram_json" \
+            '{
+                schema_version: $schema_version,
+                generated_at: $generated_at,
+                test_case_id: $test_case_id,
+                run_id: $run_id,
+                histogram: $histogram
+            }' > "$scenario_dir/frame_histogram.json"
+
+        jq -n \
+            --arg schema_version "wa.failure_signature.v2" \
+            --arg generated_at "$generated_at" \
+            --arg test_case_id "alt_screen_conformance" \
+            --arg signature "alt_screen_conformance_failure" \
+            --arg run_id "$RUN_ID" \
+            --arg events_file "$(basename "$events_file")" \
+            --argjson failed_profiles "$failed_profiles" \
+            --argjson failure_events "$failure_events" \
+            '{
+                schema_version: $schema_version,
+                generated_at: $generated_at,
+                test_case_id: $test_case_id,
+                signature: $signature,
+                run_id: $run_id,
+                events_file: $events_file,
+                failed_profiles: $failed_profiles,
+                failure_events: $failure_events
+            }' > "$scenario_dir/failure_signature.json"
+    fi
 
     trap - EXIT
     cleanup_alt_screen_conformance
