@@ -1405,7 +1405,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
@@ -1438,7 +1438,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
@@ -1469,7 +1469,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
@@ -1495,7 +1495,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
@@ -1521,7 +1521,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
@@ -1573,7 +1573,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
@@ -1594,7 +1594,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
@@ -1627,7 +1627,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
@@ -1683,7 +1683,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
@@ -1741,7 +1741,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
@@ -1779,7 +1779,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
@@ -1812,7 +1812,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
@@ -1845,7 +1845,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
@@ -1880,7 +1880,7 @@ mod tests {
 
         // First call takes the receiver
         let e2 = engine.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
         sleep(Duration::from_millis(100)).await;
@@ -1921,7 +1921,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
@@ -1960,7 +1960,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::runtime_compat::task::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 

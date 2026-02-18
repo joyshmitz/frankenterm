@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(not(feature = "asupersync-runtime"))]
+use crate::runtime_compat::mpsc;
 use frankensearch::{Cx, ScoredResult, SearchError, SearchPhase, TwoTierMetrics, TwoTierSearcher};
 use thiserror::Error;
 use tokio::sync::Notify;
-#[cfg(not(feature = "asupersync-runtime"))]
-use tokio::sync::mpsc;
 
 /// Shared document-text provider for exclusion-aware search operations.
 pub type TextProvider = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;

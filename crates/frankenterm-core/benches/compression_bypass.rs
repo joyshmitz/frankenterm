@@ -170,7 +170,7 @@ async fn connect_once(mode: VendoredCompressionMode) -> Result<(), String> {
     Ok(())
 }
 
-async fn connect_with_manual_fallback() -> Result<(), String> {
+async fn connect_with_auto_fallback() -> Result<(), String> {
     let temp_dir = tempfile::tempdir().map_err(|err| err.to_string())?;
     let socket_path = temp_dir.path().join("compression-bypass-fallback.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).map_err(|err| err.to_string())?;
@@ -185,15 +185,9 @@ async fn connect_with_manual_fallback() -> Result<(), String> {
     });
 
     let auto = DirectMuxClientConfig::default().with_socket_path(socket_path.clone());
-    if DirectMuxClient::connect(auto).await.is_ok() {
-        return Err("expected first auto-mode attempt to fail".to_string());
-    }
-
-    let mut fallback = DirectMuxClientConfig::default().with_socket_path(socket_path);
-    fallback.compression_mode = VendoredCompressionMode::Always;
-    let client = DirectMuxClient::connect(fallback)
+    let client = DirectMuxClient::connect(auto)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| format!("auto fallback connect failed: {err}"))?;
     drop(client);
 
     let _ = timeout(Duration::from_secs(1), server).await;
@@ -268,11 +262,9 @@ fn bench_fallback_detection_latency(c: &mut Criterion) {
     let mut group = c.benchmark_group("compression_bypass/fallback_detection_latency");
     group.sample_size(20);
 
-    group.bench_function("auto_reject_then_always_retry", |b| {
+    group.bench_function("auto_reject_then_auto_retry", |b| {
         b.to_async(&rt).iter(|| async {
-            connect_with_manual_fallback()
-                .await
-                .expect("manual fallback");
+            connect_with_auto_fallback().await.expect("auto fallback");
         });
     });
 

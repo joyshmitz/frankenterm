@@ -15,9 +15,8 @@ use frankenterm_core::recording::{
     EgressEvent, EgressNoopTap, EgressTap, RecorderSegmentKind, SharedEgressTap,
     captured_kind_to_segment,
 };
-use frankenterm_core::runtime_compat::task as runtime_task;
 use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder, RwLock, mpsc, sleep};
-use frankenterm_core::tailer::{CaptureEvent, TailerConfig, TailerSupervisor};
+use frankenterm_core::tailer::{CaptureEvent, TailerConfig, TailerPollTaskSet, TailerSupervisor};
 use frankenterm_core::wezterm::{PaneInfo, PaneTextSource};
 
 #[derive(Debug, Default)]
@@ -152,10 +151,9 @@ fn egress_tap_fires_on_delta_capture() {
         tailer.set_egress_tap(tap.clone());
         tailer.sync_tailers(&pane_map(&[1]));
 
-        let mut js = runtime_task::JoinSet::new();
-        tailer.spawn_ready(&mut js);
-        while let Some(r) = js.join_next().await {
-            let (pid, out) = r.unwrap();
+        let mut poll_tasks = TailerPollTaskSet::new();
+        tailer.spawn_ready(&mut poll_tasks);
+        while let Some((pid, out)) = poll_tasks.join_next().await {
             tailer.handle_poll_result(pid, out);
         }
         while rx.try_recv().is_ok() {}
@@ -172,10 +170,9 @@ fn egress_tap_fires_on_delta_capture() {
             .await;
         sleep(Duration::from_millis(20)).await;
 
-        let mut js = runtime_task::JoinSet::new();
-        tailer.spawn_ready(&mut js);
-        while let Some(r) = js.join_next().await {
-            let (pid, out) = r.unwrap();
+        let mut poll_tasks = TailerPollTaskSet::new();
+        tailer.spawn_ready(&mut poll_tasks);
+        while let Some((pid, out)) = poll_tasks.join_next().await {
             tailer.handle_poll_result(pid, out);
         }
         while rx.try_recv().is_ok() {}
@@ -218,10 +215,9 @@ fn egress_tap_captures_gap_segments() {
         tailer.set_egress_tap(tap.clone());
         tailer.sync_tailers(&pane_map(&[1]));
 
-        let mut js = runtime_task::JoinSet::new();
-        tailer.spawn_ready(&mut js);
-        while let Some(r) = js.join_next().await {
-            let (pid, out) = r.unwrap();
+        let mut poll_tasks = TailerPollTaskSet::new();
+        tailer.spawn_ready(&mut poll_tasks);
+        while let Some((pid, out)) = poll_tasks.join_next().await {
             tailer.handle_poll_result(pid, out);
         }
         while rx.try_recv().is_ok() {}
@@ -231,10 +227,9 @@ fn egress_tap_captures_gap_segments() {
             .await;
         sleep(Duration::from_millis(20)).await;
 
-        let mut js = runtime_task::JoinSet::new();
-        tailer.spawn_ready(&mut js);
-        while let Some(r) = js.join_next().await {
-            let (pid, out) = r.unwrap();
+        let mut poll_tasks = TailerPollTaskSet::new();
+        tailer.spawn_ready(&mut poll_tasks);
+        while let Some((pid, out)) = poll_tasks.join_next().await {
             tailer.handle_poll_result(pid, out);
         }
         while rx.try_recv().is_ok() {}
@@ -281,10 +276,9 @@ fn egress_tap_multi_pane() {
         tailer.set_egress_tap(tap.clone());
         tailer.sync_tailers(&pane_map(&[10, 20]));
 
-        let mut js = runtime_task::JoinSet::new();
-        tailer.spawn_ready(&mut js);
-        while let Some(r) = js.join_next().await {
-            let (pid, out) = r.unwrap();
+        let mut poll_tasks = TailerPollTaskSet::new();
+        tailer.spawn_ready(&mut poll_tasks);
+        while let Some((pid, out)) = poll_tasks.join_next().await {
             tailer.handle_poll_result(pid, out);
         }
         while rx.try_recv().is_ok() {}
@@ -319,10 +313,9 @@ fn egress_tap_not_set_still_works() {
         );
         tailer.sync_tailers(&pane_map(&[1]));
 
-        let mut js = runtime_task::JoinSet::new();
-        tailer.spawn_ready(&mut js);
-        while let Some(r) = js.join_next().await {
-            let (pid, out) = r.unwrap();
+        let mut poll_tasks = TailerPollTaskSet::new();
+        tailer.spawn_ready(&mut poll_tasks);
+        while let Some((pid, out)) = poll_tasks.join_next().await {
             tailer.handle_poll_result(pid, out);
         }
 
@@ -367,10 +360,9 @@ fn egress_monotonic_sequence() {
                 .set_text(1, &format!("aaaa\nbbbb\ncccc\ndddd\neeee\nout-{i}\n"))
                 .await;
             sleep(Duration::from_millis(20)).await;
-            let mut js = runtime_task::JoinSet::new();
-            tailer.spawn_ready(&mut js);
-            while let Some(r) = js.join_next().await {
-                let (pid, out) = r.unwrap();
+            let mut poll_tasks = TailerPollTaskSet::new();
+            tailer.spawn_ready(&mut poll_tasks);
+            while let Some((pid, out)) = poll_tasks.join_next().await {
                 tailer.handle_poll_result(pid, out);
             }
             while rx.try_recv().is_ok() {}

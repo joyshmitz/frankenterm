@@ -299,6 +299,7 @@ pub mod mpsc {
     pub use tokio::sync::mpsc::{
         Receiver, Sender, channel,
         error::{SendError, TryRecvError, TrySendError},
+        unbounded_channel,
     };
 }
 

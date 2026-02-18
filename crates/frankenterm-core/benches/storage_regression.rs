@@ -629,6 +629,8 @@ fn bench_recorder_swarm_load_profile(c: &mut Criterion) {
                                 &[1.0, 0.25],
                                 SearchMode::Hybrid,
                                 60,
+                                1.0,
+                                1.0,
                             )
                             .await
                             .expect("hybrid search");

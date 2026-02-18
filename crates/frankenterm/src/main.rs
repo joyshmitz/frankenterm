@@ -3603,7 +3603,6 @@ const ROBOT_ERR_FTS_QUERY: &str = "robot.fts_query_error";
 const ROBOT_ERR_STORAGE: &str = "robot.storage_error";
 const ROBOT_ERR_FEATURE_NOT_AVAILABLE: &str = "robot.feature_not_available";
 const ROBOT_BATCH_GET_TEXT_MAX_CONCURRENT: usize = 16;
-const CLI_HYBRID_RRF_K: u32 = 60;
 /// Cooldown period between account refreshes (milliseconds)
 const ROBOT_REFRESH_COOLDOWN_MS: i64 = 30_000;
 
@@ -3644,6 +3643,21 @@ fn unified_search_mode_to_core_mode(
             frankenterm_core::search::SearchMode::Hybrid
         }
     }
+}
+
+fn effective_search_rrf_k(config: &frankenterm_core::config::Config) -> u32 {
+    config.search.rrf_k.max(1)
+}
+
+fn effective_search_fusion_weights(config: &frankenterm_core::config::Config) -> (f32, f32) {
+    let quality_weight = if config.search.quality_weight.is_finite() {
+        config.search.quality_weight.clamp(0.0, 1.0)
+    } else {
+        0.7
+    };
+    let semantic_weight = quality_weight as f32;
+    let lexical_weight = (1.0 - semantic_weight).max(0.0);
+    (lexical_weight, semantic_weight)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -7237,7 +7251,7 @@ async fn batch_get_pane_text(
     for pane_id in pane_ids.iter().copied() {
         let wezterm = wezterm.clone();
         let semaphore = semaphore.clone();
-        let task = tokio::spawn(async move {
+        let task = frankenterm_core::runtime_compat::task::spawn(async move {
             let _permit = semaphore
                 .acquire_owned()
                 .await
@@ -8500,7 +8514,7 @@ async fn spawn_distributed_listener(
         None
     };
 
-    let task = tokio::spawn(async move {
+    let task = frankenterm_core::runtime_compat::task::spawn(async move {
         loop {
             if shutdown_flag.load(Ordering::SeqCst) {
                 break;
@@ -8540,7 +8554,7 @@ async fn spawn_distributed_listener(
             let shutdown_flag = Arc::clone(&shutdown_flag);
             let tls_acceptor = tls_acceptor.clone();
 
-            tokio::spawn(async move {
+            frankenterm_core::runtime_compat::task::spawn(async move {
                 let _permit = permit;
                 if let Some(acceptor) = tls_acceptor {
                     match acceptor.accept(stream).await {
@@ -9214,16 +9228,17 @@ async fn run_distributed_agent(
     let token = frankenterm_core::distributed::resolve_expected_token(&config.distributed)
         .map_err(|err| anyhow::anyhow!("Failed to resolve distributed token: {err}"))?;
 
-    let distributed_task = tokio::spawn(distributed_agent_stream_forever(
-        connect_addr.clone(),
-        config.distributed.clone(),
-        Arc::clone(&handle.storage),
-        Arc::clone(&event_bus),
-        Arc::clone(&handle.shutdown_flag),
-        agent_id.clone(),
-        session_id,
-        token,
-    ));
+    let distributed_task =
+        frankenterm_core::runtime_compat::task::spawn(distributed_agent_stream_forever(
+            connect_addr.clone(),
+            config.distributed.clone(),
+            Arc::clone(&handle.storage),
+            Arc::clone(&event_bus),
+            Arc::clone(&handle.shutdown_flag),
+            agent_id.clone(),
+            session_id,
+            token,
+        ));
 
     #[cfg(unix)]
     {
@@ -9544,7 +9559,7 @@ async fn run_watcher(
                 mute_storage,
             );
             let mut subscriber = event_bus.subscribe_detections();
-            let handle = tokio::spawn(async move {
+            let handle = frankenterm_core::runtime_compat::task::spawn(async move {
                 tracing::info!("Notification pipeline started, listening for detection events");
                 loop {
                     match subscriber.recv().await {
@@ -9712,7 +9727,7 @@ async fn run_watcher(
 
         // Spawn workflow runner event loop
         let event_bus_clone = Arc::clone(&event_bus);
-        let runner_handle = tokio::spawn(async move {
+        let runner_handle = frankenterm_core::runtime_compat::task::spawn(async move {
             tracing::info!("Workflow runner started, listening for detection events");
             workflow_runner.run(&event_bus_clone).await;
             tracing::info!("Workflow runner stopped");
@@ -9793,7 +9808,7 @@ async fn run_watcher(
         let storage = scheduler_storage.clone();
         let event_bus = Arc::clone(&event_bus);
         let shutdown_flag = Arc::clone(&handle.shutdown_flag);
-        tokio::spawn(async move {
+        frankenterm_core::runtime_compat::task::spawn(async move {
             run_saved_search_scheduler(storage, event_bus, shutdown_flag).await;
         })
     };
@@ -9865,7 +9880,7 @@ async fn run_watcher(
                     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
                     let event_bus = Arc::clone(&event_bus);
                     let registry = Arc::clone(&handle.registry);
-                    let ipc_task = tokio::spawn(async move {
+                    let ipc_task = frankenterm_core::runtime_compat::task::spawn(async move {
                         server
                             .run_with_registry_auth_and_rpc(
                                 event_bus,
@@ -9906,7 +9921,7 @@ async fn run_watcher(
         let storage = Arc::clone(&handle.storage);
         let shutdown_flag = Arc::clone(&handle.shutdown_flag);
         let notify_config = config.notifications.desktop.clone();
-        Some(tokio::spawn(async move {
+        Some(frankenterm_core::runtime_compat::task::spawn(async move {
             run_scheduled_backups(
                 backup_config,
                 workspace_root,
@@ -9925,7 +9940,7 @@ async fn run_watcher(
     let _orphan_reaper_handle = {
         let cli_config = config.cli.clone();
         let shutdown_flag = Arc::clone(&handle.shutdown_flag);
-        tokio::spawn(async move {
+        frankenterm_core::runtime_compat::task::spawn(async move {
             frankenterm_core::orphan_reaper::run_orphan_reaper(cli_config, shutdown_flag).await;
         })
     };
@@ -9952,7 +9967,7 @@ async fn run_watcher(
             let loop_timeout = config.cli.timeout_seconds;
             // Bridge AtomicBool shutdown flag into a watch channel for run_periodic
             let (snap_shutdown_tx, snap_shutdown_rx) = watch::channel(false);
-            tokio::spawn(async move {
+            frankenterm_core::runtime_compat::task::spawn(async move {
                 loop {
                     if shutdown_flag_for_snap.load(std::sync::atomic::Ordering::SeqCst) {
                         let _ = snap_shutdown_tx.send(true);
@@ -9961,7 +9976,7 @@ async fn run_watcher(
                     frankenterm_core::runtime_compat::sleep(Duration::from_millis(500)).await;
                 }
             });
-            tokio::spawn(async move {
+            frankenterm_core::runtime_compat::task::spawn(async move {
                 engine_for_loop
                     .run_periodic(snap_shutdown_rx, move || async move {
                         let wez =
@@ -11892,6 +11907,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             }
 
                             // Perform search
+                            let hybrid_rrf_k = effective_search_rrf_k(&config);
+                            let (hybrid_lexical_weight, hybrid_semantic_weight) =
+                                effective_search_fusion_weights(&config);
                             let search_results: Result<
                                 Vec<frankenterm_core::storage::SearchResult>,
                                 frankenterm_core::Error,
@@ -11930,7 +11948,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             &embedder_id,
                                             &query_vector,
                                             search_mode,
-                                            CLI_HYBRID_RRF_K,
+                                            hybrid_rrf_k,
+                                            hybrid_lexical_weight,
+                                            hybrid_semantic_weight,
                                         )
                                         .await
                                     {
@@ -16026,6 +16046,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         frankenterm_core::query_contract::to_storage_search_options(&canonical);
                     base_options.pane_id = None;
                     let query_for_storage = canonical.query.clone();
+                    let hybrid_rrf_k = effective_search_rrf_k(&config);
+                    let (hybrid_lexical_weight, hybrid_semantic_weight) =
+                        effective_search_fusion_weights(&config);
 
                     let search_results = if let Some(candidate_panes) = pane_candidates {
                         if candidate_panes.is_empty() {
@@ -16051,7 +16074,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             embedder_id,
                                             query_vector,
                                             search_mode,
-                                            CLI_HYBRID_RRF_K,
+                                            hybrid_rrf_k,
+                                            hybrid_lexical_weight,
+                                            hybrid_semantic_weight,
                                         )
                                         .await
                                     {
@@ -16103,7 +16128,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 embedder_id,
                                                 query_vector,
                                                 search_mode,
-                                                CLI_HYBRID_RRF_K,
+                                                hybrid_rrf_k,
+                                                hybrid_lexical_weight,
+                                                hybrid_semantic_weight,
                                             )
                                             .await
                                         {
@@ -16179,7 +16206,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         embedder_id,
                                         query_vector,
                                         search_mode,
-                                        CLI_HYBRID_RRF_K,
+                                        hybrid_rrf_k,
+                                        hybrid_lexical_weight,
+                                        hybrid_semantic_weight,
                                     )
                                     .await
                                 {
@@ -35729,12 +35758,12 @@ log_level = "debug"
         record.schedule_interval_ms = Some(1_000);
         storage.insert_saved_search(record.clone()).await.unwrap();
 
-        let scheduler_handle = frankenterm_core::runtime_compat::task::spawn(
-            run_saved_search_scheduler(
-            storage.clone(),
-            Arc::clone(&bus),
-            Arc::clone(&shutdown_flag),
-        ));
+        let scheduler_handle =
+            frankenterm_core::runtime_compat::task::spawn(run_saved_search_scheduler(
+                storage.clone(),
+                Arc::clone(&bus),
+                Arc::clone(&shutdown_flag),
+            ));
 
         let mut sub = bus.subscribe_detections();
         let event = frankenterm_core::runtime_compat::timeout(
@@ -35830,12 +35859,12 @@ log_level = "debug"
         record.schedule_interval_ms = Some(1_000);
         storage.insert_saved_search(record.clone()).await.unwrap();
 
-        let scheduler_handle = frankenterm_core::runtime_compat::task::spawn(
-            run_saved_search_scheduler(
-            storage.clone(),
-            Arc::clone(&bus),
-            Arc::clone(&shutdown_flag),
-        ));
+        let scheduler_handle =
+            frankenterm_core::runtime_compat::task::spawn(run_saved_search_scheduler(
+                storage.clone(),
+                Arc::clone(&bus),
+                Arc::clone(&shutdown_flag),
+            ));
 
         let first =
             wait_for_saved_search_error(&storage, "invalid", std::time::Duration::from_secs(3))
@@ -35884,12 +35913,12 @@ log_level = "debug"
         record.last_run_at = Some(now);
         storage.insert_saved_search(record.clone()).await.unwrap();
 
-        let scheduler_handle = frankenterm_core::runtime_compat::task::spawn(
-            run_saved_search_scheduler(
-            storage.clone(),
-            Arc::clone(&bus),
-            Arc::clone(&shutdown_flag),
-        ));
+        let scheduler_handle =
+            frankenterm_core::runtime_compat::task::spawn(run_saved_search_scheduler(
+                storage.clone(),
+                Arc::clone(&bus),
+                Arc::clone(&shutdown_flag),
+            ));
 
         frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(600)).await;
         let fetched = storage

@@ -6,7 +6,7 @@ mod web_tests {
 
     use frankenterm_core::events::{Event, EventBus};
     use frankenterm_core::patterns::{AgentType, Detection, Severity};
-    use frankenterm_core::runtime_compat::{sleep, timeout};
+    use frankenterm_core::runtime_compat::{sleep, task, timeout};
     use frankenterm_core::storage::{PaneRecord, StorageHandle};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -373,7 +373,7 @@ mod web_tests {
         let addr = server.bound_addr();
 
         let req = b"GET /stream/deltas?pane_id=7&max_hz=200 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        let fetch_task = tokio::spawn(async move {
+        let fetch_task = task::spawn(async move {
             fetch_stream_prefix(addr, req, Duration::from_secs(3), 512).await
         });
 
@@ -430,7 +430,7 @@ mod web_tests {
         let addr = server.bound_addr();
 
         let req = b"GET /stream/events?channel=detections&max_hz=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        let fetch_task = tokio::spawn(async move {
+        let fetch_task = task::spawn(async move {
             fetch_stream_prefix(addr, req, Duration::from_secs(4), 640).await
         });
 

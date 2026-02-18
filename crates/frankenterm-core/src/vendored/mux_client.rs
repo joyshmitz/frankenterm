@@ -166,13 +166,34 @@ impl DirectMuxClient {
             return Err(DirectMuxError::SocketNotFound(socket_path));
         }
 
+        let preferred_mode = resolve_compression_mode(config.compression_mode, &socket_path);
+        match Self::connect_with_mode(socket_path.clone(), config.clone(), preferred_mode).await {
+            Ok(client) => Ok(client),
+            Err(err)
+                if should_auto_fallback_to_always(
+                    config.compression_mode,
+                    preferred_mode,
+                    &err,
+                ) =>
+            {
+                Self::connect_with_mode(socket_path, config, CompressionMode::Always).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn connect_with_mode(
+        socket_path: PathBuf,
+        config: DirectMuxClientConfig,
+        compression_mode: CompressionMode,
+    ) -> Result<Self, DirectMuxError> {
         let stream = timeout(config.connect_timeout, compat_unix::connect(&socket_path))
             .await
             .map_err(|_| DirectMuxError::ConnectTimeout(socket_path.clone()))??;
 
         let mut client = Self {
             stream,
-            compression_mode: resolve_compression_mode(config.compression_mode, &socket_path),
+            compression_mode,
             socket_path,
             read_buf: Vec::new(),
             serial: 0,
@@ -182,7 +203,6 @@ impl DirectMuxClient {
 
         client.verify_codec_version().await?;
         client.register_client().await?;
-
         Ok(client)
     }
 
@@ -598,6 +618,16 @@ fn is_local_unix_socket(path: &Path) -> bool {
         .map(|meta| meta.file_type().is_socket())
         // If metadata is unavailable, keep `auto` in the safe local-fast path.
         .unwrap_or(true)
+}
+
+fn should_auto_fallback_to_always(
+    configured_mode: wa_config::VendoredCompressionMode,
+    resolved_mode: CompressionMode,
+    err: &DirectMuxError,
+) -> bool {
+    matches!(configured_mode, wa_config::VendoredCompressionMode::Auto)
+        && matches!(resolved_mode, CompressionMode::Never)
+        && matches!(err.protocol_error_kind(), ProtocolErrorKind::Recoverable)
 }
 
 #[cfg(feature = "asupersync-runtime")]
@@ -1553,13 +1583,44 @@ mod tests {
     }
 
     #[test]
+    fn auto_fallback_retry_gate_matches_expected_conditions() {
+        let recoverable = DirectMuxError::Disconnected;
+        assert!(should_auto_fallback_to_always(
+            crate::config::VendoredCompressionMode::Auto,
+            CompressionMode::Never,
+            &recoverable
+        ));
+        assert!(!should_auto_fallback_to_always(
+            crate::config::VendoredCompressionMode::Always,
+            CompressionMode::Never,
+            &recoverable
+        ));
+        assert!(!should_auto_fallback_to_always(
+            crate::config::VendoredCompressionMode::Auto,
+            CompressionMode::Always,
+            &recoverable
+        ));
+
+        let permanent = DirectMuxError::IncompatibleCodec {
+            local: CODEC_VERSION,
+            remote: CODEC_VERSION - 1,
+            remote_version: "test".to_string(),
+        };
+        assert!(!should_auto_fallback_to_always(
+            crate::config::VendoredCompressionMode::Auto,
+            CompressionMode::Never,
+            &permanent
+        ));
+    }
+
+    #[test]
     fn is_local_unix_socket_rejects_directory_paths() {
         let tmp = tempfile::tempdir().expect("temp dir");
         assert!(!is_local_unix_socket(tmp.path()));
     }
 
     #[test]
-    fn fallback_via_always_override_when_server_rejects_uncompressed() {
+    fn auto_mode_falls_back_to_compressed_when_server_rejects_uncompressed() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = temp_dir.path().join("compression-fallback.sock");
@@ -1618,16 +1679,9 @@ mod tests {
 
             let auto_config =
                 DirectMuxClientConfig::default().with_socket_path(socket_path.clone());
-            let err = DirectMuxClient::connect(auto_config)
+            let client = DirectMuxClient::connect(auto_config)
                 .await
-                .expect_err("auto mode should fail when uncompressed PDUs are rejected");
-            assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Recoverable);
-
-            let mut fallback = DirectMuxClientConfig::default().with_socket_path(socket_path);
-            fallback.compression_mode = crate::config::VendoredCompressionMode::Always;
-            let client = DirectMuxClient::connect(fallback)
-                .await
-                .expect("explicit always mode should recover compatibility");
+                .expect("auto mode should retry with compression when uncompressed PDUs fail");
             drop(client);
 
             server.await.expect("server task");

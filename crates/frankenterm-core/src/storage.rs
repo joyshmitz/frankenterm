@@ -6706,6 +6706,8 @@ impl StorageHandle {
         query_vector: &[f32],
         mode: SearchMode,
         rrf_k: u32,
+        lexical_weight: f32,
+        semantic_weight: f32,
     ) -> Result<HybridSearchBundle> {
         let db_path = Arc::clone(&self.db_path);
         let semantic_budget_state = Arc::clone(&self.semantic_budget_state);
@@ -6725,6 +6727,8 @@ impl StorageHandle {
                 &query_vector,
                 mode,
                 rrf_k,
+                lexical_weight,
+                semantic_weight,
                 &semantic_budget_state,
             )
         })
@@ -12038,13 +12042,28 @@ fn hybrid_search_with_results_sync(
     query_vector: &[f32],
     mode: SearchMode,
     rrf_k: u32,
+    lexical_weight: f32,
+    semantic_weight: f32,
     semantic_budget_state: &Arc<Mutex<SemanticBudgetState>>,
 ) -> Result<HybridSearchBundle> {
     let top_k = options.limit.unwrap_or(100);
 
     let requested_mode = mode;
-    let lexical_weight = 1.0f32;
-    let semantic_weight = 1.0f32;
+    let lexical_weight = if lexical_weight.is_finite() {
+        lexical_weight.max(0.0)
+    } else {
+        1.0
+    };
+    let semantic_weight = if semantic_weight.is_finite() {
+        semantic_weight.max(0.0)
+    } else {
+        1.0
+    };
+    let (lexical_weight, semantic_weight) = if lexical_weight == 0.0 && semantic_weight == 0.0 {
+        (1.0, 1.0)
+    } else {
+        (lexical_weight, semantic_weight)
+    };
 
     let semantic_lane = resolve_semantic_lane(
         conn,
@@ -19333,6 +19352,8 @@ mod storage_handle_tests {
                 &[1.0, 0.0],
                 crate::search::SearchMode::Hybrid,
                 60,
+                1.0,
+                1.0,
             )
             .await
             .unwrap();
@@ -19413,6 +19434,8 @@ mod storage_handle_tests {
                 &[],
                 crate::search::SearchMode::Hybrid,
                 60,
+                1.0,
+                1.0,
             )
             .await
             .unwrap();
@@ -19434,6 +19457,65 @@ mod storage_handle_tests {
             assert!(hit.lexical_contribution.is_some());
             assert!((hit.fusion_score - hit.lexical_contribution.unwrap_or_default()).abs() < 1e-6);
         }
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn storage_handle_hybrid_search_sanitizes_invalid_weights() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+        let segment = handle
+            .append_segment(1, "needle semantic and lexical candidate", None)
+            .await
+            .unwrap();
+        handle
+            .store_embedding_f32(segment.id, "hash", &[1.0, 0.0])
+            .await
+            .unwrap();
+
+        let options = SearchOptions {
+            limit: Some(3),
+            include_snippets: Some(false),
+            ..SearchOptions::default()
+        };
+
+        let sanitized = handle
+            .hybrid_search_with_results(
+                "needle",
+                options.clone(),
+                "hash",
+                &[1.0, 0.0],
+                crate::search::SearchMode::Hybrid,
+                60,
+                f32::NAN,
+                -1.0,
+            )
+            .await
+            .unwrap();
+        assert!((sanitized.lexical_weight - 1.0).abs() < f32::EPSILON);
+        assert!((sanitized.semantic_weight - 0.0).abs() < f32::EPSILON);
+        assert!(!sanitized.results.is_empty());
+
+        let fallback = handle
+            .hybrid_search_with_results(
+                "needle",
+                options,
+                "hash",
+                &[1.0, 0.0],
+                crate::search::SearchMode::Hybrid,
+                60,
+                0.0,
+                0.0,
+            )
+            .await
+            .unwrap();
+        assert!((fallback.lexical_weight - 1.0).abs() < f32::EPSILON);
+        assert!((fallback.semantic_weight - 1.0).abs() < f32::EPSILON);
+        assert!(!fallback.results.is_empty());
 
         handle.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);
@@ -19478,6 +19560,8 @@ mod storage_handle_tests {
                 &[1.0, 0.0],
                 crate::search::SearchMode::Hybrid,
                 60,
+                1.0,
+                1.0,
             )
             .await
             .unwrap();
@@ -19493,6 +19577,8 @@ mod storage_handle_tests {
                 &[1.0, 0.0],
                 crate::search::SearchMode::Hybrid,
                 60,
+                1.0,
+                1.0,
             )
             .await
             .unwrap();
@@ -19514,6 +19600,8 @@ mod storage_handle_tests {
                 &[1.0, 0.0],
                 crate::search::SearchMode::Hybrid,
                 60,
+                1.0,
+                1.0,
             )
             .await
             .unwrap();
@@ -19575,6 +19663,8 @@ mod storage_handle_tests {
                 &[1.0, 0.0],
                 crate::search::SearchMode::Hybrid,
                 60,
+                1.0,
+                1.0,
             )
             .await
             .unwrap();
@@ -19594,6 +19684,8 @@ mod storage_handle_tests {
                 &[0.8, 0.2],
                 crate::search::SearchMode::Hybrid,
                 60,
+                1.0,
+                1.0,
             )
             .await
             .unwrap();
@@ -20248,7 +20340,7 @@ mod storage_handle_tests {
         let mut handles = Vec::new();
         for i in 0..20 {
             let h = handle.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(crate::runtime_compat::task::spawn(async move {
                 h.append_segment(1, &format!("batch-{i}"), None)
                     .await
                     .unwrap()
@@ -20666,8 +20758,9 @@ mod queue_depth_tests {
         let mut join_handles = Vec::new();
         for i in 0..6 {
             let h = handle.clone();
-            let jh =
-                tokio::spawn(async move { h.append_segment(1, &format!("data-{i}"), None).await });
+            let jh = crate::runtime_compat::task::spawn(async move {
+                h.append_segment(1, &format!("data-{i}"), None).await
+            });
             join_handles.push(jh);
         }
 
@@ -20725,8 +20818,9 @@ mod queue_depth_tests {
         let mut join_handles = Vec::new();
         for i in 0..20 {
             let h = handle.clone();
-            let jh =
-                tokio::spawn(async move { h.append_segment(1, &format!("flood-{i}"), None).await });
+            let jh = crate::runtime_compat::task::spawn(async move {
+                h.append_segment(1, &format!("flood-{i}"), None).await
+            });
             join_handles.push(jh);
         }
 
@@ -20923,7 +21017,7 @@ mod backpressure_integration_tests {
         let mut handles = Vec::new();
         for i in 0..16 {
             let h = handle.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(crate::runtime_compat::task::spawn(async move {
                 h.append_segment(1, &format!("concurrent-{i}"), None)
                     .await
                     .unwrap();

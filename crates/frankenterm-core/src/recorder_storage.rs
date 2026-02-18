@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::Mutex;
+
+use crate::runtime_compat::Mutex;
 
 use crate::recording::RecorderEvent;
 

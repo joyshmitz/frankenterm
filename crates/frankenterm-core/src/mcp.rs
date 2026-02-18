@@ -5,12 +5,19 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use fastmcp::prelude::*;
-use fastmcp::{ResourceHandler, ResourceTemplate, ToolHandler};
 use serde::{Deserialize, Serialize};
 
 use std::path::PathBuf;
 use std::sync::Arc;
+
+mod mcp_framework {
+    pub(crate) use fastmcp::StdioTransport;
+    pub(crate) use fastmcp::prelude::*;
+    pub(crate) use fastmcp::{ResourceHandler, ResourceTemplate, ToolHandler};
+}
+
+use mcp_framework::prelude::*;
+use mcp_framework::{ResourceHandler, ResourceTemplate, StdioTransport, ToolHandler};
 
 use crate::Result;
 use crate::accounts::AccountRecord;
@@ -59,7 +66,21 @@ const MCP_ERR_FTS_QUERY: &str = "FT-MCP-0011";
 const MCP_ERR_RESERVATION_CONFLICT: &str = "FT-MCP-0012";
 const MCP_ERR_CAUT: &str = "FT-MCP-0013";
 const MCP_ERR_CASS: &str = "FT-MCP-0014";
-const MCP_HYBRID_RRF_K: u32 = 60;
+
+fn effective_search_rrf_k(config: &Config) -> u32 {
+    config.search.rrf_k.max(1)
+}
+
+fn effective_search_fusion_weights(config: &Config) -> (f32, f32) {
+    let quality_weight = if config.search.quality_weight.is_finite() {
+        config.search.quality_weight.clamp(0.0, 1.0)
+    } else {
+        0.7
+    };
+    let semantic_weight = quality_weight as f32;
+    let lexical_weight = (1.0 - semantic_weight).max(0.0);
+    (lexical_weight, semantic_weight)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum McpOutputFormat {
@@ -861,7 +882,7 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
 /// need a direct `fastmcp` dependency.
 pub fn run_stdio_server(config: &Config, db_path: Option<PathBuf>) -> Result<()> {
     let server = build_server_with_db(config, db_path)?;
-    let transport = fastmcp::StdioTransport::stdio();
+    let transport = StdioTransport::stdio();
     server.run_transport(transport);
     Ok(())
 }
@@ -2162,6 +2183,9 @@ impl ToolHandler for WaSearchTool {
         let query_for_storage = canonical.query.clone();
         let search_options = to_storage_search_options(&canonical);
         let snippets_enabled = canonical.snippets;
+        let hybrid_rrf_k = effective_search_rrf_k(config.as_ref());
+        let (hybrid_lexical_weight, hybrid_semantic_weight) =
+            effective_search_fusion_weights(config.as_ref());
         let semantic_query = if matches!(
             requested_mode,
             UnifiedSearchMode::Semantic | UnifiedSearchMode::Hybrid
@@ -2280,7 +2304,9 @@ impl ToolHandler for WaSearchTool {
                                 &embedder_id,
                                 &query_vector,
                                 search_mode,
-                                MCP_HYBRID_RRF_K,
+                                hybrid_rrf_k,
+                                hybrid_lexical_weight,
+                                hybrid_semantic_weight,
                             )
                             .await
                             .map_err(McpToolError::from_error)?;
@@ -6176,12 +6202,29 @@ mod tests {
         assert_eq!(code, MCP_ERR_WEZTERM);
     }
 
-    // ── MCP_HYBRID_RRF_K constant test ───────────────────────────────────
+    // ── search fusion config helpers ──────────────────────────────────────
 
     #[test]
-    fn mcp_hybrid_rrf_k_is_positive() {
-        assert!(MCP_HYBRID_RRF_K > 0);
-        assert_eq!(MCP_HYBRID_RRF_K, 60);
+    fn effective_search_rrf_k_clamps_to_positive() {
+        let mut config = Config::default();
+        config.search.rrf_k = 0;
+        assert_eq!(effective_search_rrf_k(&config), 1);
+        config.search.rrf_k = 77;
+        assert_eq!(effective_search_rrf_k(&config), 77);
+    }
+
+    #[test]
+    fn effective_search_fusion_weights_follow_quality_weight() {
+        let mut config = Config::default();
+        config.search.quality_weight = 0.25;
+        let (lexical, semantic) = effective_search_fusion_weights(&config);
+        assert!((lexical - 0.75).abs() < f32::EPSILON);
+        assert!((semantic - 0.25).abs() < f32::EPSILON);
+
+        config.search.quality_weight = f64::NAN;
+        let (lexical_default, semantic_default) = effective_search_fusion_weights(&config);
+        assert!((lexical_default - 0.3).abs() < f32::EPSILON);
+        assert!((semantic_default - 0.7).abs() < f32::EPSILON);
     }
 
     // ── parse_mcp_output_format edge cases ───────────────────────────────

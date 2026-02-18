@@ -6,12 +6,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use crate::runtime_compat::mpsc;
-use crate::runtime_compat::task::{self, JoinError, JoinHandle};
 use crate::runtime_compat::timeout;
 use crate::runtime_compat::{RwLock, Semaphore};
 use futures::StreamExt;
@@ -447,8 +447,10 @@ pub trait PollTaskSet {
 /// Runtime and tests use this wrapper instead of depending on a concrete task-set
 /// implementation directly.
 pub struct TailerPollTaskSet {
-    inner: FuturesUnordered<JoinHandle<(u64, PollOutcome)>>,
+    inner: FuturesUnordered<PollTaskFuture>,
 }
+
+type PollTaskFuture = Pin<Box<dyn Future<Output = (u64, PollOutcome)> + Send + 'static>>;
 
 impl TailerPollTaskSet {
     #[must_use]
@@ -458,7 +460,7 @@ impl TailerPollTaskSet {
         }
     }
 
-    pub async fn join_next(&mut self) -> Option<Result<(u64, PollOutcome), JoinError>> {
+    pub async fn join_next(&mut self) -> Option<(u64, PollOutcome)> {
         self.inner.next().await
     }
 
@@ -484,7 +486,7 @@ impl PollTaskSet for TailerPollTaskSet {
     where
         F: Future<Output = (u64, PollOutcome)> + Send + 'static,
     {
-        self.inner.push(task::spawn(future));
+        self.inner.push(Box::pin(future));
     }
 }
 
@@ -1474,10 +1476,8 @@ mod tests {
         assert!(max_seen <= 2, "max concurrency observed: {max_seen}");
 
         // Cleanup
-        while let Some(result) = poll_tasks.join_next().await {
-            if let Ok((pane_id, outcome)) = result {
-                supervisor.handle_poll_result(pane_id, outcome);
-            }
+        while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+            supervisor.handle_poll_result(pane_id, outcome);
         }
     }
 
@@ -1520,11 +1520,7 @@ mod tests {
         let mut poll_tasks = TailerPollTaskSet::new();
         supervisor.spawn_ready(&mut poll_tasks);
 
-        let (pane_id, outcome) = poll_tasks
-            .join_next()
-            .await
-            .expect("expected one task")
-            .expect("task should not panic");
+        let (pane_id, outcome) = poll_tasks.join_next().await.expect("expected one task");
         supervisor.handle_poll_result(pane_id, outcome);
 
         assert_eq!(pane_id, 2, "higher priority pane should spawn first");
@@ -1579,11 +1575,9 @@ mod tests {
         supervisor.spawn_ready(&mut poll_tasks);
 
         let mut outcomes = Vec::new();
-        while let Some(result) = poll_tasks.join_next().await {
-            if let Ok((pane_id, outcome)) = result {
-                outcomes.push((pane_id, format!("{outcome:?}")));
-                supervisor.handle_poll_result(pane_id, outcome);
-            }
+        while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+            outcomes.push((pane_id, format!("{outcome:?}")));
+            supervisor.handle_poll_result(pane_id, outcome);
         }
 
         let metrics = supervisor.metrics();
@@ -1795,7 +1789,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (tx, rx) = mpsc::channel(10);
+        let (tx, mut rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1821,20 +1815,18 @@ mod tests {
         supervisor.spawn_ready(&mut poll_tasks);
 
         // Collect outcomes
-        while let Some(result) = poll_tasks.join_next().await {
-            if let Ok((pane_id, outcome)) = result {
-                assert_eq!(pane_id, 1);
-                assert!(
-                    matches!(outcome, PollOutcome::OverflowGapEmitted),
-                    "Expected OverflowGapEmitted, got {outcome:?}"
-                );
-                supervisor.handle_poll_result(pane_id, outcome);
-            }
+        while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+            assert_eq!(pane_id, 1);
+            assert!(
+                matches!(outcome, PollOutcome::OverflowGapEmitted),
+                "Expected OverflowGapEmitted, got {outcome:?}"
+            );
+            supervisor.handle_poll_result(pane_id, outcome);
         }
 
         // Verify the gap event was sent
-        let event = rx
-            .try_recv()
+        let event = crate::runtime_compat::mpsc_recv_option(&mut rx)
+            .await
             .expect("should have received overflow gap event");
         assert_eq!(event.segment.pane_id, 1);
         assert_eq!(event.segment.content, "");
@@ -1859,7 +1851,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (tx, rx) = mpsc::channel(10);
+        let (tx, mut rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1885,13 +1877,13 @@ mod tests {
         let mut poll_tasks = TailerPollTaskSet::new();
         supervisor.spawn_ready(&mut poll_tasks);
 
-        while let Some(result) = poll_tasks.join_next().await {
-            if let Ok((pane_id, outcome)) = result {
-                supervisor.handle_poll_result(pane_id, outcome);
-            }
+        while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+            supervisor.handle_poll_result(pane_id, outcome);
         }
 
-        let event = rx.try_recv().expect("should have received gap event");
+        let event = crate::runtime_compat::mpsc_recv_option(&mut rx)
+            .await
+            .expect("should have received gap event");
         assert_eq!(event.segment.seq, 5, "gap should use cursor's next_seq");
 
         // Cursor should have advanced to 6

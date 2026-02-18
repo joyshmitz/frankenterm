@@ -11,13 +11,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::RwLock;
 
 use crate::Result;
 use crate::circuit_breaker::{CircuitBreakerStatus, CircuitStateKind};
 use crate::consistent_hash::HashRing;
 use crate::error::WeztermError;
 use crate::patterns::AgentType;
+use crate::runtime_compat::RwLock;
 use crate::watchdog::HealthStatus;
 use crate::wezterm::{
     MoveDirection, PaneInfo, SplitDirection, WeztermFuture, WeztermHandle, WeztermInterface,

@@ -14,11 +14,6 @@ use crate::ui_query;
 use crate::{Error, Result, VERSION};
 use asupersync::net::TcpListener;
 use asupersync::stream::Stream;
-use fastapi::ResponseBody;
-use fastapi::core::{ControlFlow, Cx, Handler, Middleware, SseEvent, SseResponse, StartupOutcome};
-use fastapi::http::QueryString;
-use fastapi::prelude::{App, Method, Request, RequestContext, Response, StatusCode};
-use fastapi::{ServerConfig, ServerError, TcpServer};
 use serde::Serialize;
 use serde_json::json;
 use std::net::{SocketAddr, TcpStream};
@@ -28,6 +23,22 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
+
+mod web_framework {
+    pub(crate) use fastapi::ResponseBody;
+    pub(crate) use fastapi::core::{
+        BoxFuture, ControlFlow, Cx, Handler, Middleware, SseEvent, SseResponse, StartupOutcome,
+    };
+    pub(crate) use fastapi::http::QueryString;
+    pub(crate) use fastapi::prelude::{App, Method, Request, RequestContext, Response, StatusCode};
+    pub(crate) use fastapi::{ServerConfig, ServerError, TcpServer};
+}
+
+use web_framework::{
+    App, BoxFuture, ControlFlow, Cx, Handler, Method, Middleware, QueryString, Request,
+    RequestContext, Response, ResponseBody, ServerConfig, ServerError, SseEvent, SseResponse,
+    StartupOutcome, StatusCode, TcpServer,
+};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8000;
@@ -177,7 +188,7 @@ impl Middleware for RequestSpanLogger {
         &'a self,
         _ctx: &'a RequestContext,
         req: &'a mut Request,
-    ) -> fastapi::core::BoxFuture<'a, ControlFlow> {
+    ) -> BoxFuture<'a, ControlFlow> {
         req.insert_extension(RequestStart(Instant::now()));
         Box::pin(async { ControlFlow::Continue })
     }
@@ -187,7 +198,7 @@ impl Middleware for RequestSpanLogger {
         _ctx: &'a RequestContext,
         req: &'a Request,
         response: Response,
-    ) -> fastapi::core::BoxFuture<'a, Response> {
+    ) -> BoxFuture<'a, Response> {
         let start = req
             .get_extension::<RequestStart>()
             .map(|s| s.0)
@@ -237,7 +248,7 @@ impl Middleware for StateInjector {
         &'a self,
         _ctx: &'a RequestContext,
         req: &'a mut Request,
-    ) -> fastapi::core::BoxFuture<'a, ControlFlow> {
+    ) -> BoxFuture<'a, ControlFlow> {
         req.insert_extension(self.state.clone());
         Box::pin(async { ControlFlow::Continue })
     }
@@ -256,7 +267,7 @@ impl Middleware for BodySizeGuard {
         &'a self,
         _ctx: &'a RequestContext,
         req: &'a mut Request,
-    ) -> fastapi::core::BoxFuture<'a, ControlFlow> {
+    ) -> BoxFuture<'a, ControlFlow> {
         if let Some(cl) = req
             .headers()
             .get("content-length")

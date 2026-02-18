@@ -32,6 +32,7 @@ use crate::config::{
     CaptureBudgetConfig, HotReloadableConfig, PaneFilterConfig, PanePriorityConfig, PatternsConfig,
     SnapshotConfig, SnapshotSchedulingMode,
 };
+use crate::backpressure::BackpressureConfig;
 use crate::crash::{HealthSnapshot, ShutdownSummary};
 use crate::error::Result;
 use crate::events::{Event, EventBus, UserVarPayload, event_identity_key};
@@ -43,7 +44,7 @@ use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
 use crate::runtime_compat::{
-    RwLock, mpsc, sleep,
+    Mutex, MutexGuard, RwLock, mpsc, sleep,
     task::{self, JoinHandle},
     timeout, watch,
 };
@@ -858,7 +859,7 @@ pub struct ObservationRuntime {
     /// WezTerm interface handle (real or mock)
     wezterm_handle: WeztermHandle,
     /// Storage handle for persistence (wrapped for async sharing)
-    storage: Arc<tokio::sync::Mutex<StorageHandle>>,
+    storage: Arc<Mutex<StorageHandle>>,
     /// Pattern detection engine
     pattern_engine: Arc<RwLock<PatternEngine>>,
     /// Pane registry for discovery and tracking
@@ -924,7 +925,7 @@ impl ObservationRuntime {
         Self {
             config,
             wezterm_handle: wezterm_handle_with_timeout(5),
-            storage: Arc::new(tokio::sync::Mutex::new(storage)),
+            storage: Arc::new(Mutex::new(storage)),
             pattern_engine,
             registry: Arc::new(RwLock::new(registry)),
             cursors: Arc::new(RwLock::new(HashMap::new())),
@@ -1547,6 +1548,12 @@ impl ObservationRuntime {
                             warnings.push(format!("WezTerm health warning probe failed: {err}"));
                         }
                     }
+                    let backpressure_tier = classify_backpressure_tier(
+                        capture_depth,
+                        capture_cap,
+                        write_depth,
+                        write_cap,
+                    );
 
                     let snapshot = HealthSnapshot {
                         timestamp: epoch_ms_u64(),
@@ -1579,7 +1586,7 @@ impl ObservationRuntime {
                                 None
                             }
                         },
-                        backpressure_tier: None,
+                        backpressure_tier,
                         last_activity_by_pane,
                         restart_count: 0,
                         last_crash_at: None,
@@ -1905,13 +1912,8 @@ impl ObservationRuntime {
                         );
                     }
                     // Handle completed captures
-                    Some(result) = poll_tasks.join_next(), if !poll_tasks.is_empty() => {
-                        match result {
-                            Ok((pane_id, outcome)) => supervisor.handle_poll_result(pane_id, outcome),
-                            Err(e) => {
-                                warn!(error = %e, "Tailer poll task failed");
-                            }
-                        }
+                    Some((pane_id, outcome)) = poll_tasks.join_next(), if !poll_tasks.is_empty() => {
+                        supervisor.handle_poll_result(pane_id, outcome);
                     }
                     // Spawn new captures if slots available
                     () = sleep(tick_duration) => {
@@ -2395,7 +2397,7 @@ impl ObservationRuntime {
     /// Returns the storage handle wrapped in `Arc<Mutex>`. The caller is
     /// responsible for shutdown. This invalidates the runtime.
     #[must_use]
-    pub fn take_storage(self) -> Arc<tokio::sync::Mutex<StorageHandle>> {
+    pub fn take_storage(self) -> Arc<Mutex<StorageHandle>> {
         self.storage
     }
 }
@@ -2406,7 +2408,7 @@ async fn handle_native_event(
     capture_tx: &mpsc::Sender<CaptureEvent>,
     cursors: &Arc<RwLock<HashMap<u64, PaneCursor>>>,
     detection_contexts: &Arc<RwLock<HashMap<u64, DetectionContext>>>,
-    storage: &Arc<tokio::sync::Mutex<StorageHandle>>,
+    storage: &Arc<Mutex<StorageHandle>>,
     event_bus: Option<&Arc<EventBus>>,
     pane_filter: &PaneFilterConfig,
 ) {
@@ -2583,7 +2585,7 @@ pub struct RuntimeHandle {
     /// Shutdown flag for signaling tasks
     pub shutdown_flag: Arc<AtomicBool>,
     /// Storage handle for external access
-    pub storage: Arc<tokio::sync::Mutex<StorageHandle>>,
+    pub storage: Arc<Mutex<StorageHandle>>,
     /// Runtime metrics
     pub metrics: Arc<RuntimeMetrics>,
     /// Pane registry
@@ -2625,6 +2627,46 @@ const SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS: u64 = 30;
 const SNAPSHOT_IDLE_WINDOW_SECS: u64 = 5 * 60;
 /// Minimum interval between `MemoryPressure` trigger emissions.
 const SNAPSHOT_MEMORY_TRIGGER_COOLDOWN_SECS: u64 = 2 * 60;
+
+fn classify_backpressure_tier(
+    capture_depth: usize,
+    capture_capacity: usize,
+    write_depth: usize,
+    write_capacity: usize,
+) -> Option<String> {
+    if capture_capacity == 0 && write_capacity == 0 {
+        return None;
+    }
+
+    let config = BackpressureConfig::default();
+    let capture_ratio = if capture_capacity == 0 {
+        0.0
+    } else {
+        capture_depth as f64 / capture_capacity as f64
+    };
+    let write_ratio = if write_capacity == 0 {
+        0.0
+    } else {
+        write_depth as f64 / write_capacity as f64
+    };
+
+    // Match BackpressureManager::classify saturation semantics.
+    let capture_saturated =
+        capture_capacity > 0 && capture_depth >= capture_capacity.saturating_sub(5);
+    let write_saturated = write_capacity > 0 && write_depth >= write_capacity.saturating_sub(100);
+
+    let tier = if capture_saturated || write_saturated {
+        "BLACK"
+    } else if capture_ratio >= config.red_capture || write_ratio >= config.red_write {
+        "RED"
+    } else if capture_ratio >= config.yellow_capture || write_ratio >= config.yellow_write {
+        "YELLOW"
+    } else {
+        "GREEN"
+    };
+
+    Some(tier.to_string())
+}
 
 fn watch_has_changed<T>(rx: &watch::Receiver<T>) -> bool {
     #[cfg(feature = "asupersync-runtime")]
@@ -2933,6 +2975,8 @@ impl RuntimeHandle {
                 warnings.push(line);
             }
         }
+        let backpressure_tier =
+            classify_backpressure_tier(capture_depth, capture_cap, write_depth, write_cap);
 
         let snapshot = HealthSnapshot {
             timestamp: epoch_ms_u64(),
@@ -2965,7 +3009,7 @@ impl RuntimeHandle {
                     None
                 }
             },
-            backpressure_tier: None,
+            backpressure_tier,
             last_activity_by_pane,
             restart_count: 0,
             last_crash_at: None,
@@ -2982,7 +3026,7 @@ impl RuntimeHandle {
     ///
     /// The caller is responsible for shutdown. This invalidates the runtime.
     #[must_use]
-    pub fn take_storage(self) -> Arc<tokio::sync::Mutex<StorageHandle>> {
+    pub fn take_storage(self) -> Arc<Mutex<StorageHandle>> {
         self.storage
     }
 
@@ -3010,9 +3054,9 @@ impl RuntimeHandle {
 }
 
 async fn lock_storage_with_profile<'a>(
-    storage: &'a Arc<tokio::sync::Mutex<StorageHandle>>,
+    storage: &'a Arc<Mutex<StorageHandle>>,
     metrics: &RuntimeMetrics,
-) -> (tokio::sync::MutexGuard<'a, StorageHandle>, Instant) {
+) -> (MutexGuard<'a, StorageHandle>, Instant) {
     let wait_started = Instant::now();
     let guard = storage.lock().await;
     metrics.record_storage_lock_wait(wait_started.elapsed());
@@ -3629,6 +3673,91 @@ mod tests {
     fn backpressure_warn_ratio_is_valid() {
         assert!(BACKPRESSURE_WARN_RATIO > 0.0);
         assert!(BACKPRESSURE_WARN_RATIO < 1.0);
+    }
+
+    #[test]
+    fn classify_backpressure_tier_none_when_capacities_unknown() {
+        assert!(classify_backpressure_tier(0, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn classify_backpressure_tier_maps_expected_levels() {
+        // Keep write queue far from saturation; otherwise small capacities can
+        // classify as BLACK due to the write-side saturation guardrail.
+        let write_capacity = 10_000;
+        assert_eq!(
+            classify_backpressure_tier(0, 100, 0, write_capacity).as_deref(),
+            Some("GREEN")
+        );
+        assert_eq!(
+            classify_backpressure_tier(50, 100, 0, write_capacity).as_deref(),
+            Some("YELLOW")
+        );
+        assert_eq!(
+            classify_backpressure_tier(75, 100, 0, write_capacity).as_deref(),
+            Some("RED")
+        );
+        assert_eq!(
+            classify_backpressure_tier(98, 100, 0, write_capacity).as_deref(),
+            Some("BLACK")
+        );
+    }
+
+    #[test]
+    fn classify_backpressure_tier_matches_manager_semantics() {
+        use crate::backpressure::{BackpressureManager, QueueDepths};
+
+        let manager = BackpressureManager::new(BackpressureConfig::default());
+        let capacities = [0usize, 1, 4, 5, 6, 25, 100, 256];
+
+        for &capture_capacity in &capacities {
+            for &write_capacity in &capacities {
+                let capture_depths = [
+                    0,
+                    capture_capacity / 2,
+                    capture_capacity.saturating_sub(1),
+                    capture_capacity,
+                    capture_capacity.saturating_add(3),
+                ];
+                let write_depths = [
+                    0,
+                    write_capacity / 2,
+                    write_capacity.saturating_sub(1),
+                    write_capacity,
+                    write_capacity.saturating_add(3),
+                ];
+
+                for &capture_depth in &capture_depths {
+                    for &write_depth in &write_depths {
+                        let actual = classify_backpressure_tier(
+                            capture_depth,
+                            capture_capacity,
+                            write_depth,
+                            write_capacity,
+                        );
+                        let expected = if capture_capacity == 0 && write_capacity == 0 {
+                            None
+                        } else {
+                            Some(
+                                manager
+                                    .classify(&QueueDepths {
+                                        capture_depth,
+                                        capture_capacity,
+                                        write_depth,
+                                        write_capacity,
+                                    })
+                                    .to_string(),
+                            )
+                        };
+
+                        assert_eq!(
+                            actual, expected,
+                            "mismatch for capture={capture_depth}/{capture_capacity}, write={write_depth}/{write_capacity}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
