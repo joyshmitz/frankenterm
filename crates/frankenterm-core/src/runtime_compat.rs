@@ -658,9 +658,7 @@ pub mod task {
     impl<T> JoinHandle<T> {
         /// Returns `true` if the task has completed or was aborted.
         pub fn is_finished(&self) -> bool {
-            self.aborted
-                .load(std::sync::atomic::Ordering::Acquire)
-                || self.inner.is_finished()
+            self.aborted.load(std::sync::atomic::Ordering::Acquire) || self.inner.is_finished()
         }
 
         /// Request cancellation of the task.

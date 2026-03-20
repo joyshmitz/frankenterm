@@ -2101,9 +2101,7 @@ mod tests {
             ErrorCategory::Network
         );
         assert_eq!(
-            ErrorCode::parse("robot.internal_error")
-                .unwrap()
-                .category(),
+            ErrorCode::parse("robot.internal_error").unwrap().category(),
             ErrorCategory::Internal
         );
     }
@@ -2137,16 +2135,8 @@ mod tests {
                 .is_retryable()
         );
         // Transient network errors are retryable
-        assert!(
-            ErrorCode::parse("robot.cass_error")
-                .unwrap()
-                .is_retryable()
-        );
-        assert!(
-            ErrorCode::parse("robot.caut_error")
-                .unwrap()
-                .is_retryable()
-        );
+        assert!(ErrorCode::parse("robot.cass_error").unwrap().is_retryable());
+        assert!(ErrorCode::parse("robot.caut_error").unwrap().is_retryable());
         assert!(
             ErrorCode::parse("robot.agent_detection_error")
                 .unwrap()

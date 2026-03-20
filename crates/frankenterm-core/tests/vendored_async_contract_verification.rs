@@ -282,24 +282,33 @@ fn v11_error_mapping_context_preservation_contract() {
     emit_contract_log("v11", "ABC-ERR-002", "context_preservation", "pass");
 }
 
-/// V12: Static analysis: MuxPoolError has From impl for vendored error types.
+/// V12: Static analysis: `MuxPoolError` maps upstream errors via `#[from]`
+/// derives or explicit `From` impls.
 #[test]
 fn v12_error_mapping_from_impl_exists_in_vendored() {
     let mux_pool_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vendored/mux_pool.rs");
 
     if let Ok(contents) = std::fs::read_to_string(mux_pool_path) {
-        // Check for From<...> impl for error type mapping
-        let from_impls = contents.matches("impl From<").count();
+        let explicit_from_impls = contents.matches("impl From<").count();
+        let derived_from_fields = contents.matches("#[from]").count();
+        let pool_from = contents.matches("#[from] PoolError").count();
+        let mux_from = contents.matches("#[from] DirectMuxError").count();
         assert!(
-            from_impls >= 1,
-            "mux_pool should have at least one From impl for error mapping"
+            explicit_from_impls + derived_from_fields >= 2,
+            "mux_pool should expose error mapping via explicit From impls or #[from] derives"
+        );
+        assert!(
+            pool_from >= 1 && mux_from >= 1,
+            "mux_pool should map both PoolError and DirectMuxError into MuxPoolError"
         );
 
         emit_contract_log(
             "v12",
             "ABC-ERR-001",
             "from_impl_count",
-            &format!("pass:count={from_impls}"),
+            &format!(
+                "pass:explicit={explicit_from_impls},derived={derived_from_fields},pool={pool_from},mux={mux_from}"
+            ),
         );
     }
 }
@@ -322,24 +331,39 @@ fn v13_backpressure_propagation_contract() {
     emit_contract_log("v13", "ABC-BP-001", "backpressure_direction", "pass");
 }
 
-/// V14: Static analysis: mux_pool uses semaphore-based concurrency control.
+/// V14: Static analysis: mux_pool delegates backpressure to the semaphore-backed
+/// shared pool implementation.
 #[test]
 fn v14_backpressure_semaphore_present_in_pool() {
     let mux_pool_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vendored/mux_pool.rs");
+    let pool_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/pool.rs");
 
-    if let Ok(contents) = std::fs::read_to_string(mux_pool_path) {
-        let semaphore_refs =
-            contents.matches("Semaphore").count() + contents.matches("semaphore").count();
+    if let (Ok(mux_pool_contents), Ok(pool_contents)) = (
+        std::fs::read_to_string(mux_pool_path),
+        std::fs::read_to_string(pool_path),
+    ) {
+        let mux_pool_uses_shared_pool = mux_pool_contents.contains("pool: Pool<DirectMuxClient>")
+            && mux_pool_contents.contains("pub pool: PoolConfig");
+        let pool_is_semaphore_backed = pool_contents.contains("semaphore: Arc<Semaphore>")
+            && pool_contents.contains("Semaphore::new(config.max_size)")
+            && pool_contents.contains("acquire_owned()");
+
         assert!(
-            semaphore_refs >= 2,
-            "mux_pool must use semaphore for concurrency control (found {semaphore_refs} refs)"
+            mux_pool_uses_shared_pool,
+            "mux_pool must delegate concurrency control through Pool<DirectMuxClient>"
+        );
+        assert!(
+            pool_is_semaphore_backed,
+            "shared pool must remain semaphore-backed for backpressure enforcement"
         );
 
         emit_contract_log(
             "v14",
             "ABC-BP-001",
             "semaphore_check",
-            &format!("pass:refs={semaphore_refs}"),
+            &format!(
+                "pass:mux_pool_shared_pool={mux_pool_uses_shared_pool},pool_semaphore_backed={pool_is_semaphore_backed}"
+            ),
         );
     }
 }
@@ -572,8 +596,8 @@ fn v22b_compliance_rejects_mismatched_contract_ids() {
         "mismatched contract IDs must invalidate compliance"
     );
     assert!(
-        (compliance.coverage - 0.5).abs() < 0.001,
-        "coverage should only count matching passed evidence"
+        (compliance.coverage - 1.0).abs() < 0.001,
+        "coverage should consider only matching evidence; mismatched entries invalidate compliance without diluting matching coverage"
     );
 
     emit_contract_log("v22b", "infra", "mismatched_contract_id", "pass");

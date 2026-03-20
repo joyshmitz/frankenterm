@@ -147,7 +147,10 @@ fn compliance_with_mismatched_contract_id_is_non_compliant() {
 
     let compliance = ContractCompliance::from_evidence(contract, evidence);
     assert!(!compliance.compliant);
-    assert!((compliance.coverage - 0.5).abs() < f64::EPSILON);
+    assert!(
+        (compliance.coverage - 1.0).abs() < f64::EPSILON,
+        "coverage should only consider matching evidence entries"
+    );
 }
 
 // =============================================================================

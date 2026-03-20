@@ -14,7 +14,7 @@
 // Both async-smol and async-asupersync may be enabled simultaneously due to Cargo
 // workspace feature unification. When both are active, asupersync takes priority.
 
-use anyhow::{Context as _, Error, bail};
+use anyhow::{bail, Context as _, Error};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
@@ -1625,28 +1625,22 @@ mod test {
 
     #[test]
     fn pdu_is_user_input_true_variants() {
-        assert!(
-            Pdu::WriteToPane(WriteToPane {
-                pane_id: 0,
-                data: vec![]
-            })
-            .is_user_input()
-        );
-        assert!(
-            Pdu::SendPaste(SendPaste {
-                pane_id: 0,
-                data: String::new()
-            })
-            .is_user_input()
-        );
-        assert!(
-            Pdu::Resize(Resize {
-                containing_tab_id: 0,
-                pane_id: 0,
-                size: TerminalSize::default(),
-            })
-            .is_user_input()
-        );
+        assert!(Pdu::WriteToPane(WriteToPane {
+            pane_id: 0,
+            data: vec![]
+        })
+        .is_user_input());
+        assert!(Pdu::SendPaste(SendPaste {
+            pane_id: 0,
+            data: String::new()
+        })
+        .is_user_input());
+        assert!(Pdu::Resize(Resize {
+            containing_tab_id: 0,
+            pane_id: 0,
+            size: TerminalSize::default(),
+        })
+        .is_user_input());
     }
 
     #[test]
@@ -2373,14 +2367,12 @@ mod test {
 
     #[test]
     fn pdu_is_user_input_set_pane_zoomed() {
-        assert!(
-            Pdu::SetPaneZoomed(SetPaneZoomed {
-                containing_tab_id: 0,
-                pane_id: 0,
-                zoomed: true,
-            })
-            .is_user_input()
-        );
+        assert!(Pdu::SetPaneZoomed(SetPaneZoomed {
+            containing_tab_id: 0,
+            pane_id: 0,
+            zoomed: true,
+        })
+        .is_user_input());
     }
 
     #[test]

@@ -16,8 +16,8 @@
 //   B21–B23: Cross-layer integration scenarios
 // =============================================================================
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use frankenterm_core::runtime_compat::{
@@ -121,7 +121,8 @@ fn b03_broadcast_channel_fanout_delivery() {
         let (tx, mut rx1) = runtime_compat::broadcast::channel::<String>(16);
         let mut rx2 = tx.subscribe();
 
-        tx.send("hello".into()).expect("broadcast send should succeed");
+        tx.send("hello".into())
+            .expect("broadcast send should succeed");
 
         let val1 = rx1.recv().await.expect("rx1 should receive");
         let val2 = rx2.recv().await.expect("rx2 should receive");
@@ -408,10 +409,7 @@ fn b14_join_handle_abort_implies_cancel() {
         handle.abort();
         let result = handle.await;
 
-        assert!(
-            result.is_err(),
-            "aborted task must yield Err (ABC-CAN-002)"
-        );
+        assert!(result.is_err(), "aborted task must yield Err (ABC-CAN-002)");
         let err = result.unwrap_err();
         assert!(err.is_cancelled(), "error must report as cancelled: {err}");
 
@@ -585,7 +583,10 @@ fn b21_full_audit_report_with_behavioral_evidence() {
         ("ABC-CAN-001", "b05_timeout_expires_on_slow_future"),
         ("ABC-CAN-002", "b14_join_handle_abort_implies_cancel"),
         ("ABC-CHN-001", "b02_watch_channel_delivers_latest_value"),
-        ("ABC-CHN-002", "b01_mpsc_channel_non_lossy_delivery_on_close"),
+        (
+            "ABC-CHN-002",
+            "b01_mpsc_channel_non_lossy_delivery_on_close",
+        ),
         ("ABC-ERR-001", "b16_send_error_on_closed_channel"),
         ("ABC-ERR-002", "manual_code_review_required"),
         ("ABC-BP-001", "b10_semaphore_limits_concurrent_access"),
@@ -716,12 +717,7 @@ fn b23_channel_pipeline_mpsc_to_broadcast() {
         assert_eq!(r1_items, vec![0, 10, 20]);
         assert_eq!(r2_items, vec![0, 10, 20]);
 
-        emit_behavioral_log(
-            "b23",
-            "ABC-CHN-001+CHN-002",
-            "channel_pipeline",
-            "pass",
-        );
+        emit_behavioral_log("b23", "ABC-CHN-001+CHN-002", "channel_pipeline", "pass");
     });
 }
 
