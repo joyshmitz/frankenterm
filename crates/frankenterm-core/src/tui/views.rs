@@ -3799,7 +3799,7 @@ mod tests {
 
     #[test]
     fn render_help_view_lists_eight_views_and_timeline_controls() {
-        let area = Rect::new(0, 0, 100, 32);
+        let area = Rect::new(0, 0, 100, 40);
         let mut buf = Buffer::empty(area);
         render_help_view(area, &mut buf);
 
