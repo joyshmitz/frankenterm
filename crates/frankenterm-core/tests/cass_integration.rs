@@ -344,6 +344,75 @@ fn cass_export_sessions_filter_after_id_and_limit() {
 
 #[cfg(feature = "cass-export")]
 #[test]
+fn cass_export_sessions_page_by_row_id_even_when_started_at_reorders() {
+    run_async_test(async {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("ft.db");
+        let db_path_string = db_path.to_string_lossy().into_owned();
+        let storage = StorageHandle::new(&db_path_string).await.unwrap();
+        let base_ms =
+            frankenterm_core::cass::parse_cass_timestamp_ms("2026-01-29T10:00:00Z").unwrap();
+
+        storage
+            .upsert_pane(PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: Some("/repo".to_string()),
+                tty_name: None,
+                first_seen_at: base_ms,
+                last_seen_at: base_ms,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .unwrap();
+
+        let mut first_inserted = AgentSessionRecord::new_start(1, "codex");
+        first_inserted.session_id = Some("sess-row-1".to_string());
+        first_inserted.started_at = base_ms + 10_000;
+        let first_row_id = storage.upsert_agent_session(first_inserted).await.unwrap();
+
+        let mut second_inserted = AgentSessionRecord::new_start(1, "codex");
+        second_inserted.session_id = Some("sess-row-2".to_string());
+        second_inserted.started_at = base_ms;
+        let second_row_id = storage.upsert_agent_session(second_inserted).await.unwrap();
+
+        let first_page = export_sessions(
+            &storage,
+            &CassExportQuery {
+                limit: 1,
+                ..CassExportQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first_page.len(), 1);
+        assert_eq!(first_page[0].session_row_id, first_row_id);
+
+        let second_page = export_sessions(
+            &storage,
+            &CassExportQuery {
+                after_id: Some(first_row_id),
+                limit: 10,
+                ..CassExportQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].session_row_id, second_row_id);
+    });
+}
+
+#[cfg(feature = "cass-export")]
+#[test]
 fn cass_export_content_respects_session_window_and_cursor() {
     run_async_test(async {
         let tmp = TempDir::new().expect("temp dir");
@@ -420,5 +489,57 @@ fn cass_export_content_respects_session_window_and_cursor() {
 
         assert_eq!(incremental.len(), 1);
         assert_eq!(incremental[0].segment_id, during_b.id);
+    });
+}
+
+#[cfg(feature = "cass-export")]
+#[test]
+fn cass_export_content_rejects_unexported_fallback_identifier() {
+    run_async_test(async {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("ft.db");
+        let db_path_string = db_path.to_string_lossy().into_owned();
+        let storage = StorageHandle::new(&db_path_string).await.unwrap();
+        let base_ms =
+            frankenterm_core::cass::parse_cass_timestamp_ms("2026-01-29T10:00:00Z").unwrap();
+
+        storage
+            .upsert_pane(PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: Some("/repo".to_string()),
+                tty_name: None,
+                first_seen_at: base_ms,
+                last_seen_at: base_ms,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .unwrap();
+
+        let mut session = AgentSessionRecord::new_start(1, "codex");
+        session.session_id = Some("sess-explicit".to_string());
+        session.started_at = base_ms;
+        let session_row_id = storage.upsert_agent_session(session).await.unwrap();
+
+        storage.append_segment(1, "payload", None).await.unwrap();
+
+        let err = export_content(
+            &storage,
+            &format!("ft-session-{session_row_id}"),
+            &CassContentExportQuery::default(),
+        )
+        .await
+        .expect_err("synthetic id should not resolve when the session exports an explicit id");
+
+        assert!(
+            format!("{err}").contains("cass export session"),
+            "unexpected error: {err}"
+        );
     });
 }

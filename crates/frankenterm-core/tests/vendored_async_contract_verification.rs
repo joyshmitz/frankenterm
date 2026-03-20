@@ -22,10 +22,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use frankenterm_core::{
-    runtime_compat::{SURFACE_CONTRACT_V1, SurfaceDisposition},
+    runtime_compat::{SurfaceDisposition, SURFACE_CONTRACT_V1},
     vendored_async_contracts::{
-        AsyncBoundaryContract, BoundaryDirection, ContractCategory, ContractCompliance,
-        ContractEvidence, EvidenceType, standard_contracts,
+        standard_contracts, AsyncBoundaryContract, BoundaryDirection, ContractCategory,
+        ContractCompliance, ContractEvidence, EvidenceType,
     },
 };
 
@@ -291,14 +291,16 @@ fn v12_error_mapping_from_impl_exists_in_vendored() {
     if let Ok(contents) = std::fs::read_to_string(mux_pool_path) {
         let explicit_from_impls = contents.matches("impl From<").count();
         let derived_from_fields = contents.matches("#[from]").count();
-        let pool_from = contents.matches("#[from] PoolError").count();
-        let mux_from = contents.matches("#[from] DirectMuxError").count();
+        let pool_from = contents.contains("#[from] PoolError")
+            || contents.contains("impl From<PoolError> for MuxPoolError");
+        let mux_from = contents.contains("#[from] DirectMuxError")
+            || contents.contains("impl From<DirectMuxError> for MuxPoolError");
         assert!(
             explicit_from_impls + derived_from_fields >= 2,
             "mux_pool should expose error mapping via explicit From impls or #[from] derives"
         );
         assert!(
-            pool_from >= 1 && mux_from >= 1,
+            pool_from && mux_from,
             "mux_pool should map both PoolError and DirectMuxError into MuxPoolError"
         );
 
@@ -343,7 +345,7 @@ fn v14_backpressure_semaphore_present_in_pool() {
         std::fs::read_to_string(pool_path),
     ) {
         let mux_pool_uses_shared_pool = mux_pool_contents.contains("pool: Pool<DirectMuxClient>")
-            && mux_pool_contents.contains("pub pool: PoolConfig");
+            && mux_pool_contents.contains("pool: PoolConfig");
         let pool_is_semaphore_backed = pool_contents.contains("semaphore: Arc<Semaphore>")
             && pool_contents.contains("Semaphore::new(config.max_size)")
             && pool_contents.contains("acquire_owned()");

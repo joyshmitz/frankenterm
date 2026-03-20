@@ -333,10 +333,9 @@ fn error_mapping_includes_vendored_to_core() {
         .filter(|c| c.category == ContractCategory::ErrorMapping)
         .collect();
     assert_eq!(err.len(), 2);
-    assert!(
-        err.iter()
-            .any(|c| c.direction == BoundaryDirection::VendoredToCore)
-    );
+    assert!(err
+        .iter()
+        .any(|c| c.direction == BoundaryDirection::VendoredToCore));
 }
 
 #[test]
