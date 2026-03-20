@@ -71,7 +71,7 @@ if cargo test -p frankenterm-core \
   --no-default-features \
   -- --test-threads=1 2>"${LOG_DIR}/structural_stderr_${RUN_ID}.txt" \
   | tee "${LOG_DIR}/structural_stdout_${RUN_ID}.txt" \
-  | grep -E "^test result:" | tail -1 | grep -q "0 failed"; then
+  | grep -E "^test result:" | tail -1 | grep -q '; 0 failed;'; then
 
   STRUCTURAL_PASS=$(grep -c '... ok' "${LOG_DIR}/structural_stdout_${RUN_ID}.txt" || true)
   PASS_COUNT=$((PASS_COUNT + STRUCTURAL_PASS))
@@ -96,7 +96,7 @@ if cargo test -p frankenterm-core \
   --no-default-features \
   -- --test-threads=1 2>"${LOG_DIR}/behavioral_stderr_${RUN_ID}.txt" \
   | tee "${LOG_DIR}/behavioral_stdout_${RUN_ID}.txt" \
-  | grep -E "^test result:" | tail -1 | grep -q "0 failed"; then
+  | grep -E "^test result:" | tail -1 | grep -q '; 0 failed;'; then
 
   BEHAVIORAL_PASS=$(grep -c '... ok' "${LOG_DIR}/behavioral_stdout_${RUN_ID}.txt" || true)
   PASS_COUNT=$((PASS_COUNT + BEHAVIORAL_PASS))
@@ -121,7 +121,7 @@ if cargo test -p frankenterm-core \
   --no-default-features \
   -- --test-threads=1 2>"${LOG_DIR}/integration_stderr_${RUN_ID}.txt" \
   | tee "${LOG_DIR}/integration_stdout_${RUN_ID}.txt" \
-  | grep -E "^test result:" | tail -1 | grep -q "0 failed"; then
+  | grep -E "^test result:" | tail -1 | grep -q '; 0 failed;'; then
 
   INTEGRATION_PASS=$(grep -c '... ok' "${LOG_DIR}/integration_stdout_${RUN_ID}.txt" || true)
   PASS_COUNT=$((PASS_COUNT + INTEGRATION_PASS))
@@ -146,7 +146,7 @@ if cargo test -p frankenterm-core \
   --no-default-features \
   -- --test-threads=1 2>"${LOG_DIR}/surface_guard_stderr_${RUN_ID}.txt" \
   | tee "${LOG_DIR}/surface_guard_stdout_${RUN_ID}.txt" \
-  | grep -E "^test result:" | tail -1 | grep -q "0 failed"; then
+  | grep -E "^test result:" | tail -1 | grep -q '; 0 failed;'; then
 
   GUARD_PASS=$(grep -c '... ok' "${LOG_DIR}/surface_guard_stdout_${RUN_ID}.txt" || true)
   PASS_COUNT=$((PASS_COUNT + GUARD_PASS))
