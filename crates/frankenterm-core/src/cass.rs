@@ -12,6 +12,8 @@ use crate::error::Remediation;
 use crate::policy::Redactor;
 use crate::runtime_compat::process::Command;
 use crate::runtime_compat::timeout;
+#[cfg(feature = "cass-export")]
+use crate::storage::{AgentSessionRecord, ExportQuery, Segment, SegmentScanQuery, StorageHandle};
 use crate::suggestions::Platform;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -416,6 +418,216 @@ pub struct ViewOptions {
     pub context_lines: Option<usize>,
 }
 
+#[cfg(feature = "cass-export")]
+const DEFAULT_CASS_EXPORT_LIMIT: usize = 1_000;
+#[cfg(feature = "cass-export")]
+const CASS_EXPORT_SESSION_PREFIX: &str = "ft-session-";
+
+/// Query controls for exporting FrankenTerm recorder sessions to cass connectors.
+#[cfg(feature = "cass-export")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CassExportQuery {
+    /// Only return sessions whose recorder row id is greater than this value.
+    pub after_id: Option<i64>,
+    /// Filter by pane id.
+    pub pane_id: Option<u64>,
+    /// Filter by session start timestamp lower bound (epoch ms).
+    pub since: Option<i64>,
+    /// Filter by session start timestamp upper bound (epoch ms).
+    pub until: Option<i64>,
+    /// Maximum number of exported sessions.
+    pub limit: usize,
+}
+
+#[cfg(feature = "cass-export")]
+impl CassExportQuery {
+    fn effective_limit(&self) -> usize {
+        if self.limit == 0 {
+            DEFAULT_CASS_EXPORT_LIMIT
+        } else {
+            self.limit
+        }
+    }
+}
+
+#[cfg(feature = "cass-export")]
+impl Default for CassExportQuery {
+    fn default() -> Self {
+        Self {
+            after_id: None,
+            pane_id: None,
+            since: None,
+            until: None,
+            limit: DEFAULT_CASS_EXPORT_LIMIT,
+        }
+    }
+}
+
+/// Query controls for exporting session content chunks to cass connectors.
+#[cfg(feature = "cass-export")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CassContentExportQuery {
+    /// Only return segments with id strictly greater than this value.
+    pub after_id: Option<i64>,
+    /// Maximum number of content chunks to export.
+    pub limit: usize,
+}
+
+#[cfg(feature = "cass-export")]
+impl CassContentExportQuery {
+    fn effective_limit(&self) -> usize {
+        if self.limit == 0 {
+            DEFAULT_CASS_EXPORT_LIMIT
+        } else {
+            self.limit
+        }
+    }
+}
+
+#[cfg(feature = "cass-export")]
+impl Default for CassContentExportQuery {
+    fn default() -> Self {
+        Self {
+            after_id: None,
+            limit: DEFAULT_CASS_EXPORT_LIMIT,
+        }
+    }
+}
+
+/// Cass-facing summary of a FrankenTerm agent session.
+#[cfg(feature = "cass-export")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CassExportSessionRecord {
+    /// Stable recorder row id for the session.
+    pub session_row_id: i64,
+    /// Export identifier. Uses the agent session id when present, otherwise
+    /// falls back to `ft-session-<row_id>`.
+    pub session_id: String,
+    /// Agent provider/classification from the recorder session.
+    pub agent_type: String,
+    /// Workspace/cwd associated with the pane at export time.
+    pub workspace: Option<String>,
+    /// Pane ids participating in the session. Currently single-pane, but kept
+    /// as a vector to match the connector-facing contract.
+    pub pane_ids: Vec<u64>,
+    /// Session start timestamp (epoch ms).
+    pub started_at_ms: i64,
+    /// Session end timestamp (epoch ms) if the session has completed.
+    pub ended_at_ms: Option<i64>,
+    /// Model name recorded for the agent session, if available.
+    pub model_name: Option<String>,
+    /// Export-time content token estimate. Prefers recorded token totals when present.
+    pub content_tokens: u64,
+    /// External correlation id (for example a cass correlation result), if present.
+    pub external_id: Option<String>,
+    /// External correlation metadata persisted on the session, if present.
+    pub external_meta: Option<Value>,
+}
+
+/// Cass-facing content chunk exported from recorder segments.
+#[cfg(feature = "cass-export")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CassExportContentChunk {
+    /// Stable recorder row id for the session.
+    pub session_row_id: i64,
+    /// Export identifier for the session.
+    pub session_id: String,
+    /// Recorder segment id.
+    pub segment_id: i64,
+    /// Pane id that produced the content.
+    pub pane_id: u64,
+    /// Per-pane sequence number for the segment.
+    pub seq: u64,
+    /// Timestamp when the content was captured (epoch ms).
+    pub timestamp_ms: i64,
+    /// Terminal content captured for indexing.
+    pub content: String,
+    /// Content class. Recorder segments are terminal output today.
+    pub content_type: String,
+}
+
+/// Export recorder sessions for cass connector ingestion.
+#[cfg(feature = "cass-export")]
+pub async fn export_sessions(
+    storage: &StorageHandle,
+    query: &CassExportQuery,
+) -> crate::Result<Vec<CassExportSessionRecord>> {
+    let pane_workspaces: HashMap<u64, String> = storage
+        .get_panes()
+        .await?
+        .into_iter()
+        .filter_map(|pane| pane.cwd.map(|cwd| (pane.pane_id, cwd)))
+        .collect();
+
+    let sessions = storage
+        .export_sessions(ExportQuery {
+            pane_id: query.pane_id,
+            since: query.since,
+            until: query.until,
+            limit: None,
+        })
+        .await?;
+
+    let mut exported = Vec::new();
+    for session in sessions
+        .into_iter()
+        .filter(|session| query.after_id.is_none_or(|after_id| session.id > after_id))
+        .take(query.effective_limit())
+    {
+        let content_tokens = session_recorded_tokens(&session)
+            .unwrap_or(estimate_session_content_tokens(storage, &session).await?);
+        exported.push(CassExportSessionRecord {
+            session_row_id: session.id,
+            session_id: export_session_identifier(&session),
+            agent_type: session.agent_type.clone(),
+            workspace: pane_workspaces.get(&session.pane_id).cloned(),
+            pane_ids: vec![session.pane_id],
+            started_at_ms: session.started_at,
+            ended_at_ms: session.ended_at,
+            model_name: session.model_name.clone(),
+            content_tokens,
+            external_id: session.external_id.clone(),
+            external_meta: session.external_meta.clone(),
+        });
+    }
+
+    Ok(exported)
+}
+
+/// Export recorder content chunks for a specific session.
+#[cfg(feature = "cass-export")]
+pub async fn export_content(
+    storage: &StorageHandle,
+    session_id: &str,
+    query: &CassContentExportQuery,
+) -> crate::Result<Vec<CassExportContentChunk>> {
+    let session = resolve_export_session(storage, session_id).await?;
+    let exported_session_id = export_session_identifier(&session);
+    let segments = storage
+        .scan_segments(SegmentScanQuery {
+            after_id: query.after_id,
+            pane_id: Some(session.pane_id),
+            since: Some(session.started_at),
+            until: session.ended_at,
+            limit: query.effective_limit(),
+        })
+        .await?;
+
+    Ok(segments
+        .into_iter()
+        .map(|segment| CassExportContentChunk {
+            session_row_id: session.id,
+            session_id: exported_session_id.clone(),
+            segment_id: segment.id,
+            pane_id: segment.pane_id,
+            seq: segment.seq,
+            timestamp_ms: segment.captured_at,
+            content: segment.content,
+            content_type: "output".to_string(),
+        })
+        .collect())
+}
+
 /// Thin wrapper around the cass CLI.
 #[derive(Debug, Clone)]
 pub struct CassClient {
@@ -749,6 +961,99 @@ fn parse_sessions(input: &str, max_preview: usize) -> Result<Vec<CassSession>, C
         .map_err(|err| CassError::InvalidJson {
             message: err.to_string(),
             preview: redact_and_truncate(input, max_preview),
+        })
+}
+
+#[cfg(feature = "cass-export")]
+fn export_session_identifier(session: &AgentSessionRecord) -> String {
+    session
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{CASS_EXPORT_SESSION_PREFIX}{}", session.id))
+}
+
+#[cfg(feature = "cass-export")]
+fn parse_export_session_row_id(session_id: &str) -> Option<i64> {
+    session_id
+        .trim()
+        .strip_prefix(CASS_EXPORT_SESSION_PREFIX)?
+        .parse::<i64>()
+        .ok()
+}
+
+#[cfg(feature = "cass-export")]
+fn session_recorded_tokens(session: &AgentSessionRecord) -> Option<u64> {
+    session
+        .total_tokens
+        .and_then(|value| u64::try_from(value).ok())
+}
+
+#[cfg(feature = "cass-export")]
+async fn estimate_session_content_tokens(
+    storage: &StorageHandle,
+    session: &AgentSessionRecord,
+) -> crate::Result<u64> {
+    let segments = storage
+        .export_segments(ExportQuery {
+            pane_id: Some(session.pane_id),
+            since: Some(session.started_at),
+            until: session.ended_at,
+            limit: None,
+        })
+        .await?;
+    Ok(segments.iter().map(estimate_segment_tokens).sum())
+}
+
+#[cfg(feature = "cass-export")]
+fn estimate_segment_tokens(segment: &Segment) -> u64 {
+    estimate_text_tokens(&segment.content)
+}
+
+#[cfg(feature = "cass-export")]
+fn estimate_text_tokens(content: &str) -> u64 {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+
+    let whitespace_tokens = u64::try_from(trimmed.split_whitespace().count()).unwrap_or(u64::MAX);
+    if whitespace_tokens > 0 {
+        whitespace_tokens
+    } else {
+        let chars = u64::try_from(trimmed.chars().count()).unwrap_or(u64::MAX);
+        chars.saturating_add(3) / 4
+    }
+}
+
+#[cfg(feature = "cass-export")]
+async fn resolve_export_session(
+    storage: &StorageHandle,
+    session_id: &str,
+) -> crate::Result<AgentSessionRecord> {
+    if let Some(row_id) = parse_export_session_row_id(session_id) {
+        if let Some(session) = storage.get_agent_session(row_id).await? {
+            return Ok(session);
+        }
+    }
+
+    let requested_id = session_id.trim();
+    let sessions = storage
+        .export_sessions(ExportQuery {
+            limit: None,
+            ..ExportQuery::default()
+        })
+        .await?;
+
+    sessions
+        .into_iter()
+        .find(|candidate| export_session_identifier(candidate) == requested_id)
+        .ok_or_else(|| {
+            crate::Error::Storage(crate::StorageError::NotFound(format!(
+                "cass export session '{requested_id}'"
+            )))
         })
 }
 
@@ -1404,6 +1709,31 @@ mod tests {
     #[test]
     fn parse_cass_timestamp_ms_garbage() {
         assert!(parse_cass_timestamp_ms("not-a-timestamp").is_none());
+    }
+
+    #[cfg(feature = "cass-export")]
+    #[test]
+    fn export_session_identifier_falls_back_to_row_id() {
+        let mut session = AgentSessionRecord::new_start(7, "codex");
+        session.id = 42;
+        assert_eq!(export_session_identifier(&session), "ft-session-42");
+    }
+
+    #[cfg(feature = "cass-export")]
+    #[test]
+    fn export_session_identifier_preserves_explicit_session_id() {
+        let mut session = AgentSessionRecord::new_start(7, "codex");
+        session.id = 42;
+        session.session_id = Some("sess-123".to_string());
+        assert_eq!(export_session_identifier(&session), "sess-123");
+    }
+
+    #[cfg(feature = "cass-export")]
+    #[test]
+    fn estimate_text_tokens_uses_whitespace_and_char_fallback() {
+        assert_eq!(estimate_text_tokens("alpha beta gamma"), 3);
+        assert_eq!(estimate_text_tokens(""), 0);
+        assert_eq!(estimate_text_tokens("abcdef"), 2);
     }
 
     #[test]

@@ -470,6 +470,7 @@ default = [
     "agent-mail",
     "asupersync-runtime",
     "browser",
+    "cass-export",
     "disk-pressure",
     "distributed",
     "frankensearch",
@@ -538,6 +539,8 @@ __journal_types_placeholder = []
 subprocess-bridge = []
 # Feature gate for mcp_agent_mail_rust coordination bridge.
 agent-mail = ["subprocess-bridge"]
+# Feature gate for FrankenTerm session/content export consumed by cass connectors.
+cass-export = []
 # Feature gate for vibe_cockpit telemetry export bridge.
 vc-export = ["subprocess-bridge"]
 
