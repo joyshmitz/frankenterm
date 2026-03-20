@@ -1401,9 +1401,7 @@ fn trim_utf8_tail_to_max_bytes(text: &str, max_bytes: usize) -> String {
         while last_char_start > 0 && !text.is_char_boundary(last_char_start - 1) {
             last_char_start -= 1;
         }
-        if last_char_start > 0 {
-            last_char_start -= 1;
-        }
+        last_char_start = last_char_start.saturating_sub(1);
         return text[last_char_start..].to_string();
     }
     text[start..].to_string()

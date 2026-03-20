@@ -428,28 +428,27 @@ impl CapacityGovernor {
         }
 
         // CPU/memory throttling for heavy workloads.
-        if category == WorkloadCategory::Heavy {
-            if signals.cpu_utilization >= self.config.cpu_throttle_threshold
-                || signals.memory_utilization >= self.config.memory_throttle_threshold
-            {
-                if self.config.prefer_rch_offload && signals.rch_can_offload() {
-                    return GovernorDecision::Offload {
-                        reason: format!(
-                            "elevated pressure: cpu={:.0}% mem={:.0}%, rch available",
-                            signals.cpu_utilization * 100.0,
-                            signals.memory_utilization * 100.0,
-                        ),
-                    };
-                }
-                return GovernorDecision::Throttle {
-                    delay_ms: self.config.heavy_throttle_delay_ms,
+        if category == WorkloadCategory::Heavy
+            && (signals.cpu_utilization >= self.config.cpu_throttle_threshold
+                || signals.memory_utilization >= self.config.memory_throttle_threshold)
+        {
+            if self.config.prefer_rch_offload && signals.rch_can_offload() {
+                return GovernorDecision::Offload {
                     reason: format!(
-                        "elevated pressure: cpu={:.0}% mem={:.0}%",
+                        "elevated pressure: cpu={:.0}% mem={:.0}%, rch available",
                         signals.cpu_utilization * 100.0,
                         signals.memory_utilization * 100.0,
                     ),
                 };
             }
+            return GovernorDecision::Throttle {
+                delay_ms: self.config.heavy_throttle_delay_ms,
+                reason: format!(
+                    "elevated pressure: cpu={:.0}% mem={:.0}%",
+                    signals.cpu_utilization * 100.0,
+                    signals.memory_utilization * 100.0,
+                ),
+            };
         }
 
         GovernorDecision::Allow {

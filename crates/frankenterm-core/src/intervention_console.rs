@@ -32,10 +32,11 @@ use serde::{Deserialize, Serialize};
 // =============================================================================
 
 /// Operational state of a pane under operator control.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneControlState {
     /// Normal operation — agent is active.
+    #[default]
     Active,
     /// Paused by operator — agent output buffered but not acted on.
     Paused,
@@ -43,12 +44,6 @@ pub enum PaneControlState {
     ManualTakeover,
     /// Quarantined — all I/O blocked pending review.
     Quarantined,
-}
-
-impl Default for PaneControlState {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 impl PaneControlState {

@@ -35,10 +35,11 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Context-window pressure tier for an agent session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextPressureTier {
     /// < 50% of context window used.
+    #[default]
     Green,
     /// 50-75% — operator should be aware.
     Yellow,
@@ -46,12 +47,6 @@ pub enum ContextPressureTier {
     Red,
     /// > 90% — compaction active or context nearly exhausted.
     Black,
-}
-
-impl Default for ContextPressureTier {
-    fn default() -> Self {
-        Self::Green
-    }
 }
 
 impl ContextPressureTier {

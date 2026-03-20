@@ -3898,7 +3898,7 @@ pub struct MissionCheckpoint {
 }
 
 /// Tracks pause/resume/abort lifecycle for a mission.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionPauseResumeState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_checkpoint: Option<MissionCheckpoint>,
@@ -3908,19 +3908,6 @@ pub struct MissionPauseResumeState {
     pub total_resume_count: u32,
     pub total_abort_count: u32,
     pub cumulative_pause_duration_ms: i64,
-}
-
-impl Default for MissionPauseResumeState {
-    fn default() -> Self {
-        Self {
-            current_checkpoint: None,
-            checkpoint_history: Vec::new(),
-            total_pause_count: 0,
-            total_resume_count: 0,
-            total_abort_count: 0,
-            cumulative_pause_duration_ms: 0,
-        }
-    }
 }
 
 impl MissionPauseResumeState {

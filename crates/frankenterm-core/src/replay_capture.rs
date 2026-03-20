@@ -681,7 +681,7 @@ pub enum CaptureRedactionMode {
 }
 
 /// Policy governing what gets captured and how long it is retained.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureRedactionPolicy {
     /// Whether redaction is active.
     pub enabled: bool,
