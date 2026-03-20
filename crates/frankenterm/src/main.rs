@@ -11624,7 +11624,7 @@ async fn distributed_persist_payload(
                             delta.seq,
                         ));
                     }
-                    seq_guard.insert(seq_key, delta.seq);
+                    seq_guard.insert(seq_key.clone(), delta.seq);
                 }
             }
 

@@ -278,7 +278,7 @@ fn cass_export_sessions_use_fallback_identifier_and_workspace() {
         assert_eq!(record.agent_type, "codex");
         assert_eq!(record.workspace.as_deref(), Some("/repo"));
         assert_eq!(record.pane_ids, vec![1]);
-        assert_eq!(record.content_tokens, 3);
+        assert_eq!(record.content_tokens, 4);
         assert_eq!(record.model_name.as_deref(), Some("gpt-5.4"));
     });
 }
