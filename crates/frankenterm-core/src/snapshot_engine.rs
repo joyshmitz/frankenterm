@@ -1990,12 +1990,13 @@ mod tests {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
-            sleep(Duration::from_millis(100)).await;
+            // Wait for startup capture + scheduler loop to settle (250ms poll step)
+            sleep(Duration::from_millis(350)).await;
 
             let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-            sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(350)).await;
             let _ = engine.emit_trigger(SnapshotTrigger::StateTransition);
-            sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(350)).await;
 
             let count = checkpoint_count(db_path.as_str());
             assert_eq!(count, 3, "startup + 2 captures (zero threshold)");
