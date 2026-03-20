@@ -187,10 +187,7 @@ impl ErrorCode {
             "robot.timeout"
             | "robot.cass_timeout"
             | "robot.cass_error"
-            | "robot.cass_invalid_json"
-            | "robot.cass_output_too_large"
             | "robot.caut_error" => ErrorCategory::Network,
-            "robot.agent_detection_error" => ErrorCategory::Network,
             "robot.assignment_not_found" => ErrorCategory::Workflow,
             code if code.starts_with("robot.workflow_")
                 || code.starts_with("robot.mission_")
@@ -206,7 +203,10 @@ impl ErrorCode {
             | "robot.wezterm_parse_error"
             | "robot.pane_not_found"
             | "robot.circuit_open" => ErrorCategory::Wezterm,
-            "robot.internal_error" => ErrorCategory::Internal,
+            "robot.internal_error"
+            | "robot.cass_invalid_json"
+            | "robot.cass_output_too_large"
+            | "robot.agent_detection_error" => ErrorCategory::Internal,
             _ => ErrorCategory::Internal,
         }
     }
@@ -2082,23 +2082,26 @@ mod tests {
             ErrorCode::parse("robot.code_not_found").unwrap().category(),
             ErrorCategory::Config
         );
+        // Data-format errors from external tools are Internal, not Network —
+        // the response arrived but its content was malformed or oversized.
         assert_eq!(
             ErrorCode::parse("robot.cass_invalid_json")
                 .unwrap()
                 .category(),
-            ErrorCategory::Network
+            ErrorCategory::Internal
         );
         assert_eq!(
             ErrorCode::parse("robot.cass_output_too_large")
                 .unwrap()
                 .category(),
-            ErrorCategory::Network
+            ErrorCategory::Internal
         );
+        // Agent detection is a local pane-analysis operation, not a network call.
         assert_eq!(
             ErrorCode::parse("robot.agent_detection_error")
                 .unwrap()
                 .category(),
-            ErrorCategory::Network
+            ErrorCategory::Internal
         );
         assert_eq!(
             ErrorCode::parse("robot.internal_error").unwrap().category(),
@@ -2134,15 +2137,16 @@ mod tests {
                 .unwrap()
                 .is_retryable()
         );
-        // Transient network errors are retryable
+        // Transient external-tool errors are retryable
         assert!(ErrorCode::parse("robot.cass_error").unwrap().is_retryable());
         assert!(ErrorCode::parse("robot.caut_error").unwrap().is_retryable());
+        // Transient local-subsystem errors are retryable
         assert!(
             ErrorCode::parse("robot.agent_detection_error")
                 .unwrap()
                 .is_retryable()
         );
-        // Non-retryable network errors
+        // Data-format errors are NOT retryable (same bad data on retry)
         assert!(
             !ErrorCode::parse("robot.cass_invalid_json")
                 .unwrap()
