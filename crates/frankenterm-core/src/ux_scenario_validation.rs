@@ -729,7 +729,7 @@ impl GoNoGoEvaluation {
     #[must_use]
     pub fn render(&self) -> String {
         let mut lines = Vec::new();
-        lines.push(format!("=== UX Go/No-Go Evaluation ==="));
+        lines.push("=== UX Go/No-Go Evaluation ===".to_string());
         lines.push(format!("Verdict: {}", self.summary));
         lines.push(String::new());
 

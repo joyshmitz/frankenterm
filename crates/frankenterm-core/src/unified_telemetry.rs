@@ -106,7 +106,7 @@ impl std::fmt::Display for CorrelationId {
 // ---------------------------------------------------------------------------
 
 /// The interface surface that originated this telemetry event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TelemetrySource {
     /// Human CLI (`ft status`, `ft robot state`).
@@ -116,13 +116,8 @@ pub enum TelemetrySource {
     /// Web/HTTP API (feature-gated).
     Web,
     /// Internal runtime (watcher loop, scheduler tick, health probe).
+    #[default]
     Internal,
-}
-
-impl Default for TelemetrySource {
-    fn default() -> Self {
-        Self::Internal
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -139,19 +134,16 @@ impl Default for TelemetrySource {
 /// - `Internal` — safe within the fleet but not for external exposure.
 /// - `Sensitive` — requires scrubbing before any persistence.
 /// - `Pii` — must be stripped entirely before leaving the process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum RedactionLabel {
     Public,
+    #[default]
     Internal,
     Sensitive,
     Pii,
-}
-
-impl Default for RedactionLabel {
-    fn default() -> Self {
-        Self::Internal
-    }
 }
 
 impl RedactionLabel {
@@ -182,7 +174,7 @@ pub struct RedactionMeta {
 // ---------------------------------------------------------------------------
 
 /// Roll-up health status for a subsystem.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthStatus {
     /// Operating normally.
@@ -192,13 +184,8 @@ pub enum HealthStatus {
     /// Non-functional or erroring.
     Unhealthy,
     /// Status cannot be determined (subsystem not initialized or timed out).
+    #[default]
     Unknown,
-}
-
-impl Default for HealthStatus {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 impl HealthStatus {
