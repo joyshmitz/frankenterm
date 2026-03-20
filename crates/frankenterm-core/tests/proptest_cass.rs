@@ -8,8 +8,12 @@
 use std::collections::HashMap;
 
 use frankenterm_core::cass::{
-    CassAgent, CassMessage, CassSearchHit, CassSearchResult, CassSession, CassSessionSummary,
-    parse_cass_timestamp_ms,
+    CassAgent, CassContextLine, CassIndexResult, CassMessage, CassSearchHit, CassSearchResult,
+    CassSession, CassSessionSummary, CassStatus, CassViewResult, parse_cass_timestamp_ms,
+};
+#[cfg(feature = "cass-export")]
+use frankenterm_core::cass::{
+    CassContentExportQuery, CassExportContentChunk, CassExportQuery, CassExportSessionRecord,
 };
 use proptest::prelude::*;
 
@@ -482,5 +486,729 @@ proptest! {
         let summary = CassSessionSummary::from_session(&session);
         prop_assert_eq!(summary.message_count, session.messages.len(),
             "message_count {} != messages.len() {}", summary.message_count, session.messages.len());
+    }
+}
+
+// =========================================================================
+// Additional strategies for uncovered types (WindyStork)
+// =========================================================================
+
+fn arb_cass_context_line() -> impl Strategy<Value = CassContextLine> {
+    (
+        proptest::option::of(0_usize..10_000),
+        proptest::option::of("[a-zA-Z ]{1,40}"),
+        proptest::option::of("user|assistant|system|tool"),
+    )
+        .prop_map(|(line_number, content, role)| CassContextLine {
+            line_number,
+            content,
+            role,
+            extra: HashMap::new(),
+        })
+}
+
+fn arb_cass_search_hit() -> impl Strategy<Value = CassSearchHit> {
+    (
+        proptest::option::of("/[a-z/]{3,30}\\.jsonl"),
+        proptest::option::of(0_usize..50_000),
+        proptest::option::of("codex|claude_code|gemini|cursor|aider"),
+        proptest::option::of("/[a-z/]{3,20}"),
+        proptest::option::of("[a-zA-Z ]{5,50}"),
+        proptest::option::of("[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"),
+        proptest::option::of(0.0_f64..1.0),
+    )
+        .prop_map(
+            |(source_path, line_number, agent, workspace, content, timestamp, score)| {
+                CassSearchHit {
+                    source_path,
+                    line_number,
+                    agent,
+                    workspace,
+                    content,
+                    timestamp,
+                    score,
+                    extra: HashMap::new(),
+                }
+            },
+        )
+}
+
+fn arb_cass_search_result() -> impl Strategy<Value = CassSearchResult> {
+    (
+        proptest::option::of("[a-zA-Z ]{1,20}"),
+        proptest::option::of(1_usize..100),
+        proptest::option::of(0_usize..50),
+        proptest::option::of(0_usize..100),
+        proptest::option::of(0_usize..500),
+        proptest::collection::vec(arb_cass_search_hit(), 0..5),
+        proptest::option::of(0_usize..10_000),
+        proptest::option::of("[a-z0-9-]{8,16}"),
+        proptest::option::of("[a-z0-9]{8,16}"),
+        proptest::option::of(proptest::bool::ANY),
+    )
+        .prop_map(
+            |(
+                query,
+                limit,
+                offset,
+                count,
+                total_matches,
+                hits,
+                max_tokens,
+                request_id,
+                cursor,
+                hits_clamped,
+            )| {
+                CassSearchResult {
+                    query,
+                    limit,
+                    offset,
+                    count,
+                    total_matches,
+                    hits,
+                    max_tokens,
+                    request_id,
+                    cursor,
+                    hits_clamped,
+                    extra: HashMap::new(),
+                }
+            },
+        )
+}
+
+fn arb_cass_view_result() -> impl Strategy<Value = CassViewResult> {
+    (
+        proptest::option::of("/[a-z/]{3,30}\\.jsonl"),
+        proptest::option::of(0_usize..50_000),
+        proptest::option::of(proptest::collection::vec(arb_cass_context_line(), 0..3)),
+        proptest::option::of(arb_cass_context_line()),
+        proptest::option::of(proptest::collection::vec(arb_cass_context_line(), 0..3)),
+        proptest::option::of("codex|claude_code|gemini"),
+        proptest::option::of("/[a-z/]{3,20}"),
+    )
+        .prop_map(
+            |(source_path, line_number, context_before, match_line, context_after, agent, workspace)| {
+                CassViewResult {
+                    source_path,
+                    line_number,
+                    context_before,
+                    match_line,
+                    context_after,
+                    agent,
+                    workspace,
+                    extra: HashMap::new(),
+                }
+            },
+        )
+}
+
+fn arb_cass_index_result() -> impl Strategy<Value = CassIndexResult> {
+    (
+        proptest::option::of(0_usize..10_000),
+        proptest::option::of(0_usize..5_000),
+        proptest::option::of(proptest::bool::ANY),
+        proptest::option::of(0_u64..60_000),
+    )
+        .prop_map(
+            |(sessions_indexed, new_sessions, success, elapsed_ms)| CassIndexResult {
+                sessions_indexed,
+                new_sessions,
+                success,
+                elapsed_ms,
+                extra: HashMap::new(),
+            },
+        )
+}
+
+fn arb_cass_status() -> impl Strategy<Value = CassStatus> {
+    (
+        proptest::option::of(proptest::bool::ANY),
+        proptest::option::of("/[a-z/.]{5,30}"),
+        proptest::option::of(0_usize..100_000),
+        proptest::option::of(0_usize..10_000_000),
+        proptest::option::of("[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"),
+        proptest::option::of(proptest::bool::ANY),
+    )
+        .prop_map(
+            |(healthy, index_path, total_sessions, total_lines, last_indexed, stale)| CassStatus {
+                healthy,
+                index_path,
+                total_sessions,
+                total_lines,
+                last_indexed,
+                stale,
+                extra: HashMap::new(),
+            },
+        )
+}
+
+// =========================================================================
+// Serde roundtrips for uncovered types (WindyStork)
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    /// CassSearchHit serde roundtrip preserves all fields.
+    #[test]
+    fn prop_search_hit_serde_roundtrip(hit in arb_cass_search_hit()) {
+        let json = serde_json::to_string(&hit).unwrap();
+        let back: CassSearchHit = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.source_path, &hit.source_path);
+        prop_assert_eq!(back.line_number, hit.line_number);
+        prop_assert_eq!(&back.agent, &hit.agent);
+        prop_assert_eq!(&back.workspace, &hit.workspace);
+        prop_assert_eq!(&back.content, &hit.content);
+        prop_assert_eq!(&back.timestamp, &hit.timestamp);
+        // f64 score: compare with tolerance for JSON roundtrip
+        match (back.score, hit.score) {
+            (Some(a), Some(b)) => prop_assert!((a - b).abs() < 1e-10,
+                "score mismatch: {} vs {}", a, b),
+            (None, None) => {}
+            _ => prop_assert!(false, "score presence mismatch"),
+        }
+    }
+
+    /// CassSearchResult serde roundtrip preserves key fields.
+    #[test]
+    fn prop_search_result_serde_roundtrip(result in arb_cass_search_result()) {
+        let json = serde_json::to_string(&result).unwrap();
+        let back: CassSearchResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.query, &result.query);
+        prop_assert_eq!(back.limit, result.limit);
+        prop_assert_eq!(back.offset, result.offset);
+        prop_assert_eq!(back.count, result.count);
+        prop_assert_eq!(back.total_matches, result.total_matches);
+        prop_assert_eq!(back.hits.len(), result.hits.len());
+        prop_assert_eq!(back.max_tokens, result.max_tokens);
+        prop_assert_eq!(&back.request_id, &result.request_id);
+        prop_assert_eq!(&back.cursor, &result.cursor);
+        prop_assert_eq!(back.hits_clamped, result.hits_clamped);
+    }
+
+    /// CassContextLine serde roundtrip.
+    #[test]
+    fn prop_context_line_serde_roundtrip(line in arb_cass_context_line()) {
+        let json = serde_json::to_string(&line).unwrap();
+        let back: CassContextLine = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.line_number, line.line_number);
+        prop_assert_eq!(&back.content, &line.content);
+        prop_assert_eq!(&back.role, &line.role);
+    }
+
+    /// CassViewResult serde roundtrip preserves structure.
+    #[test]
+    fn prop_view_result_serde_roundtrip(view in arb_cass_view_result()) {
+        let json = serde_json::to_string(&view).unwrap();
+        let back: CassViewResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.source_path, &view.source_path);
+        prop_assert_eq!(back.line_number, view.line_number);
+        prop_assert_eq!(&back.agent, &view.agent);
+        prop_assert_eq!(&back.workspace, &view.workspace);
+        // Context vectors
+        prop_assert_eq!(
+            back.context_before.as_ref().map(|v| v.len()),
+            view.context_before.as_ref().map(|v| v.len())
+        );
+        prop_assert_eq!(
+            back.context_after.as_ref().map(|v| v.len()),
+            view.context_after.as_ref().map(|v| v.len())
+        );
+        prop_assert_eq!(back.match_line.is_some(), view.match_line.is_some());
+    }
+
+    /// CassIndexResult serde roundtrip.
+    #[test]
+    fn prop_index_result_serde_roundtrip(idx in arb_cass_index_result()) {
+        let json = serde_json::to_string(&idx).unwrap();
+        let back: CassIndexResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.sessions_indexed, idx.sessions_indexed);
+        prop_assert_eq!(back.new_sessions, idx.new_sessions);
+        prop_assert_eq!(back.success, idx.success);
+        prop_assert_eq!(back.elapsed_ms, idx.elapsed_ms);
+    }
+
+    /// CassStatus serde roundtrip.
+    #[test]
+    fn prop_status_serde_roundtrip(status in arb_cass_status()) {
+        let json = serde_json::to_string(&status).unwrap();
+        let back: CassStatus = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.healthy, status.healthy);
+        prop_assert_eq!(&back.index_path, &status.index_path);
+        prop_assert_eq!(back.total_sessions, status.total_sessions);
+        prop_assert_eq!(back.total_lines, status.total_lines);
+        prop_assert_eq!(&back.last_indexed, &status.last_indexed);
+        prop_assert_eq!(back.stale, status.stale);
+    }
+}
+
+// =========================================================================
+// Clone and Default tests for uncovered types (WindyStork)
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(40))]
+
+    /// CassSearchHit Clone preserves fields.
+    #[test]
+    fn prop_search_hit_clone(hit in arb_cass_search_hit()) {
+        let cloned = hit.clone();
+        prop_assert_eq!(&cloned.source_path, &hit.source_path);
+        prop_assert_eq!(cloned.line_number, hit.line_number);
+        prop_assert_eq!(&cloned.agent, &hit.agent);
+    }
+
+    /// CassContextLine Clone preserves fields.
+    #[test]
+    fn prop_context_line_clone(line in arb_cass_context_line()) {
+        let cloned = line.clone();
+        prop_assert_eq!(cloned.line_number, line.line_number);
+        prop_assert_eq!(&cloned.content, &line.content);
+    }
+
+    /// CassViewResult Clone preserves fields.
+    #[test]
+    fn prop_view_result_clone(view in arb_cass_view_result()) {
+        let cloned = view.clone();
+        prop_assert_eq!(&cloned.source_path, &view.source_path);
+        prop_assert_eq!(cloned.line_number, view.line_number);
+        prop_assert_eq!(&cloned.agent, &view.agent);
+    }
+
+    /// CassIndexResult Clone preserves fields.
+    #[test]
+    fn prop_index_result_clone(idx in arb_cass_index_result()) {
+        let cloned = idx.clone();
+        prop_assert_eq!(cloned.sessions_indexed, idx.sessions_indexed);
+        prop_assert_eq!(cloned.new_sessions, idx.new_sessions);
+    }
+
+    /// CassStatus Clone preserves fields.
+    #[test]
+    fn prop_status_clone(status in arb_cass_status()) {
+        let cloned = status.clone();
+        prop_assert_eq!(cloned.healthy, status.healthy);
+        prop_assert_eq!(&cloned.index_path, &status.index_path);
+    }
+
+    /// CassSearchResult JSON is a valid object.
+    #[test]
+    fn prop_search_result_json_valid(result in arb_cass_search_result()) {
+        let json = serde_json::to_string(&result).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.is_object());
+    }
+
+    /// CassViewResult JSON is a valid object.
+    #[test]
+    fn prop_view_result_json_valid(view in arb_cass_view_result()) {
+        let json = serde_json::to_string(&view).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.is_object());
+    }
+
+    /// CassStatus JSON is a valid object.
+    #[test]
+    fn prop_status_json_valid(status in arb_cass_status()) {
+        let json = serde_json::to_string(&status).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(value.is_object());
+    }
+}
+
+// =========================================================================
+// Default type unit tests (WindyStork)
+// =========================================================================
+
+#[test]
+fn context_line_default() {
+    let line = CassContextLine::default();
+    assert!(line.line_number.is_none());
+    assert!(line.content.is_none());
+    assert!(line.role.is_none());
+    assert!(line.extra.is_empty());
+}
+
+#[test]
+fn view_result_default() {
+    let view = CassViewResult::default();
+    assert!(view.source_path.is_none());
+    assert!(view.line_number.is_none());
+    assert!(view.context_before.is_none());
+    assert!(view.match_line.is_none());
+    assert!(view.context_after.is_none());
+    assert!(view.agent.is_none());
+    assert!(view.workspace.is_none());
+    assert!(view.extra.is_empty());
+}
+
+#[test]
+fn index_result_default() {
+    let idx = CassIndexResult::default();
+    assert!(idx.sessions_indexed.is_none());
+    assert!(idx.new_sessions.is_none());
+    assert!(idx.success.is_none());
+    assert!(idx.elapsed_ms.is_none());
+    assert!(idx.extra.is_empty());
+}
+
+#[test]
+fn status_default() {
+    let status = CassStatus::default();
+    assert!(status.healthy.is_none());
+    assert!(status.index_path.is_none());
+    assert!(status.total_sessions.is_none());
+    assert!(status.total_lines.is_none());
+    assert!(status.last_indexed.is_none());
+    assert!(status.stale.is_none());
+    assert!(status.extra.is_empty());
+}
+
+#[test]
+fn search_result_with_unknown_fields_roundtrip() {
+    let json = r#"{
+        "query": "test",
+        "hits": [],
+        "unknown_field": "preserved",
+        "nested": {"deep": true}
+    }"#;
+    let parsed: CassSearchResult = serde_json::from_str(json).unwrap();
+    assert!(parsed.extra.contains_key("unknown_field"));
+    assert!(parsed.extra.contains_key("nested"));
+    // Re-serialize and check unknown fields survive
+    let reserialized = serde_json::to_string(&parsed).unwrap();
+    let reparsed: CassSearchResult = serde_json::from_str(&reserialized).unwrap();
+    assert!(reparsed.extra.contains_key("unknown_field"));
+}
+
+#[test]
+fn view_result_with_full_context() {
+    let json = r#"{
+        "source_path": "/sessions/sess1.jsonl",
+        "line_number": 42,
+        "context_before": [
+            {"line_number": 40, "content": "before1"},
+            {"line_number": 41, "content": "before2"}
+        ],
+        "match_line": {"line_number": 42, "content": "match", "role": "assistant"},
+        "context_after": [
+            {"line_number": 43, "content": "after1"}
+        ],
+        "agent": "codex",
+        "workspace": "/project"
+    }"#;
+    let parsed: CassViewResult = serde_json::from_str(json).unwrap();
+    assert_eq!(parsed.line_number, Some(42));
+    assert_eq!(parsed.context_before.as_ref().map(|v| v.len()), Some(2));
+    assert_eq!(parsed.context_after.as_ref().map(|v| v.len()), Some(1));
+    let ml = parsed.match_line.as_ref().unwrap();
+    assert_eq!(ml.role.as_deref(), Some("assistant"));
+}
+
+#[test]
+fn index_result_success_roundtrip() {
+    let json = r#"{
+        "sessions_indexed": 150,
+        "new_sessions": 10,
+        "success": true,
+        "elapsed_ms": 1234
+    }"#;
+    let parsed: CassIndexResult = serde_json::from_str(json).unwrap();
+    assert_eq!(parsed.sessions_indexed, Some(150));
+    assert_eq!(parsed.new_sessions, Some(10));
+    assert_eq!(parsed.success, Some(true));
+    assert_eq!(parsed.elapsed_ms, Some(1234));
+    let reserialized = serde_json::to_string(&parsed).unwrap();
+    let reparsed: CassIndexResult = serde_json::from_str(&reserialized).unwrap();
+    assert_eq!(reparsed.sessions_indexed, Some(150));
+}
+
+#[test]
+fn status_healthy_roundtrip() {
+    let json = r#"{
+        "healthy": true,
+        "index_path": "/home/user/.cass/index",
+        "total_sessions": 500,
+        "total_lines": 100000,
+        "last_indexed": "2026-03-20T10:00:00Z",
+        "stale": false
+    }"#;
+    let parsed: CassStatus = serde_json::from_str(json).unwrap();
+    assert_eq!(parsed.healthy, Some(true));
+    assert_eq!(parsed.total_sessions, Some(500));
+    assert_eq!(parsed.stale, Some(false));
+    let reserialized = serde_json::to_string(&parsed).unwrap();
+    let reparsed: CassStatus = serde_json::from_str(&reserialized).unwrap();
+    assert_eq!(reparsed.healthy, Some(true));
+    assert_eq!(reparsed.total_sessions, Some(500));
+}
+
+#[test]
+fn search_hit_score_nan_handling() {
+    // Ensure NaN doesn't crash serde (f64 NaN serializes to null in JSON)
+    let hit = CassSearchHit {
+        score: Some(f64::NAN),
+        ..CassSearchHit::default()
+    };
+    // serde_json serializes NaN as null by default — this should not panic
+    let json = serde_json::to_string(&hit).unwrap();
+    let back: CassSearchHit = serde_json::from_str(&json).unwrap();
+    // NaN serialized as null → deserialized as None
+    assert!(back.score.is_none());
+}
+
+#[test]
+fn search_result_empty_hits_count_consistency() {
+    let result = CassSearchResult {
+        query: Some("test".to_string()),
+        hits: vec![],
+        count: Some(0),
+        total_matches: Some(0),
+        ..CassSearchResult::default()
+    };
+    let json = serde_json::to_string(&result).unwrap();
+    let back: CassSearchResult = serde_json::from_str(&json).unwrap();
+    assert!(back.hits.is_empty());
+    assert_eq!(back.count, Some(0));
+}
+
+// =========================================================================
+// cass-export feature-gated types (WindyStork)
+// =========================================================================
+
+#[cfg(feature = "cass-export")]
+mod cass_export_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn arb_export_query() -> impl Strategy<Value = CassExportQuery> {
+        (
+            proptest::option::of(0_i64..100_000),
+            proptest::option::of(0_u64..1000),
+            proptest::option::of(0_i64..2_000_000_000_000),
+            proptest::option::of(0_i64..2_000_000_000_000),
+            0_usize..5000,
+        )
+            .prop_map(|(after_id, pane_id, since, until, limit)| CassExportQuery {
+                after_id,
+                pane_id,
+                since,
+                until,
+                limit,
+            })
+    }
+
+    fn arb_content_export_query() -> impl Strategy<Value = CassContentExportQuery> {
+        (proptest::option::of(0_i64..100_000), 0_usize..5000)
+            .prop_map(|(after_id, limit)| CassContentExportQuery { after_id, limit })
+    }
+
+    fn arb_export_session_record() -> impl Strategy<Value = CassExportSessionRecord> {
+        (
+            0_i64..100_000,
+            "[a-z0-9-]{5,20}",
+            "codex|claude_code|gemini|cursor",
+            proptest::option::of("/[a-z/]{3,20}"),
+            proptest::collection::vec(0_u64..1000, 1..3),
+            0_i64..2_000_000_000_000,
+            proptest::option::of(0_i64..2_000_000_000_000),
+            proptest::option::of("[a-z0-9-]{5,20}"),
+            0_u64..100_000,
+            proptest::option::of("[a-z0-9-]{8,16}"),
+        )
+            .prop_map(
+                |(
+                    session_row_id,
+                    session_id,
+                    agent_type,
+                    workspace,
+                    pane_ids,
+                    started_at_ms,
+                    ended_at_ms,
+                    model_name,
+                    content_tokens,
+                    external_id,
+                )| {
+                    CassExportSessionRecord {
+                        session_row_id,
+                        session_id,
+                        agent_type,
+                        workspace,
+                        pane_ids,
+                        started_at_ms,
+                        ended_at_ms,
+                        model_name,
+                        content_tokens,
+                        external_id,
+                        external_meta: None,
+                    }
+                },
+            )
+    }
+
+    fn arb_export_content_chunk() -> impl Strategy<Value = CassExportContentChunk> {
+        (
+            0_i64..100_000,
+            "[a-z0-9-]{5,20}",
+            0_i64..100_000,
+            0_u64..1000,
+            0_u64..10_000,
+            0_i64..2_000_000_000_000,
+            "[a-zA-Z ]{5,50}",
+        )
+            .prop_map(
+                |(session_row_id, session_id, segment_id, pane_id, seq, timestamp_ms, content)| {
+                    CassExportContentChunk {
+                        session_row_id,
+                        session_id,
+                        segment_id,
+                        pane_id,
+                        seq,
+                        timestamp_ms,
+                        content,
+                        content_type: "output".to_string(),
+                    }
+                },
+            )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(60))]
+
+        /// CassExportQuery serde roundtrip.
+        #[test]
+        fn prop_export_query_serde_roundtrip(query in arb_export_query()) {
+            let json = serde_json::to_string(&query).unwrap();
+            let back: CassExportQuery = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(back.after_id, query.after_id);
+            prop_assert_eq!(back.pane_id, query.pane_id);
+            prop_assert_eq!(back.since, query.since);
+            prop_assert_eq!(back.until, query.until);
+            prop_assert_eq!(back.limit, query.limit);
+        }
+
+        /// CassContentExportQuery serde roundtrip.
+        #[test]
+        fn prop_content_export_query_serde_roundtrip(query in arb_content_export_query()) {
+            let json = serde_json::to_string(&query).unwrap();
+            let back: CassContentExportQuery = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(back.after_id, query.after_id);
+            prop_assert_eq!(back.limit, query.limit);
+        }
+
+        /// CassExportSessionRecord serde roundtrip.
+        #[test]
+        fn prop_export_session_record_serde_roundtrip(record in arb_export_session_record()) {
+            let json = serde_json::to_string(&record).unwrap();
+            let back: CassExportSessionRecord = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(back.session_row_id, record.session_row_id);
+            prop_assert_eq!(&back.session_id, &record.session_id);
+            prop_assert_eq!(&back.agent_type, &record.agent_type);
+            prop_assert_eq!(&back.workspace, &record.workspace);
+            prop_assert_eq!(&back.pane_ids, &record.pane_ids);
+            prop_assert_eq!(back.started_at_ms, record.started_at_ms);
+            prop_assert_eq!(back.ended_at_ms, record.ended_at_ms);
+            prop_assert_eq!(&back.model_name, &record.model_name);
+            prop_assert_eq!(back.content_tokens, record.content_tokens);
+            prop_assert_eq!(&back.external_id, &record.external_id);
+        }
+
+        /// CassExportContentChunk serde roundtrip.
+        #[test]
+        fn prop_export_content_chunk_serde_roundtrip(chunk in arb_export_content_chunk()) {
+            let json = serde_json::to_string(&chunk).unwrap();
+            let back: CassExportContentChunk = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(back.session_row_id, chunk.session_row_id);
+            prop_assert_eq!(&back.session_id, &chunk.session_id);
+            prop_assert_eq!(back.segment_id, chunk.segment_id);
+            prop_assert_eq!(back.pane_id, chunk.pane_id);
+            prop_assert_eq!(back.seq, chunk.seq);
+            prop_assert_eq!(back.timestamp_ms, chunk.timestamp_ms);
+            prop_assert_eq!(&back.content, &chunk.content);
+            prop_assert_eq!(&back.content_type, &chunk.content_type);
+        }
+
+        /// CassExportQuery equality check.
+        #[test]
+        fn prop_export_query_eq(query in arb_export_query()) {
+            let cloned = query.clone();
+            prop_assert_eq!(cloned, query);
+        }
+
+        /// CassContentExportQuery equality check.
+        #[test]
+        fn prop_content_export_query_eq(query in arb_content_export_query()) {
+            let cloned = query.clone();
+            prop_assert_eq!(cloned, query);
+        }
+
+        /// CassExportSessionRecord equality check.
+        #[test]
+        fn prop_export_session_record_eq(record in arb_export_session_record()) {
+            let cloned = record.clone();
+            prop_assert_eq!(cloned, record);
+        }
+
+        /// CassExportContentChunk equality check.
+        #[test]
+        fn prop_export_content_chunk_eq(chunk in arb_export_content_chunk()) {
+            let cloned = chunk.clone();
+            prop_assert_eq!(cloned, chunk);
+        }
+    }
+
+    #[test]
+    fn export_query_default_has_standard_limit() {
+        let query = CassExportQuery::default();
+        assert!(query.limit > 0, "default limit should be positive");
+        assert!(query.after_id.is_none());
+        assert!(query.pane_id.is_none());
+    }
+
+    #[test]
+    fn content_export_query_default_has_standard_limit() {
+        let query = CassContentExportQuery::default();
+        assert!(query.limit > 0, "default limit should be positive");
+        assert!(query.after_id.is_none());
+    }
+
+    #[test]
+    fn export_session_record_json_valid() {
+        let record = CassExportSessionRecord {
+            session_row_id: 1,
+            session_id: "test-session".to_string(),
+            agent_type: "codex".to_string(),
+            workspace: Some("/project".to_string()),
+            pane_ids: vec![0, 1],
+            started_at_ms: 1700000000000,
+            ended_at_ms: Some(1700000060000),
+            model_name: Some("gpt-5".to_string()),
+            content_tokens: 1500,
+            external_id: None,
+            external_meta: None,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.is_object());
+        assert_eq!(value["session_id"], "test-session");
+        assert_eq!(value["pane_ids"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn export_content_chunk_json_valid() {
+        let chunk = CassExportContentChunk {
+            session_row_id: 1,
+            session_id: "test-session".to_string(),
+            segment_id: 42,
+            pane_id: 0,
+            seq: 10,
+            timestamp_ms: 1700000000000,
+            content: "Some terminal output here".to_string(),
+            content_type: "output".to_string(),
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.is_object());
+        assert_eq!(value["content_type"], "output");
     }
 }
