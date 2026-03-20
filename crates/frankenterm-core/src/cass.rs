@@ -559,7 +559,7 @@ pub async fn export_sessions(
         .filter_map(|pane| pane.cwd.map(|cwd| (pane.pane_id, cwd)))
         .collect();
 
-    let sessions = storage
+    let mut sessions = storage
         .export_sessions(ExportQuery {
             pane_id: query.pane_id,
             since: query.since,
@@ -567,6 +567,7 @@ pub async fn export_sessions(
             limit: None,
         })
         .await?;
+    sessions.sort_unstable_by_key(|session| session.id);
 
     let mut exported = Vec::new();
     for session in sessions
@@ -1019,9 +1020,8 @@ fn estimate_text_tokens(content: &str) -> u64 {
         return 0;
     }
 
-    let whitespace_tokens = u64::try_from(trimmed.split_whitespace().count()).unwrap_or(u64::MAX);
-    if whitespace_tokens > 0 {
-        whitespace_tokens
+    if trimmed.chars().any(char::is_whitespace) {
+        u64::try_from(trimmed.split_whitespace().count()).unwrap_or(u64::MAX)
     } else {
         let chars = u64::try_from(trimmed.chars().count()).unwrap_or(u64::MAX);
         chars.saturating_add(3) / 4
@@ -1033,13 +1033,16 @@ async fn resolve_export_session(
     storage: &StorageHandle,
     session_id: &str,
 ) -> crate::Result<AgentSessionRecord> {
+    let requested_id = session_id.trim();
+
     if let Some(row_id) = parse_export_session_row_id(session_id) {
         if let Some(session) = storage.get_agent_session(row_id).await? {
-            return Ok(session);
+            if export_session_identifier(&session) == requested_id {
+                return Ok(session);
+            }
         }
     }
 
-    let requested_id = session_id.trim();
     let sessions = storage
         .export_sessions(ExportQuery {
             limit: None,
@@ -1732,6 +1735,7 @@ mod tests {
     #[test]
     fn estimate_text_tokens_uses_whitespace_and_char_fallback() {
         assert_eq!(estimate_text_tokens("alpha beta gamma"), 3);
+        assert_eq!(estimate_text_tokens("  alpha   beta  "), 2);
         assert_eq!(estimate_text_tokens(""), 0);
         assert_eq!(estimate_text_tokens("abcdef"), 2);
     }
