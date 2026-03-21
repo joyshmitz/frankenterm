@@ -890,6 +890,10 @@ mod tests {
     where
         F: Future<Output = ()>,
     {
+        #[cfg(feature = "asupersync-runtime")]
+        let _tokio_rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        #[cfg(feature = "asupersync-runtime")]
+        let _guard = _tokio_rt.enter();
         use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
 
         let runtime = RuntimeBuilder::current_thread()

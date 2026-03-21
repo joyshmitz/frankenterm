@@ -3638,6 +3638,10 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
+        #[cfg(feature = "asupersync-runtime")]
+        let _tokio_rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        #[cfg(feature = "asupersync-runtime")]
+        let _guard = _tokio_rt.enter();
         let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
             .build()
             .expect("failed to build runtime for runtime tests");

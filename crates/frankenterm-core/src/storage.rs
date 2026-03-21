@@ -19452,6 +19452,10 @@ fn run_async_test<F>(future: F)
 where
     F: std::future::Future<Output = ()>,
 {
+        #[cfg(feature = "asupersync-runtime")]
+        let _tokio_rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        #[cfg(feature = "asupersync-runtime")]
+        let _guard = _tokio_rt.enter();
     use crate::runtime_compat::CompatRuntime;
     let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
         .enable_all()
@@ -20977,6 +20981,10 @@ mod storage_handle_tests {
     where
         F: std::future::Future<Output = ()>,
     {
+        #[cfg(feature = "asupersync-runtime")]
+        let _tokio_rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        #[cfg(feature = "asupersync-runtime")]
+        let _guard = _tokio_rt.enter();
         use crate::runtime_compat::CompatRuntime;
         let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
             .enable_all()
@@ -22777,6 +22785,10 @@ mod queue_depth_tests {
     where
         F: std::future::Future<Output = ()>,
     {
+        #[cfg(feature = "asupersync-runtime")]
+        let _tokio_rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        #[cfg(feature = "asupersync-runtime")]
+        let _guard = _tokio_rt.enter();
         use crate::runtime_compat::CompatRuntime;
         let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
             .enable_all()
@@ -23036,6 +23048,10 @@ mod backpressure_integration_tests {
     where
         F: std::future::Future<Output = ()>,
     {
+        #[cfg(feature = "asupersync-runtime")]
+        let _tokio_rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        #[cfg(feature = "asupersync-runtime")]
+        let _guard = _tokio_rt.enter();
         use crate::runtime_compat::CompatRuntime;
         let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
             .enable_all()
@@ -26192,6 +26208,10 @@ mod timeline_integration_tests {
     where
         F: std::future::Future<Output = ()>,
     {
+        #[cfg(feature = "asupersync-runtime")]
+        let _tokio_rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        #[cfg(feature = "asupersync-runtime")]
+        let _guard = _tokio_rt.enter();
         use crate::runtime_compat::CompatRuntime;
         let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
             .enable_all()
