@@ -32,6 +32,9 @@
 
 use serde::{Deserialize, Serialize};
 
+const RAW_FRAME_TAG: u8 = 0;
+const ZSTD_FRAME_TAG: u8 = 1;
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -168,6 +171,10 @@ impl ByteCompressor {
     ///
     /// Returns the compressed bytes. For very small inputs (< 16 bytes),
     /// the output may be larger than the input due to framing overhead.
+    ///
+    /// The returned blob is self-describing: it stores either a zstd-compressed
+    /// frame or a tagged raw fallback if compression fails, so round-trips remain
+    /// lossless even when zstd rejects the dictionary or encoder setup.
     pub fn compress(&self, input: &[u8]) -> Vec<u8> {
         if input.is_empty() {
             return Vec::new();
@@ -180,7 +187,7 @@ impl ByteCompressor {
             let input_len: u32 = input.len().try_into().unwrap_or_else(|_| {
                 tracing::error!(
                     input_len = input.len(),
-                    "input exceeds u32::MAX for size prefix, truncating"
+                    "input exceeds u32::MAX for size prefix, storing saturated sentinel"
                 );
                 u32::MAX
             });
@@ -204,18 +211,30 @@ impl ByteCompressor {
             return Ok(Vec::new());
         }
 
-        let data = if self.config.include_size_prefix {
+        let (data, expected_size) = if self.config.include_size_prefix {
             if input.len() < 4 {
                 return Err(ByteCompressionError::InvalidInput(
                     "input too short for size prefix".to_string(),
                 ));
             }
-            &input[4..]
+            let expected_size =
+                u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
+            (&input[4..], Some(expected_size))
         } else {
-            input
+            (input, None)
         };
 
-        self.decompress_data(data)
+        let decompressed = self.decompress_data(data)?;
+        if let Some(expected_size) = expected_size {
+            let saturated_size = usize::try_from(u32::MAX).unwrap_or(usize::MAX);
+            if expected_size != saturated_size && decompressed.len() != expected_size {
+                return Err(ByteCompressionError::InvalidInput(format!(
+                    "size prefix mismatch: expected {expected_size} bytes, decoded {} bytes",
+                    decompressed.len()
+                )));
+            }
+        }
+        Ok(decompressed)
     }
 
     /// Compress multiple buffers into a single batched blob.
@@ -257,7 +276,7 @@ impl ByteCompressor {
 
         let count = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
         let mut offset = 4usize;
-        
+
         // Prevent pre-allocation OOM from corrupted or malicious inputs
         let max_possible_buffers = (input.len() - 4) / 4;
         let safe_capacity = count.min(max_possible_buffers);
@@ -321,21 +340,39 @@ impl ByteCompressor {
         let result = zstd::bulk::Compressor::with_dictionary(level, dict_bytes)
             .and_then(|mut c| c.compress(input));
         match result {
-            Ok(compressed) => compressed,
+            Ok(compressed) => Self::frame_payload(ZSTD_FRAME_TAG, compressed),
             Err(err) => {
                 tracing::warn!(
                     input_len = input.len(),
                     level,
                     error = %err,
-                    "zstd compression failed, returning uncompressed — decompression will fail"
+                    "zstd compression failed, storing raw fallback frame"
                 );
-                input.to_vec()
+                Self::frame_payload(RAW_FRAME_TAG, input.to_vec())
             }
         }
     }
 
-    /// Decompress data, using dictionary if available.
+    fn frame_payload(tag: u8, payload: Vec<u8>) -> Vec<u8> {
+        let mut framed = Vec::with_capacity(1 + payload.len());
+        framed.push(tag);
+        framed.extend_from_slice(&payload);
+        framed
+    }
+
+    /// Decompress data, accepting both framed payloads and legacy unframed zstd.
     fn decompress_data(&self, data: &[u8]) -> Result<Vec<u8>, ByteCompressionError> {
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+        match data[0] {
+            RAW_FRAME_TAG => Ok(data[1..].to_vec()),
+            ZSTD_FRAME_TAG => self.decompress_zstd(&data[1..]),
+            _ => self.decompress_zstd(data),
+        }
+    }
+
+    fn decompress_zstd(&self, data: &[u8]) -> Result<Vec<u8>, ByteCompressionError> {
         if data.is_empty() {
             return Ok(Vec::new());
         }
@@ -574,6 +611,38 @@ mod tests {
         assert_eq!(stored_size, input.len());
         let decompressed = compressor.decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn raw_fallback_frame_roundtrip() {
+        let compressor = ByteCompressor::default();
+        let input = b"fallback to raw frame when dictionary init fails\n".repeat(16);
+        let framed = ByteCompressor::frame_payload(RAW_FRAME_TAG, input.clone());
+        let decompressed = compressor.decompress(&framed).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn decompress_accepts_legacy_unframed_zstd_payloads() {
+        let compressor = ByteCompressor::default();
+        let input = b"legacy zstd payload support\n".repeat(32);
+        let legacy = zstd::bulk::compress(&input, CompressionLevel::Default.zstd_level()).unwrap();
+        let decompressed = compressor.decompress(&legacy).unwrap();
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn size_prefix_mismatch_is_rejected() {
+        let config = ByteCompressionConfig {
+            include_size_prefix: true,
+            ..Default::default()
+        };
+        let compressor = ByteCompressor::with_config(config);
+        let input = b"size prefix integrity\n".repeat(12);
+        let mut compressed = compressor.compress(&input);
+        compressed[..4].copy_from_slice(&1u32.to_le_bytes());
+        let error = compressor.decompress(&compressed).unwrap_err();
+        assert!(matches!(error, ByteCompressionError::InvalidInput(_)));
     }
 
     // -- Batch operations --

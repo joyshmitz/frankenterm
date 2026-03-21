@@ -638,18 +638,38 @@ pub mod task {
     pub struct JoinHandle<T> {
         inner: Pin<Box<asupersync::runtime::JoinHandle<T>>>,
         aborted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        abort_waker: std::sync::Arc<std::sync::Mutex<Option<std::task::Waker>>>,
     }
 
     impl<T> Future for JoinHandle<T> {
         type Output = Result<T, JoinError>;
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            // Check the abort flag before polling the inner future.
+            {
+                let mut stored = self.abort_waker.lock().expect("abort waker mutex poisoned");
+                let should_replace = stored
+                    .as_ref()
+                    .is_none_or(|waker| !waker.will_wake(cx.waker()));
+                if should_replace {
+                    *stored = Some(cx.waker().clone());
+                }
+            }
+
             if self.aborted.load(std::sync::atomic::Ordering::Acquire) {
+                self.abort_waker
+                    .lock()
+                    .expect("abort waker mutex poisoned")
+                    .take();
                 return Poll::Ready(Err(JoinError::new("task aborted")));
             }
             match self.inner.as_mut().poll(cx) {
-                Poll::Ready(value) => Poll::Ready(Ok(value)),
+                Poll::Ready(value) => {
+                    self.abort_waker
+                        .lock()
+                        .expect("abort waker mutex poisoned")
+                        .take();
+                    Poll::Ready(Ok(value))
+                }
                 Poll::Pending => Poll::Pending,
             }
         }
@@ -671,6 +691,14 @@ pub mod task {
         pub fn abort(&self) {
             self.aborted
                 .store(true, std::sync::atomic::Ordering::Release);
+            if let Some(waker) = self
+                .abort_waker
+                .lock()
+                .expect("abort waker mutex poisoned")
+                .take()
+            {
+                waker.wake();
+            }
         }
     }
 
@@ -810,6 +838,7 @@ pub mod task {
         JoinHandle {
             inner: Box::pin(inner),
             aborted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            abort_waker: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -1678,7 +1707,10 @@ mod tests {
         F: std::future::Future<Output = ()>,
     {
         #[cfg(feature = "asupersync-runtime")]
-        let _tokio_rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         #[cfg(feature = "asupersync-runtime")]
         let _guard = _tokio_rt.enter();
         let runtime = RuntimeBuilder::current_thread()
@@ -3756,6 +3788,53 @@ mod tests {
                 Ok(val) => assert_eq!(val, "done"),
                 Err(_) => { /* cancelled — expected */ }
             }
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn task_abort_wakes_pending_waiter() {
+        use futures::task::{ArcWake, waker_ref};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingWaker {
+            wake_count: AtomicUsize,
+        }
+
+        impl ArcWake for CountingWaker {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                arc_self.wake_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let handle = task::spawn(std::future::poll_fn(|_| std::task::Poll::<()>::Pending));
+            let wake_counter = Arc::new(CountingWaker {
+                wake_count: AtomicUsize::new(0),
+            });
+            let waker = waker_ref(&wake_counter);
+            let mut cx = std::task::Context::from_waker(&waker);
+            let mut pinned = std::pin::pin!(handle);
+
+            assert!(matches!(
+                pinned.as_mut().poll(&mut cx),
+                std::task::Poll::Pending
+            ));
+
+            pinned.as_ref().get_ref().abort();
+
+            assert!(
+                wake_counter.wake_count.load(Ordering::SeqCst) >= 1,
+                "abort() should wake the current waiter"
+            );
+
+            let result = pinned.as_mut().poll(&mut cx);
+            assert!(matches!(
+                result,
+                std::task::Poll::Ready(Err(ref err)) if err.is_cancelled()
+            ));
         });
     }
 

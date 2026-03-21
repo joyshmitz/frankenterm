@@ -223,6 +223,11 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 _ => TxOutcome::Pending,
             };
             decision_path.push_str("->prepare_not_eligible");
+            if final_state == MissionTxState::Failed {
+                ledger
+                    .transition_phase(TxPhase::Aborted)
+                    .map_err(|err| TxExecutionError::PhaseTransition(err.to_string()))?;
+            }
 
             return Ok(TxExecutionResult {
                 final_state,
@@ -268,7 +273,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             &mut ledger,
             &mut events,
             now_ms,
-        );
+        )?;
 
         // Phase 3: Compensate (if needed)
         let compensation_report = if commit_report.has_failures() && self.config.auto_compensate {
@@ -296,7 +301,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 &mut ledger,
                 &mut events,
                 now_ms,
-            );
+            )?;
 
             Some(comp)
         } else {
@@ -321,13 +326,11 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             } else {
                 TxPhase::Aborted
             };
-            if let Err(err) = ledger.transition_phase(terminal_phase) {
-                tracing::warn!(
-                    phase = ?terminal_phase,
-                    error = %err,
-                    "failed to transition ledger to terminal phase"
-                );
-            }
+            ledger.transition_phase(terminal_phase).map_err(|err| {
+                TxExecutionError::LedgerWrite(format!(
+                    "failed to transition ledger to terminal phase {terminal_phase:?}: {err}"
+                ))
+            })?;
         }
 
         // Emit completion event
@@ -590,7 +593,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         ledger: &mut TxExecutionLedger,
         events: &mut Vec<TxObservabilityEvent>,
         now_ms: i64,
-    ) {
+    ) -> Result<(), TxExecutionError> {
         for step_result in &commit_report.step_results {
             let idem_key =
                 IdempotencyKey::new(&contract.plan.plan_id.0, &step_result.step_id.0, "commit");
@@ -615,19 +618,20 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 },
             };
 
-            if let Err(err) = ledger.append(
-                idem_key,
-                outcome,
-                crate::tx_plan_compiler::StepRisk::Low,
-                &format!("agent-{}", step_result.step_id.0),
-                now_ms as u64,
-            ) {
-                tracing::warn!(
-                    step_id = %step_result.step_id.0,
-                    error = %err,
-                    "failed to record commit step result in idempotency ledger"
-                );
-            }
+            ledger
+                .append(
+                    idem_key,
+                    outcome,
+                    crate::tx_plan_compiler::StepRisk::Low,
+                    &format!("agent-{}", step_result.step_id.0),
+                    now_ms as u64,
+                )
+                .map_err(|err| {
+                    TxExecutionError::LedgerWrite(format!(
+                        "failed to record commit step {} in idempotency ledger: {err}",
+                        step_result.step_id.0
+                    ))
+                })?;
 
             let event_kind = if step_result.outcome.is_committed() {
                 TxEventKind::StepCommitted
@@ -652,6 +656,8 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 now_ms,
             ));
         }
+
+        Ok(())
     }
 
     fn record_compensation_results_to_ledger(
@@ -662,7 +668,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         ledger: &mut TxExecutionLedger,
         events: &mut Vec<TxObservabilityEvent>,
         now_ms: i64,
-    ) {
+    ) -> Result<(), TxExecutionError> {
         for receipt in &comp_report.receipts {
             if let Some(step_id) = receipt.get("step_id").and_then(|v| v.as_str()) {
                 let idem_key =
@@ -693,19 +699,19 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     }
                 };
 
-                if let Err(err) = ledger.append(
+                ledger
+                    .append(
                     idem_key,
                     outcome,
                     crate::tx_plan_compiler::StepRisk::Low,
                     &format!("agent-{step_id}"),
                     now_ms as u64,
-                ) {
-                    tracing::warn!(
-                        step_id = %step_id,
-                        error = %err,
-                        "failed to record compensation step result in idempotency ledger"
-                    );
-                }
+                )
+                    .map_err(|err| {
+                        TxExecutionError::LedgerWrite(format!(
+                            "failed to record compensation step {step_id} in idempotency ledger: {err}"
+                        ))
+                    })?;
 
                 events.push(self.make_event(
                     TxEventKind::StepCompensated,
@@ -718,6 +724,8 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 ));
             }
         }
+
+        Ok(())
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -889,6 +897,8 @@ pub enum TxExecutionError {
     CommitPhase(String),
     /// Compensation phase error.
     CompensationPhase(String),
+    /// Idempotency ledger write or terminalization failed.
+    LedgerWrite(String),
     /// Ledger not found for resume.
     LedgerNotFound(String),
     /// Resume would replay already executed work without a checkpoint-aware executor.
@@ -906,6 +916,7 @@ impl std::fmt::Display for TxExecutionError {
             Self::PreparePhase(msg) => write!(f, "Prepare phase error: {msg}"),
             Self::CommitPhase(msg) => write!(f, "Commit phase error: {msg}"),
             Self::CompensationPhase(msg) => write!(f, "Compensation phase error: {msg}"),
+            Self::LedgerWrite(msg) => write!(f, "Ledger write error: {msg}"),
             Self::LedgerNotFound(id) => write!(f, "Ledger not found: {id}"),
             Self::UnsafeResume {
                 execution_id,
@@ -1157,6 +1168,114 @@ mod tests {
     }
 
     #[test]
+    fn record_commit_results_to_ledger_fails_closed_when_ledger_is_sealed() {
+        let contract = make_test_contract(1);
+        let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        let mut ledger = TxExecutionLedger::new("exec-1", &contract.plan.plan_id.0, 0);
+        ledger
+            .transition_phase(crate::tx_idempotency::TxPhase::Preparing)
+            .unwrap();
+        ledger
+            .transition_phase(crate::tx_idempotency::TxPhase::Committing)
+            .unwrap();
+        ledger
+            .transition_phase(crate::tx_idempotency::TxPhase::Completed)
+            .unwrap();
+
+        let commit_report = TxCommitReport {
+            tx_id: contract.intent.tx_id.clone(),
+            plan_id: contract.plan.plan_id.clone(),
+            outcome: TxCommitOutcome::FullyCommitted,
+            step_results: vec![crate::plan::TxCommitStepResult {
+                step_id: contract.plan.steps[0].step_id.clone(),
+                ordinal: contract.plan.steps[0].ordinal,
+                outcome: crate::plan::TxCommitStepOutcome::Committed {
+                    reason_code: "ok".to_string(),
+                },
+                decision_path: "test".to_string(),
+                completed_at_ms: 1000,
+            }],
+            failure_boundary: None,
+            committed_count: 1,
+            failed_count: 0,
+            skipped_count: 0,
+            decision_path: "test".to_string(),
+            reason_code: "ok".to_string(),
+            error_code: None,
+            completed_at_ms: 1000,
+            receipts: Vec::new(),
+        };
+        let mut events = Vec::new();
+
+        let err = engine
+            .record_commit_results_to_ledger(
+                &contract,
+                &commit_report,
+                "exec-1",
+                &mut ledger,
+                &mut events,
+                1000,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, TxExecutionError::LedgerWrite(_)));
+        assert!(err.to_string().contains("step-0"));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn record_compensation_results_to_ledger_fails_closed_when_ledger_is_sealed() {
+        let contract = make_test_contract(1);
+        let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        let mut ledger = TxExecutionLedger::new("exec-1", &contract.plan.plan_id.0, 0);
+        ledger
+            .transition_phase(crate::tx_idempotency::TxPhase::Preparing)
+            .unwrap();
+        ledger
+            .transition_phase(crate::tx_idempotency::TxPhase::Committing)
+            .unwrap();
+        ledger
+            .transition_phase(crate::tx_idempotency::TxPhase::Compensating)
+            .unwrap();
+        ledger
+            .transition_phase(crate::tx_idempotency::TxPhase::Completed)
+            .unwrap();
+
+        let comp_report = crate::plan::TxCompensationReport {
+            outcome: crate::plan::TxCompensationOutcome::FullyRolledBack,
+            compensated_count: 1,
+            failed_count: 0,
+            no_compensation_count: 0,
+            skipped_count: 0,
+            step_results: Vec::new(),
+            decision_path: "test".to_string(),
+            reason_code: "rollback_complete".to_string(),
+            error_code: None,
+            completed_at_ms: 1000,
+            receipts: vec![serde_json::json!({
+                "step_id": contract.plan.steps[0].step_id.0,
+                "outcome": "compensated"
+            })],
+        };
+        let mut events = Vec::new();
+
+        let err = engine
+            .record_compensation_results_to_ledger(
+                &contract,
+                &comp_report,
+                "exec-1",
+                &mut ledger,
+                &mut events,
+                1000,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, TxExecutionError::LedgerWrite(_)));
+        assert!(err.to_string().contains("step-0"));
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn decision_path_traces_execution() {
         let mut contract = make_test_contract(2);
         let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
@@ -1206,6 +1325,7 @@ mod tests {
             TxExecutionError::PreparePhase("failed".to_string()),
             TxExecutionError::CommitPhase("failed".to_string()),
             TxExecutionError::CompensationPhase("failed".to_string()),
+            TxExecutionError::LedgerWrite("ledger sealed".to_string()),
             TxExecutionError::LedgerNotFound("id-1".to_string()),
         ];
         for err in &errors {
@@ -1264,6 +1384,7 @@ mod tests {
         assert_eq!(result.prepare_report.outcome, TxPrepareOutcome::Denied);
         assert!(result.commit_report.is_none());
         assert_eq!(result.final_state, MissionTxState::Failed);
+        assert_eq!(result.ledger.phase(), TxPhase::Aborted);
     }
 
     #[test]

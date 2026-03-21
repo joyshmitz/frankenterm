@@ -7,7 +7,8 @@
 //! Feature-gated behind `session-resume`.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -90,6 +91,8 @@ fn default_casr_binary() -> String {
 fn default_timeout_secs() -> u64 {
     30
 }
+
+const CASR_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 impl Default for SessionResumeConfig {
     fn default() -> Self {
@@ -279,10 +282,7 @@ impl SessionResumer {
 
     /// Check if `casr` is available on PATH.
     pub fn is_casr_available(&self) -> bool {
-        Command::new(&self.config.casr_binary)
-            .arg("--version")
-            .output()
-            .is_ok()
+        self.run_casr_with_options(&["--version"], false).is_ok()
     }
 
     /// Export recorder data as a CASR-compatible session.
@@ -324,27 +324,199 @@ impl SessionResumer {
 
     /// Run a casr subprocess and return stdout on success.
     fn run_casr(&self, args: &[&str]) -> Result<String, SessionResumeError> {
-        let mut cmd = Command::new(&self.config.casr_binary);
-        cmd.args(args);
-
-        if let Some(ref dir) = self.config.working_dir {
-            cmd.current_dir(dir);
-        }
-
-        let output = cmd.output().map_err(|e| {
-            SessionResumeError::CasrNotFound(format!("{}: {}", self.config.casr_binary, e))
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(SessionResumeError::SubprocessFailed {
-                code: output.status.code(),
-                stderr,
-            });
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        self.run_casr_with_options(args, true)
     }
+
+    fn run_casr_with_options(
+        &self,
+        args: &[&str],
+        apply_working_dir: bool,
+    ) -> Result<String, SessionResumeError> {
+        let mut cmd = Command::new(&self.config.casr_binary);
+        cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        if apply_working_dir {
+            if let Some(ref dir) = self.config.working_dir {
+                if !dir.is_dir() {
+                    return Err(SessionResumeError::SubprocessFailed {
+                        code: None,
+                        stderr: format!(
+                            "working directory is unavailable or not a directory: {}",
+                            dir.display()
+                        ),
+                    });
+                }
+                cmd.current_dir(dir);
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
+        let mut child = cmd.spawn().map_err(|e| self.map_spawn_error(e))?;
+        let timeout = Duration::from_secs(self.config.timeout_secs);
+        let started = Instant::now();
+
+        let mut stdout_stream =
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| SessionResumeError::SubprocessFailed {
+                    code: None,
+                    stderr: "casr stdout pipe was unavailable".to_string(),
+                })?;
+        let mut stderr_stream =
+            child
+                .stderr
+                .take()
+                .ok_or_else(|| SessionResumeError::SubprocessFailed {
+                    code: None,
+                    stderr: "casr stderr pipe was unavailable".to_string(),
+                })?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx_err = tx.clone();
+
+        let stdout_handle = std::thread::spawn(move || {
+            use std::io::Read;
+
+            let mut buf = Vec::new();
+            let _ = stdout_stream.read_to_end(&mut buf);
+            let _ = tx.send((true, buf));
+        });
+
+        let stderr_handle = std::thread::spawn(move || {
+            use std::io::Read;
+
+            let mut buf = Vec::new();
+            let _ = stderr_stream.read_to_end(&mut buf);
+            let _ = tx_err.send((false, buf));
+        });
+
+        let mut stdout_data = Vec::new();
+        let mut stderr_data = Vec::new();
+        let mut pipes_closed = 0usize;
+
+        loop {
+            if started.elapsed() >= timeout {
+                kill_casr_process_tree(&mut child);
+                let _ = child.wait();
+                let _ = collect_casr_pipe_output(
+                    &rx,
+                    &mut stdout_data,
+                    &mut stderr_data,
+                    &mut pipes_closed,
+                    Duration::from_millis(100),
+                );
+                let _ = stdout_handle.join();
+                let _ = stderr_handle.join();
+                return Err(SessionResumeError::Timeout);
+            }
+
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    collect_casr_pipe_output(
+                        &rx,
+                        &mut stdout_data,
+                        &mut stderr_data,
+                        &mut pipes_closed,
+                        timeout.saturating_sub(started.elapsed()),
+                    )?;
+                    let _ = stdout_handle.join();
+                    let _ = stderr_handle.join();
+
+                    if !status.success() {
+                        let stderr = String::from_utf8_lossy(&stderr_data).to_string();
+                        return Err(SessionResumeError::SubprocessFailed {
+                            code: status.code(),
+                            stderr,
+                        });
+                    }
+
+                    return Ok(String::from_utf8_lossy(&stdout_data).to_string());
+                }
+                Ok(None) => {
+                    std::thread::sleep(CASR_POLL_INTERVAL);
+                }
+                Err(e) => {
+                    kill_casr_process_tree(&mut child);
+                    let _ = child.wait();
+                    let _ = stdout_handle.join();
+                    let _ = stderr_handle.join();
+                    return Err(SessionResumeError::SubprocessFailed {
+                        code: None,
+                        stderr: e.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn map_spawn_error(&self, err: std::io::Error) -> SessionResumeError {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return SessionResumeError::CasrNotFound(format!(
+                "{}: {}",
+                self.config.casr_binary, err
+            ));
+        }
+
+        SessionResumeError::SubprocessFailed {
+            code: None,
+            stderr: err.to_string(),
+        }
+    }
+}
+
+fn collect_casr_pipe_output(
+    rx: &std::sync::mpsc::Receiver<(bool, Vec<u8>)>,
+    stdout_data: &mut Vec<u8>,
+    stderr_data: &mut Vec<u8>,
+    pipes_closed: &mut usize,
+    timeout: Duration,
+) -> Result<(), SessionResumeError> {
+    let deadline = Instant::now() + timeout;
+
+    while *pipes_closed < 2 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SessionResumeError::Timeout);
+        }
+
+        match rx.recv_timeout(remaining) {
+            Ok((is_stdout, data)) => {
+                if is_stdout {
+                    *stdout_data = data;
+                } else {
+                    *stderr_data = data;
+                }
+                *pipes_closed += 1;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(SessionResumeError::Timeout);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                *pipes_closed = 2;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn kill_casr_process_tree(child: &mut std::process::Child) {
+    let _ = Command::new("kill")
+        .arg("-9")
+        .arg(format!("-{}", child.id()))
+        .status();
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn kill_casr_process_tree(child: &mut std::process::Child) {
+    let _ = child.kill();
 }
 
 /// Fail-open: if casr is unavailable, return empty results instead of errors.
@@ -513,10 +685,10 @@ mod tests {
         });
         let result = r.discover_sessions();
         assert!(result.is_err());
-        match result.unwrap_err() {
-            SessionResumeError::CasrNotFound(_) => {}
-            other => panic!("expected CasrNotFound, got: {}", other),
-        }
+        assert!(matches!(
+            result.unwrap_err(),
+            SessionResumeError::CasrNotFound(_)
+        ));
     }
 
     #[test]
@@ -816,5 +988,66 @@ mod tests {
         });
         let result = r.discover_sessions_for_provider(&AgentProvider::Codex);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn is_casr_available_ignores_invalid_working_dir() {
+        let r = SessionResumer::new(SessionResumeConfig {
+            casr_binary: "rustc".into(),
+            working_dir: Some(PathBuf::from("/definitely/nonexistent/casr-working-dir")),
+            ..Default::default()
+        });
+
+        assert!(r.is_casr_available());
+    }
+
+    #[test]
+    fn discover_sessions_invalid_working_dir_is_not_not_found() {
+        let r = SessionResumer::new(SessionResumeConfig {
+            casr_binary: "rustc".into(),
+            working_dir: Some(PathBuf::from("/definitely/nonexistent/casr-working-dir")),
+            ..Default::default()
+        });
+
+        let err = r.discover_sessions().unwrap_err();
+        assert!(matches!(
+            err,
+            SessionResumeError::SubprocessFailed { code: None, .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_casr_enforces_configured_timeout() {
+        let r = SessionResumer::new(SessionResumeConfig {
+            casr_binary: "sh".into(),
+            timeout_secs: 1,
+            ..Default::default()
+        });
+
+        let started = Instant::now();
+        let err = r.run_casr(&["-c", "sleep 5"]).unwrap_err();
+
+        assert_eq!(err, SessionResumeError::Timeout);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "timeout should abort well before the child finishes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_casr_drains_large_stdout_without_deadlock() {
+        let r = SessionResumer::new(SessionResumeConfig {
+            casr_binary: "sh".into(),
+            timeout_secs: 5,
+            ..Default::default()
+        });
+
+        let output = r
+            .run_casr(&["-c", "yes x | head -c 131072"])
+            .expect("large stdout should not deadlock the CASR runner");
+
+        assert_eq!(output.len(), 131072);
     }
 }
