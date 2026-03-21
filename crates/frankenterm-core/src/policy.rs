@@ -2223,6 +2223,7 @@ const COMMAND_TOKENS: &[&str] = &[
     "eval",
     "exec",
     "env",
+    "coproc",
     "xargs",
     "busybox",
     "openssl",
@@ -2333,6 +2334,10 @@ pub fn is_command_candidate(text: &str) -> bool {
             trimmed = stripped.trim_start();
         }
 
+        if let Some(stripped) = trimmed.strip_prefix('!') {
+            trimmed = stripped.trim_start();
+        }
+
         // Also strip leading parens (subshells) and braces (blocks)
         loop {
             if let Some(stripped) = trimmed.strip_prefix('(') {
@@ -2355,6 +2360,7 @@ pub fn is_command_candidate(text: &str) -> bool {
             || trimmed.contains('>')
             || trimmed.contains(';')
             || trimmed.contains("$(")
+            || trimmed.contains("<(")
             || trimmed.contains('`')
         {
             return true;
@@ -2417,6 +2423,10 @@ fn has_trauma_bypass_prefix(text: &str) -> bool {
         }
 
         if let Some(stripped) = trimmed.strip_prefix('$') {
+            trimmed = stripped.trim_start();
+        }
+
+        if let Some(stripped) = trimmed.strip_prefix('!') {
             trimmed = stripped.trim_start();
         }
 
@@ -2495,8 +2505,7 @@ where
     let mut current_logical_line = String::new();
 
     for line in text.lines() {
-        let trimmed = line.trim_end();
-        if let Some(stripped) = trimmed.strip_suffix('\\') {
+        if let Some(stripped) = line.strip_suffix('\\') {
             current_logical_line.push_str(stripped);
             current_logical_line.push(' ');
         } else {

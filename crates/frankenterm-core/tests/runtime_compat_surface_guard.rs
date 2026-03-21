@@ -163,8 +163,11 @@ fn web_and_cli_async_surfaces_route_through_runtime_compat() {
     let runtime_compat =
         fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/runtime_compat.rs"))
             .expect("failed to read runtime_compat.rs");
-    let web = fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/web.rs"))
-        .expect("failed to read web.rs");
+    let web_server =
+        fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/web/server.rs"))
+            .expect("failed to read web/server.rs");
+    let web_sse = fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/web/sse.rs"))
+        .expect("failed to read web/sse.rs");
     let main = fs::read_to_string(workspace_root.join("crates/frankenterm/src/main.rs"))
         .expect("failed to read main.rs");
 
@@ -197,12 +200,20 @@ fn web_and_cli_async_surfaces_route_through_runtime_compat() {
         "runtime_compat.rs must continue to expose a paused-test runtime builder bridge while this migration contract is active"
     );
     assert!(
-        web.contains("use crate::runtime_compat::{mpsc, select, signal, sleep, task, timeout};"),
-        "web.rs must import runtime_compat bridges for async runtime operations"
+        web_server.contains("use crate::runtime_compat::{select, signal};"),
+        "web/server.rs must import runtime_compat bridges for server lifecycle operations"
     );
     assert!(
-        !web.contains("tokio::select!") && !web.contains("tokio::signal::"),
-        "web.rs must not bypass runtime_compat for select/signal operations"
+        web_sse.contains("use crate::runtime_compat::{mpsc, select, sleep, task, timeout};"),
+        "web/sse.rs must import runtime_compat bridges for stream runtime operations"
+    );
+    assert!(
+        !web_server.contains("tokio::select!") && !web_server.contains("tokio::signal::"),
+        "web/server.rs must not bypass runtime_compat for select/signal operations"
+    );
+    assert!(
+        !web_sse.contains("tokio::select!") && !web_sse.contains("tokio::signal::"),
+        "web/sse.rs must not bypass runtime_compat for select/signal operations"
     );
     assert!(
         main.contains("frankenterm_core::runtime_compat::select!"),

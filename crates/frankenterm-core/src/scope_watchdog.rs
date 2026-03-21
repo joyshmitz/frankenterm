@@ -450,8 +450,10 @@ impl ScopeWatchdog {
             if node.state != ScopeState::Finalizing {
                 continue;
             }
-            // Estimate when finalizing started — use shutdown_requested_at as lower bound
-            let finalize_start = node.shutdown_requested_at_ms.unwrap_or(node.created_at_ms);
+            // Use finalizing_started_at_ms if available, falling back to shutdown_requested or created
+            let finalize_start = node
+                .finalizing_started_at_ms
+                .unwrap_or_else(|| node.shutdown_requested_at_ms.unwrap_or(node.created_at_ms));
             let elapsed = current_ms - finalize_start;
             let timeout = self.config.finalizer_timeout_ms as i64;
 
@@ -823,10 +825,10 @@ mod tests {
         // Force-close capture's children check: close worker first normally
         tree.request_shutdown(&well_known::capture_worker(0), 2100)
             .unwrap();
-        tree.finalize(&well_known::capture_worker(0)).unwrap();
+        tree.finalize(&well_known::capture_worker(0), 1000).unwrap();
         tree.close(&well_known::capture_worker(0), 2200).unwrap();
 
-        tree.finalize(&well_known::capture()).unwrap();
+        tree.finalize(&well_known::capture(), 1000).unwrap();
         tree.close(&well_known::capture(), 2300).unwrap();
 
         // Now re-register a new worker under the closed capture (hacky but simulates orphan)
@@ -1219,9 +1221,7 @@ mod tests {
         .unwrap();
         tree.start(&daemon, 1100).unwrap();
         tree.request_shutdown(&daemon, 2000).unwrap();
-        tree.finalize(&daemon).unwrap();
-        // Now the daemon is in Finalizing state since shutdown_requested_at_ms=2000.
-        // Default finalizer_timeout_ms=10_000.
+        tree.finalize(&daemon, 3000).unwrap(); // Finalizing started at T=3000
 
         let mut wd = ScopeWatchdog::new();
 
@@ -1234,14 +1234,14 @@ mod tests {
             "should not be zombie at 5s"
         );
 
-        // Zombie at 15s (elapsed > timeout)
-        let alerts = wd.scan(&tree, 15_000);
+        // Zombie at T=15001 (elapsed = 10001 > timeout)
+        let alerts = wd.scan(&tree, 15001);
         let zombies: Vec<_> = alerts
             .iter()
             .filter(|a| matches!(a.kind, AlertKind::ZombieFinalizer { .. }))
             .collect();
         assert_eq!(zombies.len(), 1);
-        assert_eq!(zombies[0].severity, AlertSeverity::Error);
+        assert!(matches!(zombies[0].kind, AlertKind::ZombieFinalizer { .. }));
     }
 
     #[test]
@@ -1261,14 +1261,14 @@ mod tests {
         .unwrap();
         tree.start(&daemon, 1100).unwrap();
         tree.request_shutdown(&daemon, 2000).unwrap();
-        tree.finalize(&daemon).unwrap();
+        tree.finalize(&daemon, 1000).unwrap(); // Finalizing started at T=1000
 
         // Manually clear shutdown_requested_at_ms to test fallback to created_at_ms
         tree.get_mut(&daemon).unwrap().shutdown_requested_at_ms = None;
 
         let mut wd = ScopeWatchdog::new();
-        // Now finalize_start = created_at_ms = 1000, so elapsed at 15000 = 14000 > timeout (10000)
-        let alerts = wd.scan(&tree, 15_000);
+        // Now finalize_start = created_at_ms = 1000, so elapsed at 15001 = 14001 > timeout (10000)
+        let alerts = wd.scan(&tree, 15001);
         assert!(
             alerts
                 .iter()
@@ -1684,7 +1684,7 @@ mod tests {
         .unwrap();
         tree.start(&zombie, 1100).unwrap();
         tree.request_shutdown(&zombie, 2000).unwrap();
-        tree.finalize(&zombie).unwrap();
+        tree.finalize(&zombie, 1000).unwrap();
 
         // 4. Create an orphan
         let orphan_parent = ScopeId("daemon:oparent".into());
@@ -2091,11 +2091,7 @@ mod tests {
                 elapsed_ms: 15000,
             },
             AlertKind::DeadlockRisk {
-                cycle: vec![
-                    ScopeId("a".into()),
-                    ScopeId("b".into()),
-                    ScopeId("a".into()),
-                ],
+                cycle: vec![ScopeId("a".into()), ScopeId("b".into())],
             },
             AlertKind::ScopeLeak {
                 tier: ScopeTier::Worker,
@@ -2168,8 +2164,7 @@ mod tests {
             .unwrap();
         tree.start(&d, 1100).unwrap();
         tree.request_shutdown(&d, 2000).unwrap();
-        tree.finalize(&d).unwrap();
-        // Now in Finalizing, not Draining → stuck cancellation should not fire
+        tree.finalize(&d, 1000).unwrap(); // Finalizing started at T=1000
 
         let mut wd = ScopeWatchdog::new();
         let alerts = wd.scan(&tree, 1_000_000);

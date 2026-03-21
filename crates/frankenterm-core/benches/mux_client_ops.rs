@@ -15,11 +15,9 @@ use codec::{
     UnitResponse, WriteToPane,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::runtime_compat::unix::{
-    AsyncReadExt as CompatAsyncReadExt, AsyncWriteExt as CompatAsyncWriteExt,
-};
+use frankenterm_core::runtime_compat::unix::AsyncWriteExt as CompatAsyncWriteExt;
 use frankenterm_core::runtime_compat::{
-    CompatRuntime, Mutex as CompatMutex, Runtime, RuntimeBuilder, task, timeout, unix,
+    CompatRuntime, Mutex as CompatMutex, Runtime, RuntimeBuilder, io, task, timeout, unix,
 };
 use frankenterm_core::vendored::{
     DirectMuxClient, DirectMuxClientConfig, SubscriptionConfig, subscribe_pane_output,
@@ -169,7 +167,7 @@ async fn spawn_mock_mux_server(
                 let mut seqno = 0_usize;
                 loop {
                     let mut temp = vec![0_u8; 4096];
-                    let read = match stream.read(&mut temp).await {
+                    let read = match io::read(&mut stream, &mut temp).await {
                         Ok(0) => break,
                         Ok(n) => n,
                         Err(_) => break,

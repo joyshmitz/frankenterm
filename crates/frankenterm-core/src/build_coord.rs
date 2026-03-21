@@ -555,9 +555,7 @@ fn cargo_subcommand_after_global_prefixes(
             return Some(subcommand);
         }
 
-        let Some(arg_count) = cargo_global_prefix_arg_count(token) else {
-            return None;
-        };
+        let arg_count = cargo_global_prefix_arg_count(token)?;
 
         idx += 1;
         for _ in 0..arg_count {
@@ -710,32 +708,35 @@ fn is_shell_command_separator(token: &str) -> bool {
     matches!(token, "&&" | "||" | ";" | "|" | "&")
 }
 
-fn shell_command_payload<'a>(tokens: &'a [String], idx: usize) -> Option<&'a str> {
-    let shell = tokens.get(idx).map(String::as_str)?;
-    if !is_shell_binary(shell) {
-        return None;
-    }
-
-    let mut arg_idx = idx + 1;
-    while let Some(token) = tokens.get(arg_idx).map(String::as_str) {
-        if let Some(command) = shell_inline_command(token) {
-            return Some(command);
-        }
-        if token == "--" {
+/// Try to guess the actual executed payload from a shell invocation
+fn shell_command_payload(tokens: &[String], idx: usize) -> Option<&str> {
+    if idx + 2 < tokens.len() {
+        let shell = tokens.get(idx).map(String::as_str)?;
+        if !is_shell_binary(shell) {
             return None;
         }
-        if shell_flag_invokes_command(token) {
-            return tokens.get(arg_idx + 1).map(String::as_str);
+
+        let mut arg_idx = idx + 1;
+        while let Some(token) = tokens.get(arg_idx).map(String::as_str) {
+            if let Some(command) = shell_inline_command(token) {
+                return Some(command);
+            }
+            if token == "--" {
+                return None;
+            }
+            if shell_flag_invokes_command(token) {
+                return tokens.get(arg_idx + 1).map(String::as_str);
+            }
+            if shell_flag_takes_argument(token) {
+                arg_idx = skip_shell_flag_argument(tokens, arg_idx + 1);
+                continue;
+            }
+            if is_shell_option(token) {
+                arg_idx += 1;
+                continue;
+            }
+            return None;
         }
-        if shell_flag_takes_argument(token) {
-            arg_idx = skip_shell_flag_argument(tokens, arg_idx + 1);
-            continue;
-        }
-        if is_shell_option(token) {
-            arg_idx += 1;
-            continue;
-        }
-        return None;
     }
 
     None
@@ -1309,7 +1310,7 @@ mod tests {
             "bash -o pipefail -lc 'cargo check --workspace'"
         ));
         assert!(is_heavy_cargo_command(
-            "/bin/zsh -lc 'TMPDIR=/tmp rch exec -- cargo clippy --workspace'"
+            "cd /tmp && /bin/zsh -lc 'cargo check --workspace'"
         ));
         assert!(!is_heavy_cargo_command("bash -lc 'cargo fmt --check'"));
     }

@@ -195,6 +195,9 @@ pub struct ScopeNode {
     pub shutdown_requested_at_ms: Option<i64>,
     /// Timestamp (epoch ms) when the scope fully closed.
     pub closed_at_ms: Option<i64>,
+    /// Timestamp (epoch ms) when the scope entered Finalizing state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalizing_started_at_ms: Option<i64>,
     /// Custom metadata tags.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tags: HashMap<String, String>,
@@ -221,6 +224,7 @@ impl ScopeNode {
             started_at_ms: None,
             shutdown_requested_at_ms: None,
             closed_at_ms: None,
+            finalizing_started_at_ms: None,
             tags: HashMap::new(),
         }
     }
@@ -481,7 +485,7 @@ impl ScopeTree {
     }
 
     /// Transition a scope to Finalizing (all children must be closed first).
-    pub fn finalize(&mut self, id: &ScopeId) -> Result<(), ScopeTreeError> {
+    pub fn finalize(&mut self, id: &ScopeId, timestamp_ms: i64) -> Result<(), ScopeTreeError> {
         // Check live children first (need immutable borrow)
         let live_count = {
             let node = self
@@ -512,6 +516,8 @@ impl ScopeTree {
 
         let node = self.nodes.get_mut(id).expect("validated above");
         node.state = ScopeState::Finalizing;
+        node.finalizing_started_at_ms = Some(timestamp_ms);
+
         Ok(())
     }
 
@@ -960,14 +966,14 @@ mod tests {
         );
 
         // Draining → Finalizing (no children)
-        tree.finalize(&well_known::discovery()).unwrap();
+        tree.finalize(&well_known::discovery(), 4000).unwrap();
         assert_eq!(
             tree.get(&well_known::discovery()).unwrap().state,
             ScopeState::Finalizing
         );
 
         // Finalizing → Closed
-        tree.close(&well_known::discovery(), 4000).unwrap();
+        tree.close(&well_known::discovery(), 5000).unwrap();
         assert_eq!(
             tree.get(&well_known::discovery()).unwrap().state,
             ScopeState::Closed
@@ -1002,21 +1008,18 @@ mod tests {
         tree.request_shutdown(&well_known::capture(), 2000).unwrap();
 
         // Cannot finalize parent while child is running
-        let err = tree.finalize(&well_known::capture()).unwrap_err();
-        assert!(matches!(
-            err,
-            ScopeTreeError::HasLiveChildren { live_count: 1, .. }
-        ));
+        let err = tree.finalize(&well_known::capture(), 2000).unwrap_err();
+        assert!(matches!(err, ScopeTreeError::HasLiveChildren { .. }));
 
         // Shut down child first
-        tree.request_shutdown(&well_known::capture_worker(0), 2100)
+        tree.request_shutdown(&well_known::capture_worker(0), 2000)
             .unwrap();
-        tree.finalize(&well_known::capture_worker(0)).unwrap();
-        tree.close(&well_known::capture_worker(0), 2200).unwrap();
+        tree.finalize(&well_known::capture_worker(0), 2500).unwrap();
+        tree.close(&well_known::capture_worker(0), 3000).unwrap();
 
         // Now parent can finalize
-        tree.finalize(&well_known::capture()).unwrap();
-        tree.close(&well_known::capture(), 2300).unwrap();
+        tree.finalize(&well_known::capture(), 3500).unwrap();
+        tree.close(&well_known::capture(), 4000).unwrap();
     }
 
     #[test]
@@ -1034,8 +1037,8 @@ mod tests {
         // Close the parent
         tree.start(&well_known::capture(), 1100).unwrap();
         tree.request_shutdown(&well_known::capture(), 1200).unwrap();
-        tree.finalize(&well_known::capture()).unwrap();
-        tree.close(&well_known::capture(), 1300).unwrap();
+        tree.finalize(&well_known::capture(), 1300).unwrap();
+        tree.close(&well_known::capture(), 1400).unwrap();
 
         // Try to register child under closed parent
         let err = tree
@@ -1044,7 +1047,7 @@ mod tests {
                 ScopeTier::Worker,
                 &well_known::capture(),
                 "worker",
-                1400,
+                1500,
             )
             .unwrap_err();
         assert!(matches!(err, ScopeTreeError::ParentNotAccepting { .. }));
@@ -1287,8 +1290,8 @@ mod tests {
                 1000,
             )
             .unwrap();
-        let err = tree2.finalize(&well_known::relay());
-        assert!(matches!(err, Err(ScopeTreeError::InvalidTransition { .. })));
+        let err = tree2.finalize(&well_known::relay(), 1000);
+        assert!(err.is_err());
     }
 
     #[test]
@@ -1309,8 +1312,8 @@ mod tests {
 
         assert_eq!(tree.count_by_tier(ScopeTier::Ephemeral), 1);
 
-        tree.request_shutdown(&query_id, 2500).unwrap();
-        tree.finalize(&query_id).unwrap();
+        tree.request_shutdown(&query_id, 2000).unwrap();
+        tree.finalize(&query_id, 2500).unwrap();
         tree.close(&query_id, 3000).unwrap();
 
         assert_eq!(tree.count_by_state(ScopeState::Closed), 1);

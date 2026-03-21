@@ -250,7 +250,11 @@ impl ByteCompressor {
 
         let count = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
         let mut offset = 4usize;
-        let mut buffers = Vec::with_capacity(count);
+        
+        // Prevent pre-allocation OOM from corrupted or malicious inputs
+        let max_possible_buffers = (input.len() - 4) / 4;
+        let safe_capacity = count.min(max_possible_buffers);
+        let mut buffers = Vec::with_capacity(safe_capacity);
 
         for i in 0..count {
             if offset + 4 > input.len() {

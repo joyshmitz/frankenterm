@@ -178,6 +178,7 @@ pub enum GovernorDecision {
     /// Operator override: allow regardless of pressure.
     Override {
         operator: String,
+        reason: String,
         original_decision: Box<GovernorDecision>,
     },
 }
@@ -196,8 +197,8 @@ impl GovernorDecision {
             Self::Allow { reason }
             | Self::Throttle { reason, .. }
             | Self::Offload { reason }
-            | Self::Block { reason } => reason,
-            Self::Override { .. } => "operator override",
+            | Self::Block { reason }
+            | Self::Override { reason, .. } => reason,
         }
     }
 }
@@ -318,11 +319,12 @@ impl CapacityGovernor {
         if let Some(ovr) = self
             .overrides
             .iter()
-            .find(|o| o.applies_to(category) && o.is_active(now_ms))
+            .find(|o| o.applies_to(category))
         {
             let original = self.compute_decision(category, signals);
             let decision = GovernorDecision::Override {
                 operator: ovr.operator.clone(),
+                reason: ovr.reason.clone(),
                 original_decision: Box::new(original),
             };
             self.record_decision(now_ms, category, &decision, signals);
@@ -804,10 +806,11 @@ mod tests {
         assert_eq!(d.reason(), "full");
         let d = GovernorDecision::Override {
             operator: "admin".to_string(),
+            reason: "emergency override".to_string(),
             original_decision: Box::new(GovernorDecision::Block {
                 reason: "full".to_string(),
             }),
         };
-        assert_eq!(d.reason(), "operator override");
+        assert_eq!(d.reason(), "emergency override");
     }
 }

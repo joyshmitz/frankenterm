@@ -999,13 +999,13 @@ impl ShutdownCoordinator {
         match node.state {
             ScopeState::Created | ScopeState::Running => {
                 tree.request_shutdown(scope_id, timestamp_ms)?;
-                tree.finalize(scope_id)?;
+                tree.finalize(scope_id, timestamp_ms)?;
                 tree.close(scope_id, timestamp_ms)?;
             }
             ScopeState::Draining => {
                 // Mark all finalizers as skipped
                 self.skip_all_finalizers(scope_id, "force-close escalation");
-                tree.finalize(scope_id)?;
+                tree.finalize(scope_id, timestamp_ms)?;
                 tree.close(scope_id, timestamp_ms)?;
             }
             ScopeState::Finalizing => {
@@ -1047,7 +1047,7 @@ impl ShutdownCoordinator {
         );
 
         // Transition in tree (validates children are closed)
-        tree.finalize(scope_id)?;
+        tree.finalize(scope_id, timestamp_ms)?;
 
         // Check if we should run finalizers
         let policy = self.policy(scope_id).clone();
@@ -1877,13 +1877,13 @@ mod tests {
             .mark_finalizer_started(&scope, "risky-op", 1000)
             .unwrap();
         coord
-            .mark_finalizer_failed(&scope, "risky-op", "disk full", 200, 1200)
+            .mark_finalizer_failed(&scope, "risky-op", "io error", 30, 1200)
             .unwrap();
 
         let fns = coord.finalizers(&scope);
         assert!(matches!(
             fns[0].status,
-            FinalizerStatus::Failed { ref error, .. } if error == "disk full"
+            FinalizerStatus::Failed { ref error, .. } if error == "io error"
         ));
     }
 
