@@ -493,7 +493,7 @@ impl ScopeWatchdog {
         ];
 
         for tier in tiers {
-            let count = tree.count_by_tier(tier);
+            let count = tree.live_count_by_tier(tier);
             let limit = self.config.scope_limit_for_tier(tier);
 
             if count > limit {
@@ -977,6 +977,39 @@ mod tests {
             }
         );
         assert!(is_daemon_leak);
+    }
+
+    #[test]
+    fn detect_scope_leak_ignores_closed_scopes() {
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        for i in 0..25 {
+            let id = ScopeId(format!("daemon:d{i}"));
+            tree.register(
+                id.clone(),
+                ScopeTier::Daemon,
+                &ScopeId::root(),
+                format!("daemon-{i}"),
+                1000,
+            )
+            .unwrap();
+            tree.start(&id, 1100 + i as i64).unwrap();
+            if i < 10 {
+                tree.request_shutdown(&id, 2000 + i as i64).unwrap();
+                tree.finalize(&id, 2100 + i as i64).unwrap();
+                tree.close(&id, 2200 + i as i64).unwrap();
+            }
+        }
+
+        let mut watchdog = ScopeWatchdog::new();
+        let alerts = watchdog.scan(&tree, 3000);
+        assert!(
+            !alerts
+                .iter()
+                .any(|a| matches!(a.kind, AlertKind::ScopeLeak { .. })),
+            "closed scopes should not count toward live leak thresholds"
+        );
     }
 
     #[test]
