@@ -159,6 +159,9 @@ tests/e2e/artifacts/
 # UBS (Ultimate Bug Scanner) reports
 ubs*.txt
 
+# Ephemeral regex/test scratch directories (agent experiments)
+tmp_re_test/
+
 # Agent tool MCP config backups (timestamped .bak files)
 .claude/*.bak
 .cline.mcp.json.*
