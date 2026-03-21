@@ -310,6 +310,41 @@ fn canonical_channel_bridge_mappings_are_present_and_aligned() {
     }
 }
 
+#[test]
+fn compatibility_mappings_cover_all_verifiable_contracts() {
+    let unmapped = compatibility_unmapped_verifiable_contract_ids();
+    assert!(
+        unmapped.is_empty(),
+        "verifiable contracts missing from compatibility mappings: {unmapped:?}"
+    );
+}
+
+#[test]
+fn compatibility_mappings_cover_all_verifiable_categories() {
+    let mapped_ids = compatibility_mapped_contract_ids();
+    let mapped_categories: std::collections::HashSet<_> = standard_contracts()
+        .into_iter()
+        .filter(|contract| contract.verifiable)
+        .filter(|contract| mapped_ids.contains(contract.contract_id.as_str()))
+        .map(|contract| contract.category)
+        .collect();
+
+    for expected in [
+        ContractCategory::Ownership,
+        ContractCategory::Cancellation,
+        ContractCategory::Channeling,
+        ContractCategory::ErrorMapping,
+        ContractCategory::Backpressure,
+        ContractCategory::Timeout,
+        ContractCategory::TaskLifecycle,
+    ] {
+        assert!(
+            mapped_categories.contains(&expected),
+            "compatibility mappings should cover {expected:?}"
+        );
+    }
+}
+
 // =============================================================================
 // Cross-Category Invariant Tests
 // =============================================================================

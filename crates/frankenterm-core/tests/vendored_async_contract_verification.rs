@@ -24,8 +24,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use frankenterm_core::{
     runtime_compat::{SurfaceDisposition, SURFACE_CONTRACT_V1},
     vendored_async_contracts::{
-        standard_contracts, AsyncBoundaryContract, BoundaryDirection, ContractCategory,
-        ContractCompliance, ContractEvidence, EvidenceType,
+        compatibility_mapped_contract_ids, compatibility_unmapped_verifiable_contract_ids,
+        standard_compatibility_mappings, standard_contracts, AsyncBoundaryContract,
+        BoundaryDirection, ContractCategory, ContractCompliance, ContractEvidence, EvidenceType,
     },
 };
 
@@ -626,11 +627,16 @@ fn v23_mapping_all_contract_ids_unique() {
     emit_contract_log("v23", "mapping", "unique_ids", "pass");
 }
 
-/// V24: All seven contract categories are represented.
+/// V24: Compatibility mappings cover every verifiable contract category.
 #[test]
 fn v24_mapping_all_categories_covered() {
-    let contracts = collect_contracts();
-    let categories: HashSet<ContractCategory> = contracts.iter().map(|c| c.category).collect();
+    let mapped_ids = compatibility_mapped_contract_ids();
+    let categories: HashSet<ContractCategory> = collect_contracts()
+        .into_iter()
+        .filter(|contract| contract.verifiable)
+        .filter(|contract| mapped_ids.contains(contract.contract_id.as_str()))
+        .map(|contract| contract.category)
+        .collect();
 
     let expected = [
         ContractCategory::Ownership,
@@ -679,6 +685,25 @@ fn v25_mapping_contract_id_format_consistent() {
     }
 
     emit_contract_log("v25", "mapping", "id_format", "pass");
+}
+
+/// V25b: Compatibility mappings cover every verifiable contract ID.
+#[test]
+fn v25b_mapping_covers_all_verifiable_contracts() {
+    let unmapped = compatibility_unmapped_verifiable_contract_ids();
+    assert!(
+        unmapped.is_empty(),
+        "verifiable contracts missing from compatibility matrix: {unmapped:?}"
+    );
+
+    let mapped_ids = compatibility_mapped_contract_ids();
+    let matrix_contract_ids: BTreeSet<_> = standard_compatibility_mappings()
+        .into_iter()
+        .flat_map(|mapping| mapping.satisfies_contracts.into_iter())
+        .collect();
+    assert_eq!(mapped_ids, matrix_contract_ids);
+
+    emit_contract_log("v25b", "mapping", "verifiable_contract_coverage", "pass");
 }
 
 // =============================================================================

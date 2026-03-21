@@ -619,6 +619,15 @@ fn compatibility_mappings_empty_contract_sets_are_exactly_disallowed_surfaces() 
     }
 }
 
+#[test]
+fn compatibility_mappings_leave_no_verifiable_contract_unmapped() {
+    let unmapped = compatibility_unmapped_verifiable_contract_ids();
+    assert!(
+        unmapped.is_empty(),
+        "verifiable contracts missing from compatibility matrix: {unmapped:?}"
+    );
+}
+
 proptest! {
     #[test]
     fn compatibility_mapping_serde_roundtrip(_dummy in Just(())) {

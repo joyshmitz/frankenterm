@@ -31,7 +31,7 @@
 //!   └── uncovered_contracts: Vec<String>
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -337,7 +337,11 @@ pub fn standard_compatibility_mappings() -> Vec<CompatibilityMapping> {
         },
         CompatibilityMapping {
             compat_api: "CompatRuntime::block_on".into(),
-            satisfies_contracts: vec!["ABC-OWN-001".into(), "ABC-CAN-001".into()],
+            satisfies_contracts: vec![
+                "ABC-OWN-001".into(),
+                "ABC-OWN-002".into(),
+                "ABC-CAN-001".into(),
+            ],
             disposition_aligned: true,
         },
         CompatibilityMapping {
@@ -358,12 +362,20 @@ pub fn standard_compatibility_mappings() -> Vec<CompatibilityMapping> {
         },
         CompatibilityMapping {
             compat_api: "spawn_blocking".into(),
-            satisfies_contracts: vec!["ABC-TL-001".into(), "ABC-OWN-001".into()],
+            satisfies_contracts: vec![
+                "ABC-TL-001".into(),
+                "ABC-OWN-001".into(),
+                "ABC-ERR-001".into(),
+            ],
             disposition_aligned: true,
         },
         CompatibilityMapping {
             compat_api: "task::spawn_blocking".into(),
-            satisfies_contracts: vec!["ABC-TL-001".into()],
+            satisfies_contracts: vec![
+                "ABC-TL-001".into(),
+                "ABC-CAN-002".into(),
+                "ABC-TL-002".into(),
+            ],
             disposition_aligned: false, // Replace — JoinHandle semantics misaligned
         },
         CompatibilityMapping {
@@ -417,6 +429,34 @@ pub fn standard_compatibility_mappings() -> Vec<CompatibilityMapping> {
             disposition_aligned: false, // Retire — tokio-only shim
         },
     ]
+}
+
+/// Contract IDs currently represented by the runtime-compat compatibility matrix.
+///
+/// This is the auditable contract coverage implied by
+/// [`standard_compatibility_mappings`].
+#[must_use]
+pub fn compatibility_mapped_contract_ids() -> BTreeSet<String> {
+    standard_compatibility_mappings()
+        .into_iter()
+        .flat_map(|mapping| mapping.satisfies_contracts.into_iter())
+        .collect()
+}
+
+/// Verifiable contracts that are not represented anywhere in the compatibility
+/// matrix.
+///
+/// A non-empty result means the matrix can drift while still leaving a
+/// contract-level blind spot in the Core↔Vendored async boundary audit.
+#[must_use]
+pub fn compatibility_unmapped_verifiable_contract_ids() -> Vec<String> {
+    let mapped_ids = compatibility_mapped_contract_ids();
+    standard_contracts()
+        .into_iter()
+        .filter(|contract| contract.verifiable)
+        .filter(|contract| !mapped_ids.contains(contract.contract_id.as_str()))
+        .map(|contract| contract.contract_id)
+        .collect()
 }
 
 // =============================================================================
@@ -915,6 +955,41 @@ mod tests {
             assert!(
                 mapping.disposition_aligned,
                 "{api} should remain aligned because it is a stable Keep surface"
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_mappings_cover_all_verifiable_contracts() {
+        let unmapped = compatibility_unmapped_verifiable_contract_ids();
+        assert!(
+            unmapped.is_empty(),
+            "verifiable contracts missing from compatibility matrix: {unmapped:?}"
+        );
+    }
+
+    #[test]
+    fn compatibility_mappings_cover_all_verifiable_categories() {
+        let mapped_ids = compatibility_mapped_contract_ids();
+        let mapped_categories: std::collections::HashSet<_> = standard_contracts()
+            .into_iter()
+            .filter(|contract| contract.verifiable)
+            .filter(|contract| mapped_ids.contains(contract.contract_id.as_str()))
+            .map(|contract| contract.category)
+            .collect();
+
+        for expected in [
+            ContractCategory::Ownership,
+            ContractCategory::Cancellation,
+            ContractCategory::Channeling,
+            ContractCategory::ErrorMapping,
+            ContractCategory::Backpressure,
+            ContractCategory::Timeout,
+            ContractCategory::TaskLifecycle,
+        ] {
+            assert!(
+                mapped_categories.contains(&expected),
+                "compatibility matrix is missing verifiable coverage for {expected:?}"
             );
         }
     }

@@ -15,7 +15,7 @@ use crate::runtime_compat::mpsc_reserve_send;
 #[cfg(any(not(feature = "asupersync-runtime"), test))]
 use crate::runtime_compat::task;
 use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
-use crate::runtime_compat::{mpsc, mpsc_try_reserve_send, timeout, watch};
+use crate::runtime_compat::{io, mpsc, mpsc_try_reserve_send, timeout, watch};
 use codec::{
     CODEC_VERSION, CompressionMode, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
     GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse, ListPanes,
@@ -1390,21 +1390,8 @@ fn should_auto_fallback_to_always(
         && matches!(err.protocol_error_kind(), ProtocolErrorKind::Recoverable)
 }
 
-#[cfg(feature = "asupersync-runtime")]
 async fn unix_stream_read(stream: &mut UnixStream, buf: &mut [u8]) -> std::io::Result<usize> {
-    use crate::runtime_compat::unix::AsyncRead;
-    use asupersync::io::ReadBuf;
-    use std::pin::Pin;
-
-    let mut read_buf = ReadBuf::new(buf);
-    std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_read(cx, &mut read_buf)).await?;
-    Ok(read_buf.filled().len())
-}
-
-#[cfg(not(feature = "asupersync-runtime"))]
-async fn unix_stream_read(stream: &mut UnixStream, buf: &mut [u8]) -> std::io::Result<usize> {
-    use crate::runtime_compat::unix::AsyncReadExt;
-    stream.read(buf).await
+    io::read(stream, buf).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1955,7 +1942,10 @@ mod tests {
         F: std::future::Future<Output = ()>,
     {
         #[cfg(feature = "asupersync-runtime")]
-        let _tokio_rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         #[cfg(feature = "asupersync-runtime")]
         let _guard = _tokio_rt.enter();
         let runtime = RuntimeBuilder::current_thread()

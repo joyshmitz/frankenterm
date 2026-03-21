@@ -809,7 +809,7 @@ impl MuxPool {
 mod tests {
     use super::*;
     use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
-    use crate::runtime_compat::{CompatRuntime, task, timeout};
+    use crate::runtime_compat::{CompatRuntime, io, task, timeout};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -821,27 +821,22 @@ mod tests {
         Pdu, UnitResponse,
     };
 
-    #[cfg(feature = "asupersync-runtime")]
     async fn unix_stream_read(
         stream: &mut compat_unix::UnixStream,
         buf: &mut [u8],
     ) -> std::io::Result<usize> {
-        use crate::runtime_compat::unix::AsyncRead;
-        use asupersync::io::ReadBuf;
-        use std::pin::Pin;
-
-        let mut read_buf = ReadBuf::new(buf);
-        std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_read(cx, &mut read_buf)).await?;
-        Ok(read_buf.filled().len())
+        io::read(stream, buf).await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn unix_stream_read(
+    async fn write_response_pdu(
         stream: &mut compat_unix::UnixStream,
-        buf: &mut [u8],
-    ) -> std::io::Result<usize> {
-        use crate::runtime_compat::unix::AsyncReadExt;
-        stream.read(buf).await
+        pdu: &Pdu,
+        serial: u64,
+    ) -> std::io::Result<()> {
+        pdu.encode_async(stream, serial)
+            .await
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        stream.flush().await
     }
 
     /// Spawn a mock mux server that handles handshake + ListPanes.
@@ -925,9 +920,7 @@ mod tests {
                             responses.push((decoded.serial, response));
                         }
                         for (serial, pdu) in responses {
-                            let mut out = Vec::new();
-                            pdu.encode(&mut out, serial).expect("encode response");
-                            if stream.write_all(&out).await.is_err() {
+                            if write_response_pdu(&mut stream, &pdu, serial).await.is_err() {
                                 break;
                             }
                         }
@@ -999,9 +992,7 @@ mod tests {
                         }
 
                         for (serial, pdu) in responses {
-                            let mut out = Vec::new();
-                            pdu.encode(&mut out, serial).expect("encode response");
-                            if stream.write_all(&out).await.is_err() {
+                            if write_response_pdu(&mut stream, &pdu, serial).await.is_err() {
                                 break;
                             }
                         }
@@ -1096,9 +1087,7 @@ mod tests {
                         }
 
                         for (serial, pdu) in responses {
-                            let mut out = Vec::new();
-                            pdu.encode(&mut out, serial).expect("encode response");
-                            if stream.write_all(&out).await.is_err() {
+                            if write_response_pdu(&mut stream, &pdu, serial).await.is_err() {
                                 break;
                             }
                         }
@@ -1129,7 +1118,10 @@ mod tests {
         F: std::future::Future<Output = ()>,
     {
         #[cfg(feature = "asupersync-runtime")]
-        let _tokio_rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         #[cfg(feature = "asupersync-runtime")]
         let _guard = _tokio_rt.enter();
         let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
