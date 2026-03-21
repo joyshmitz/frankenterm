@@ -1029,6 +1029,9 @@ fn estimate_text_tokens(content: &str) -> u64 {
 }
 
 #[cfg(feature = "cass-export")]
+const RESOLVE_SESSION_FALLBACK_LIMIT: usize = 10_000;
+
+#[cfg(feature = "cass-export")]
 async fn resolve_export_session(
     storage: &StorageHandle,
     session_id: &str,
@@ -1043,9 +1046,12 @@ async fn resolve_export_session(
         }
     }
 
+    // Bounded fallback: scan at most RESOLVE_SESSION_FALLBACK_LIMIT sessions
+    // to prevent OOM on large databases. If the session isn't in the most
+    // recent N sessions, it's effectively gone.
     let sessions = storage
         .export_sessions(ExportQuery {
-            limit: None,
+            limit: Some(RESOLVE_SESSION_FALLBACK_LIMIT),
             ..ExportQuery::default()
         })
         .await?;
@@ -1068,14 +1074,17 @@ fn redact_and_truncate(input: &str, max_len: usize) -> String {
     }
 
     // `max_len` is byte-oriented (CLI/output budgets). Truncate on a UTF-8
-    // boundary so previews remain valid UTF-8 while respecting byte budgets.
-    let mut end = max_len.min(redacted.len());
+    // boundary so the total output (including "..." ellipsis) stays within
+    // the byte budget.
+    let ellipsis = "...";
+    let budget = max_len.saturating_sub(ellipsis.len());
+    let mut end = budget.min(redacted.len());
     while end > 0 && !redacted.is_char_boundary(end) {
         end -= 1;
     }
 
     let mut truncated = redacted[..end].to_string();
-    truncated.push_str("...");
+    truncated.push_str(ellipsis);
     truncated
 }
 
@@ -1325,12 +1334,28 @@ mod tests {
         let text = "🚀".repeat(10);
         let redacted = redact_and_truncate(&text, 5);
         assert!(redacted.ends_with("..."));
+        // With max_len=5: budget is 5-3=2 bytes for content, but "🚀" is 4 bytes
+        // so no emoji fits → result is just "..."
         assert!(
-            redacted.len() <= 8,
-            "preview bytes {} exceed max+ellipsis",
+            redacted.len() <= 5,
+            "total preview bytes {} must not exceed max_len",
             redacted.len()
         );
         assert!(std::str::from_utf8(redacted.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn redact_and_truncate_total_never_exceeds_budget() {
+        // ASCII text: each char is 1 byte, so budget calculation is straightforward
+        let text = "a".repeat(100);
+        let redacted = redact_and_truncate(&text, 20);
+        assert!(
+            redacted.len() <= 20,
+            "total bytes {} must not exceed max_len=20",
+            redacted.len()
+        );
+        assert!(redacted.ends_with("..."));
+        assert_eq!(redacted.len(), 20); // 17 chars + "..."
     }
 
     #[test]

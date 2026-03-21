@@ -601,6 +601,15 @@ impl ScopeTree {
         self.nodes.values().filter(|n| n.tier == tier).count()
     }
 
+    /// Count live (non-terminal) scopes by tier.
+    #[must_use]
+    pub fn live_count_by_tier(&self, tier: ScopeTier) -> usize {
+        self.nodes
+            .values()
+            .filter(|n| n.tier == tier && !n.state.is_terminal())
+            .count()
+    }
+
     /// All scope IDs for a given tier.
     #[must_use]
     pub fn scopes_for_tier(&self, tier: ScopeTier) -> Vec<ScopeId> {
@@ -735,10 +744,13 @@ impl ScopeHandle {
         }
     }
 
-    /// Request shutdown by setting the flag.
+    /// Request shutdown by setting the flag and bumping the generation.
+    ///
+    /// Both stores use `Release` ordering so that readers using `Acquire`
+    /// on either the flag or the generation observe a consistent state.
     pub fn request_shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::Release);
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Check if shutdown has been requested.
@@ -750,7 +762,7 @@ impl ScopeHandle {
     /// Current generation counter.
     #[must_use]
     pub fn current_generation(&self) -> u64 {
-        self.generation.load(Ordering::Relaxed)
+        self.generation.load(Ordering::Acquire)
     }
 }
 
@@ -1317,5 +1329,39 @@ mod tests {
         tree.close(&query_id, 3000).unwrap();
 
         assert_eq!(tree.count_by_state(ScopeState::Closed), 1);
+    }
+
+    #[test]
+    fn live_count_by_tier_excludes_closed_scopes() {
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let closed = well_known::ephemeral_query("closed");
+        let live = well_known::ephemeral_query("live");
+
+        tree.register(
+            closed.clone(),
+            ScopeTier::Ephemeral,
+            &ScopeId::root(),
+            "closed",
+            1100,
+        )
+        .unwrap();
+        tree.register(
+            live.clone(),
+            ScopeTier::Ephemeral,
+            &ScopeId::root(),
+            "live",
+            1200,
+        )
+        .unwrap();
+        tree.start(&closed, 1300).unwrap();
+        tree.start(&live, 1400).unwrap();
+        tree.request_shutdown(&closed, 1500).unwrap();
+        tree.finalize(&closed, 1600).unwrap();
+        tree.close(&closed, 1700).unwrap();
+
+        assert_eq!(tree.count_by_tier(ScopeTier::Ephemeral), 2);
+        assert_eq!(tree.live_count_by_tier(ScopeTier::Ephemeral), 1);
     }
 }
