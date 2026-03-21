@@ -162,6 +162,13 @@ fn make_all_compliant_report() -> ContractAuditReport {
     report
 }
 
+fn find_mapping(api: &str) -> CompatibilityMapping {
+    standard_compatibility_mappings()
+        .into_iter()
+        .find(|mapping| mapping.compat_api == api)
+        .unwrap_or_else(|| panic!("missing mapping for {api}"))
+}
+
 // =============================================================================
 // standard_contracts property tests
 // =============================================================================
@@ -213,6 +220,21 @@ fn compliance_mismatched_contract_id_not_compliant_but_matching_coverage_full() 
     assert!(!compliance.compliant);
     // But coverage is 1.0 because all MATCHING evidence (1/1) passed.
     assert!((compliance.coverage - 1.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn audit_report_new_starts_empty_and_unfinalized() {
+    let report = ContractAuditReport::new("fresh-audit", 42);
+
+    assert_eq!(report.audit_id, "fresh-audit");
+    assert_eq!(report.generated_at_ms, 42);
+    assert!(report.contracts.is_empty());
+    assert_eq!(report.surface_status.total_count(), 0);
+    assert!(!report.overall_compliant);
+    assert!((report.compliance_rate - 0.0).abs() < f64::EPSILON);
+    assert!(report.uncovered_contracts.is_empty());
+    assert!(report.failing_contracts().is_empty());
+    assert!(report.by_category().is_empty());
 }
 
 proptest! {
@@ -291,6 +313,35 @@ proptest! {
         prop_assert!(compliance.coverage >= 0.0);
         prop_assert!(compliance.coverage <= 1.0);
     }
+
+    #[test]
+    fn compliance_matching_coverage_ignores_mismatched_evidence(
+        pass_count in 0usize..=5,
+        fail_count in 0usize..=5,
+        mismatch_count in 0usize..=5,
+    ) {
+        prop_assume!(pass_count + fail_count > 0);
+
+        let contract = standard_contracts().into_iter().next().unwrap();
+        let id = contract.contract_id.clone();
+        let mut evidence = Vec::new();
+
+        for i in 0..pass_count {
+            evidence.push(make_evidence(&id, &format!("pass_{}", i), true));
+        }
+        for i in 0..fail_count {
+            evidence.push(make_evidence(&id, &format!("fail_{}", i), false));
+        }
+        for i in 0..mismatch_count {
+            evidence.push(make_evidence("ABC-ERR-001", &format!("mismatch_{}", i), i % 2 == 0));
+        }
+
+        let compliance = ContractCompliance::from_evidence(contract, evidence);
+        let expected_coverage = pass_count as f64 / (pass_count + fail_count) as f64;
+
+        prop_assert!((compliance.coverage - expected_coverage).abs() < f64::EPSILON);
+        prop_assert_eq!(compliance.compliant, fail_count == 0 && mismatch_count == 0);
+    }
 }
 
 // =============================================================================
@@ -336,6 +387,22 @@ proptest! {
         prop_assert_eq!(by_cat.len(), 7);
         let total: usize = by_cat.values().map(|v| v.len()).sum();
         prop_assert_eq!(total, report.contracts.len());
+    }
+
+    #[test]
+    fn audit_report_by_category_preserves_membership(_dummy in Just(())) {
+        let report = make_all_compliant_report();
+
+        for (category, entries) in report.by_category() {
+            let category_name = category.as_str();
+            prop_assert!(
+                !entries.is_empty(),
+                "category {category_name} should not be empty"
+            );
+            for compliance in entries {
+                prop_assert_eq!(format!("{:?}", compliance.contract.category), category_name);
+            }
+        }
     }
 
     #[test]
@@ -404,6 +471,48 @@ proptest! {
     }
 }
 
+#[test]
+fn summary_reports_failing_and_uncovered_contracts() {
+    let mut report = ContractAuditReport::new("summary-test", 42);
+    let mut contracts = standard_contracts().into_iter();
+
+    let passing_contract = contracts.next().unwrap();
+    let failing_contract = contracts.next().unwrap();
+    let uncovered_contract = contracts.next().unwrap();
+
+    let passing_id = passing_contract.contract_id.clone();
+    report.add_compliance(ContractCompliance::from_evidence(
+        passing_contract,
+        vec![make_evidence(&passing_id, "passing", true)],
+    ));
+
+    let failing_id = failing_contract.contract_id.clone();
+    report.add_compliance(ContractCompliance::from_evidence(
+        failing_contract,
+        vec![make_evidence(&failing_id, "failing", false)],
+    ));
+
+    let uncovered_id = uncovered_contract.contract_id.clone();
+    report.add_compliance(ContractCompliance::from_evidence(
+        uncovered_contract,
+        vec![],
+    ));
+
+    report.set_surface_status(standard_surface_status());
+    report.finalize();
+
+    let summary = report.summary();
+    assert!(summary.contains("summary-test"), "{summary}");
+    assert!(
+        summary.contains("Contracts: 1/3 compliant (33%), 1 uncovered"),
+        "{summary}"
+    );
+    assert!(summary.contains("Overall: NON-COMPLIANT"), "{summary}");
+    assert!(summary.contains("Failing contracts (2):"), "{summary}");
+    assert!(summary.contains(&failing_id), "{summary}");
+    assert!(summary.contains(&uncovered_id), "{summary}");
+}
+
 // =============================================================================
 // CompatibilityMapping tests
 // =============================================================================
@@ -459,6 +568,53 @@ fn compatibility_mappings_include_canonical_channel_bridges() {
         assert!(
             mapping.disposition_aligned,
             "{api} should remain aligned because it is a Keep surface"
+        );
+    }
+}
+
+#[test]
+fn compatibility_mappings_non_aligned_set_matches_non_keep_runtime_surface_entries() {
+    let expected: std::collections::BTreeSet<_> = SURFACE_CONTRACT_V1
+        .iter()
+        .filter(|entry| {
+            !matches!(
+                entry.disposition,
+                frankenterm_core::runtime_compat::SurfaceDisposition::Keep
+            )
+        })
+        .map(|entry| entry.api.to_owned())
+        .collect();
+    let actual: std::collections::BTreeSet<_> = standard_compatibility_mappings()
+        .into_iter()
+        .filter(|mapping| !mapping.disposition_aligned)
+        .map(|mapping| mapping.compat_api)
+        .collect();
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn compatibility_mappings_empty_contract_sets_are_exactly_disallowed_surfaces() {
+    let empty_contract_mappings: std::collections::BTreeSet<_> = standard_compatibility_mappings()
+        .into_iter()
+        .filter(|mapping| mapping.satisfies_contracts.is_empty())
+        .map(|mapping| mapping.compat_api)
+        .collect();
+    let expected: std::collections::BTreeSet<_> = [
+        "CompatRuntime::spawn_detached",
+        "process::Command",
+        "signal",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+
+    assert_eq!(empty_contract_mappings, expected);
+    for api in &expected {
+        let mapping = find_mapping(api);
+        assert!(
+            !mapping.disposition_aligned,
+            "{api} should remain non-aligned"
         );
     }
 }

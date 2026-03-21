@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+#[cfg(all(test, unix))]
+use std::sync::{Mutex, OnceLock};
 
 #[allow(unused_imports)]
 use crate::mcp_framework::{
@@ -189,6 +191,36 @@ fn mcp_event_mutation_decision_context(
         context.add_evidence("actor_id", actor_id);
     }
     context
+}
+
+fn cass_client_with_timeout(timeout_secs: u64) -> CassClient {
+    let client = CassClient::new().with_timeout_secs(timeout_secs);
+    #[cfg(all(test, unix))]
+    if let Some(binary) = cass_test_binary_override() {
+        return client.with_binary(binary);
+    }
+    client
+}
+
+#[cfg(all(test, unix))]
+fn cass_test_binary_override_slot() -> &'static Mutex<Option<String>> {
+    static SLOT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(all(test, unix))]
+fn cass_test_binary_override() -> Option<String> {
+    cass_test_binary_override_slot()
+        .lock()
+        .expect("cass test binary override poisoned")
+        .clone()
+}
+
+#[cfg(all(test, unix))]
+fn set_cass_test_binary_override(binary: Option<String>) {
+    *cass_test_binary_override_slot()
+        .lock()
+        .expect("cass test binary override poisoned") = binary;
 }
 
 // wa.rules_list tool
@@ -458,7 +490,7 @@ impl ToolHandler for WaCassSearchTool {
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
         let result: std::result::Result<CassSearchResult, CassError> = runtime.block_on(async {
-            let client = CassClient::new().with_timeout_secs(params.timeout_secs);
+            let client = cass_client_with_timeout(params.timeout_secs);
             let options = CassSearchOptions {
                 limit: (params.limit != 0).then_some(params.limit),
                 offset: (params.offset != 0).then_some(params.offset),
@@ -551,7 +583,7 @@ impl ToolHandler for WaCassViewTool {
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
         let result: std::result::Result<CassViewResult, CassError> = runtime.block_on(async {
-            let client = CassClient::new().with_timeout_secs(params.timeout_secs);
+            let client = cass_client_with_timeout(params.timeout_secs);
             let options = CassViewOptions {
                 context_lines: Some(params.context_lines),
             };
@@ -631,7 +663,7 @@ impl ToolHandler for WaCassStatusTool {
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
         let result: std::result::Result<CassStatus, CassError> = runtime.block_on(async {
-            let client = CassClient::new().with_timeout_secs(params.timeout_secs);
+            let client = cass_client_with_timeout(params.timeout_secs);
             client.status().await
         });
 
@@ -4345,8 +4377,12 @@ impl ToolHandler for WaEventsLabelTool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    #[cfg(unix)]
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     use super::{
         ActionKind, ActorKind, CompatRuntime, CompatRuntimeBuilder, Config, Content, McpContext,
@@ -4362,7 +4398,11 @@ mod tests {
         mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
         mcp_workflow_run_policy_input, serialize_mcp_audit_decision_context,
     };
+    #[cfg(unix)]
+    use super::set_cass_test_binary_override;
     use crate::mcp_error::MCP_ERR_INVALID_ARGS;
+    #[cfg(unix)]
+    use crate::mcp_error::MCP_ERR_CASS;
     use crate::plan::{
         MISSION_TX_SCHEMA_VERSION, MissionActorRole, MissionKillSwitchLevel, MissionTxContract,
         MissionTxState, StepAction, TxCommitStepInput, TxCompensation, TxId, TxIntent, TxOutcome,
@@ -4602,6 +4642,68 @@ mod tests {
         match &contents[0] {
             Content::Text { text } => serde_json::from_str(text).expect("valid MCP envelope json"),
             _ => panic!("expected text content"), // ubs:ignore
+        }
+    }
+
+    #[cfg(unix)]
+    fn cass_tool_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    fn sh_single_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+
+    #[cfg(unix)]
+    struct CassToolTestEnv {
+        _serial: MutexGuard<'static, ()>,
+        _dir: TempDir,
+        args_path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl CassToolTestEnv {
+        fn install(script_body: &str) -> Self {
+            let serial = cass_tool_test_lock()
+                .lock()
+                .expect("cass tool test lock poisoned");
+            let dir = tempfile::tempdir().expect("cass tool tempdir");
+            let args_path = dir.path().join("cass.args");
+            let binary_path = dir.path().join("cass-fake");
+            let script = format!(
+                "#!/bin/sh\nset -eu\nargs_file={}\n: > \"$args_file\"\nfor arg in \"$@\"; do\n  printf '%s\\n' \"$arg\" >> \"$args_file\"\ndone\n{}\n",
+                sh_single_quote(args_path.to_string_lossy().as_ref()),
+                script_body,
+            );
+            std::fs::write(&binary_path, script).expect("write fake cass");
+            let mut permissions = std::fs::metadata(&binary_path)
+                .expect("fake cass metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&binary_path, permissions).expect("chmod fake cass");
+            set_cass_test_binary_override(Some(binary_path.to_string_lossy().into_owned()));
+            Self {
+                _serial: serial,
+                _dir: dir,
+                args_path,
+            }
+        }
+
+        fn args(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.args_path)
+                .expect("read cass args")
+                .lines()
+                .map(ToOwned::to_owned)
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CassToolTestEnv {
+        fn drop(&mut self) {
+            set_cass_test_binary_override(None);
         }
     }
 
@@ -5270,6 +5372,141 @@ mod tests {
                 expected_name
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cass_search_tool_executes_cass_with_expected_args() {
+        let env = CassToolTestEnv::install(
+            r#"printf '%s' '{"query":"agent context","count":1,"hits":[{"source_path":"/tmp/session.md","line_number":42,"agent":"codex","content":"needle hit"}]}'"#,
+        );
+        let tool = WaCassSearchTool;
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "query": "agent context",
+                    "limit": 5,
+                    "offset": 2,
+                    "agent": "codex",
+                    "workspace": "/tmp/ws",
+                    "days": 7,
+                    "fields": "minimal",
+                    "max_tokens": 128,
+                    "timeout_secs": 9
+                }),
+            )
+            .expect("cass search call"),
+        );
+
+        assert_eq!(env.args(), vec![
+            "search",
+            "agent context",
+            "--robot",
+            "--limit",
+            "5",
+            "--offset",
+            "2",
+            "--agent",
+            "codex",
+            "--workspace",
+            "/tmp/ws",
+            "--days",
+            "7",
+            "--fields",
+            "minimal",
+            "--max-tokens",
+            "128",
+        ]);
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["data"]["count"], 1);
+        assert_eq!(envelope["data"]["hits"][0]["source_path"], "/tmp/session.md");
+        assert_eq!(envelope["data"]["hits"][0]["line_number"], 42);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cass_view_tool_executes_cass_with_expected_args() {
+        let env = CassToolTestEnv::install(
+            r#"printf '%s' '{"source_path":"/tmp/session.md","line_number":42,"match_line":{"line_number":42,"content":"needle hit","role":"assistant"},"context_before":[{"line_number":41,"content":"before","role":"user"}],"context_after":[{"line_number":43,"content":"after","role":"assistant"}]}'"#,
+        );
+        let tool = WaCassViewTool;
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "source_path": "/tmp/session.md",
+                    "line_number": 42,
+                    "context_lines": 3,
+                    "timeout_secs": 11
+                }),
+            )
+            .expect("cass view call"),
+        );
+
+        assert_eq!(
+            env.args(),
+            vec!["view", "/tmp/session.md", "-n", "42", "--json", "-C", "3"]
+        );
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["data"]["source_path"], "/tmp/session.md");
+        assert_eq!(envelope["data"]["match_line"]["content"], "needle hit");
+        assert_eq!(envelope["data"]["context_before"][0]["line_number"], 41);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cass_status_tool_executes_cass_with_expected_args() {
+        let env = CassToolTestEnv::install(
+            r#"printf '%s' '{"healthy":true,"index_path":"/tmp/.cass/index","total_sessions":150,"stale":false}'"#,
+        );
+        let tool = WaCassStatusTool;
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "timeout_secs": 4
+                }),
+            )
+            .expect("cass status call"),
+        );
+
+        assert_eq!(env.args(), vec!["status", "--json"]);
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["data"]["healthy"], true);
+        assert_eq!(envelope["data"]["total_sessions"], 150);
+        assert_eq!(envelope["data"]["stale"], false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cass_status_tool_maps_nonzero_exit_to_mcp_error() {
+        let _env = CassToolTestEnv::install(
+            r#"printf '%s\n' 'cass exploded' >&2
+exit 17"#,
+        );
+        let tool = WaCassStatusTool;
+
+        let envelope = parse_json_content(
+            tool.call(&test_mcp_context(), serde_json::json!({}))
+                .expect("cass status call"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_CASS);
+        assert_eq!(
+            envelope["hint"],
+            "cass exited with an error. Check cass logs or rerun with verbose output."
+        );
+        assert!(
+            envelope["error"]
+                .as_str()
+                .expect("error string")
+                .contains("cass status failed: cass failed with exit code 17")
+        );
     }
 
     #[test]
