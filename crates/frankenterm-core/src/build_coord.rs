@@ -710,33 +710,31 @@ fn is_shell_command_separator(token: &str) -> bool {
 
 /// Try to guess the actual executed payload from a shell invocation
 fn shell_command_payload(tokens: &[String], idx: usize) -> Option<&str> {
-    if idx + 2 < tokens.len() {
-        let shell = tokens.get(idx).map(String::as_str)?;
-        if !is_shell_binary(shell) {
-            return None;
-        }
+    let shell = tokens.get(idx).map(String::as_str)?;
+    if !is_shell_binary(shell) {
+        return None;
+    }
 
-        let mut arg_idx = idx + 1;
-        while let Some(token) = tokens.get(arg_idx).map(String::as_str) {
-            if let Some(command) = shell_inline_command(token) {
-                return Some(command);
-            }
-            if token == "--" {
-                return None;
-            }
-            if shell_flag_invokes_command(token) {
-                return tokens.get(arg_idx + 1).map(String::as_str);
-            }
-            if shell_flag_takes_argument(token) {
-                arg_idx = skip_shell_flag_argument(tokens, arg_idx + 1);
-                continue;
-            }
-            if is_shell_option(token) {
-                arg_idx += 1;
-                continue;
-            }
+    let mut arg_idx = idx + 1;
+    while let Some(token) = tokens.get(arg_idx).map(String::as_str) {
+        if let Some(command) = shell_inline_command(token) {
+            return Some(command);
+        }
+        if token == "--" {
             return None;
         }
+        if shell_flag_invokes_command(token) {
+            return tokens.get(arg_idx + 1).map(String::as_str);
+        }
+        if shell_flag_takes_argument(token) {
+            arg_idx = skip_shell_flag_argument(tokens, arg_idx + 1);
+            continue;
+        }
+        if is_shell_option(token) {
+            arg_idx += 1;
+            continue;
+        }
+        return None;
     }
 
     None
