@@ -4,6 +4,7 @@ use futures::FutureExt;
 use luahelper::ValuePrinter;
 use mlua::Value;
 use mux::termwiztermtab::TermWizTerminal;
+use promise::spawn::block_on;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -184,14 +185,13 @@ pub fn show_debug_overlay(
 
             let passed_host = host.take().unwrap();
 
-            let (host_res, text) =
-                smol::block_on(promise::spawn::spawn_into_main_thread(async move {
-                    evaluate_trampoline(passed_host, line)
-                        .recv()
-                        .await
-                        .map_err(|e| mlua::Error::external(format!("{:#}", e)))
-                        .expect("returning result not to fail")
-                }));
+            let (host_res, text) = block_on(promise::spawn::spawn_into_main_thread(async move {
+                evaluate_trampoline(passed_host, line)
+                    .recv()
+                    .await
+                    .map_err(|e| mlua::Error::external(format!("{:#}", e)))
+                    .expect("returning result not to fail")
+            }));
 
             host.replace(host_res);
 

@@ -14,6 +14,7 @@ use mux::renderable::*;
 use mux::tab::TabId;
 use ordered_float::NotNan;
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
+use promise::spawn::sleep;
 use rangeset::RangeSet;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -280,7 +281,7 @@ impl CopyRenderable {
         let pane_id = self.delegate.pane_id();
 
         promise::spawn::spawn(async move {
-            smol::Timer::after(Duration::from_millis(350)).await;
+            sleep(Duration::from_millis(350)).await;
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 let state = term_window.pane_state(pane_id);
                 if let Some(overlay) = state.overlay.as_ref() {

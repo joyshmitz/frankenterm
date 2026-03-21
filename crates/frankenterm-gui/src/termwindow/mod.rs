@@ -51,7 +51,7 @@ use mux::tab::{
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
 use mux_lua::MuxPane;
-use smol::Timer;
+use promise::spawn::sleep;
 use smol::channel::Sender;
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, LinkedList};
@@ -2128,7 +2128,7 @@ impl TermWindow {
 
                 let window = window.clone();
                 promise::spawn::spawn(async move {
-                    Timer::at(target).await;
+                    sleep(target.saturating_duration_since(Instant::now())).await;
                     window.notify(TermWindowNotif::EmitStatusUpdate);
                 })
                 .detach();

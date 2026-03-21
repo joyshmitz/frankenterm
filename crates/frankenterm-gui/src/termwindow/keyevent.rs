@@ -5,7 +5,7 @@ use ::window::{
 use anyhow::Context;
 use config::keyassignment::{KeyAssignment, KeyTableEntry};
 use mux::pane::{Pane, PerformAssignmentResult};
-use smol::Timer;
+use promise::spawn::sleep;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::input::KeyboardEncoding;
@@ -259,7 +259,7 @@ impl super::TermWindow {
                 // area will be repainted at the right time
                 if let Some(window) = self.window.clone() {
                     promise::spawn::spawn(async move {
-                        Timer::at(target).await;
+                        sleep(target.saturating_duration_since(Instant::now())).await;
                         window.invalidate();
                     })
                     .detach();

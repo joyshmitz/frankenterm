@@ -2,7 +2,7 @@ use crate::termwindow::{RenderFrame, TermWindowNotif};
 use ::window::WindowOps;
 use ::window::bitmaps::atlas::OutOfTextureSpace;
 use anyhow::Context;
-use smol::Timer;
+use promise::spawn::sleep;
 use std::time::{Duration, Instant};
 use wezterm_font::ClearShapeCache;
 
@@ -129,7 +129,7 @@ impl crate::TermWindow {
                         self.scheduled_animation.borrow_mut().replace(next_due);
                         let window = self.window.clone().take().unwrap();
                         promise::spawn::spawn(async move {
-                            Timer::at(next_due).await;
+                            sleep(next_due.saturating_duration_since(Instant::now())).await;
                             let win = window.clone();
                             window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
                                 tw.scheduled_animation.borrow_mut().take();
