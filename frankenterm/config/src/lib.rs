@@ -22,15 +22,16 @@
 #![allow(clippy::useless_conversion)]
 #![allow(clippy::wrong_self_convention)]
 
-use anyhow::{anyhow, bail, Context, Error};
+use std::future::Future;
+
+use anyhow::{Context, Error, anyhow, bail};
+use flume::{Receiver, Sender, unbounded};
 #[cfg(feature = "lua")]
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction};
 use frankenterm_dynamic::{ToDynamic, Value};
 use frankenterm_term::UnicodeVersion;
 use lazy_static::lazy_static;
 use ordered_float::NotNan;
-use smol::channel::{Receiver, Sender};
-use smol::prelude::*;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -44,7 +45,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(all(feature = "lua", feature = "no-lua"))]
-compile_error!("Features `lua` and `no-lua` cannot both be enabled. Use `--no-default-features --features no-lua` for a no-Lua build.");
+compile_error!(
+    "Features `lua` and `no-lua` cannot both be enabled. Use `--no-default-features --features no-lua` for a no-Lua build."
+);
 
 #[cfg(feature = "lua")]
 use mlua::Lua;
@@ -214,7 +217,7 @@ struct LuaPipe {
 }
 impl LuaPipe {
     pub fn new() -> Self {
-        let (sender, receiver) = smol::channel::unbounded();
+        let (sender, receiver) = unbounded();
         Self { sender, receiver }
     }
 }
