@@ -2,7 +2,8 @@
 //! See <https://developer.gnome.org/notification-spec/>
 
 use crate::ToastNotification;
-use futures_util::stream::{abortable, StreamExt};
+use futures_util::stream::{StreamExt, abortable};
+use promise::spawn::block_on;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use zbus::proxy;
@@ -156,7 +157,7 @@ pub fn show_notif(notif: ToastNotification) -> Result<(), Box<dyn std::error::Er
     // Run this in a separate thread as we don't know if dbus or the notification
     // service on the other end are up, and we'd otherwise block for some time.
     std::thread::spawn(move || {
-        let res = async_io::block_on(async move { show_notif_impl(notif).await });
+        let res = block_on(async move { show_notif_impl(notif).await });
         if let Err(err) = res {
             log::error!("while showing notification: {:#}", err);
         }

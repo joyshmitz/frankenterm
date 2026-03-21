@@ -10,10 +10,10 @@ publish = false
 
 [dependencies]
 log.workspace = true
+promise.workspace = true
 wezterm-open-url.workspace = true
 
 [target.'cfg(all(not(windows), not(target_os="macos")))'.dependencies]
-async-io.workspace = true
 futures-util.workspace = true
 serde = {workspace=true, features = ["derive"]}
 zbus.workspace = true

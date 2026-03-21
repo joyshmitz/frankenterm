@@ -21,8 +21,6 @@ gl_generator.workspace = true
 wayland = ["wayland-client", "smithay-client-toolkit", "wayland-egl", "wayland-protocols", "wayland-backend", "wayland-protocols-plasma"]
 
 [dependencies]
-async-channel.workspace = true
-async-io.workspace = true
 async-task.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
@@ -32,6 +30,7 @@ downcast-rs.workspace = true
 thiserror.workspace = true
 bitflags.workspace = true
 euclid.workspace = true
+flume.workspace = true
 guillotiere.workspace = true
 lazy_static.workspace = true
 libloading.workspace = true

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use config::ConfigHandle;
+use flume::{Sender, bounded};
 use promise::{Future, Promise};
 use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawWindowHandle,
@@ -27,20 +28,20 @@ use smithay_client_toolkit::reexports::csd_frame::{
 };
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as XdgResizeEdge;
 use smithay_client_toolkit::seat::pointer::CursorIcon;
+use smithay_client_toolkit::shell::WaylandSurface;
+use smithay_client_toolkit::shell::xdg::XdgSurface;
 use smithay_client_toolkit::shell::xdg::fallback_frame::FallbackFrame;
 use smithay_client_toolkit::shell::xdg::window::{
     DecorationMode, Window as XdgWindow, WindowConfigure, WindowDecorations as Decorations,
     WindowHandler,
 };
-use smithay_client_toolkit::shell::xdg::XdgSurface;
-use smithay_client_toolkit::shell::WaylandSurface;
 use wayland_client::protocol::wl_callback::WlCallback;
 use wayland_client::protocol::wl_keyboard::{Event as WlKeyboardEvent, KeyState};
 use wayland_client::protocol::wl_pointer::{ButtonState, WlPointer};
 use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection as WConnection, Dispatch, Proxy, QueueHandle};
-use wayland_egl::{is_available as egl_is_available, WlEglSurface};
+use wayland_egl::{WlEglSurface, is_available as egl_is_available};
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur::OrgKdeKwinBlur;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwinBlurManager;
 use wezterm_font::FontConfiguration;
@@ -210,7 +211,7 @@ impl WaylandWindow {
         let window_id = conn.next_window_id();
         let pending_event = Arc::new(Mutex::new(PendingEvent::default()));
 
-        let (pending_first_configure, wait_configure) = async_channel::bounded(1);
+        let (pending_first_configure, wait_configure) = bounded(1);
 
         let qh = conn.event_queue.borrow().handle();
 
@@ -345,7 +346,7 @@ impl WaylandWindow {
             windows.borrow_mut().insert(window_id, inner.clone());
         };
 
-        wait_configure.recv().await?;
+        wait_configure.recv_async().await?;
 
         Ok(window_handle)
     }
@@ -580,7 +581,7 @@ pub struct WaylandWindowInner {
     pub(super) key_repeat: Option<(u32, Arc<Mutex<KeyRepeatState>>)>,
     pub(super) pending_event: Arc<Mutex<PendingEvent>>,
     pub(super) pending_mouse: Arc<Mutex<PendingMouse>>,
-    pending_first_configure: Option<async_channel::Sender<()>>,
+    pending_first_configure: Option<Sender<()>>,
     frame_callback: Option<WlCallback>,
     invalidated: bool,
     // font_config: Rc<FontConfiguration>,
