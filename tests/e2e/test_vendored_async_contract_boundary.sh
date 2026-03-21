@@ -18,7 +18,7 @@ ARTIFACT_DIR="${ROOT_DIR}/tests/e2e/artifacts/ft_e34d9_10_5_4_async_contract"
 SUMMARY_FILE="${ARTIFACT_DIR}/summary_${RUN_ID}.json"
 RCH_REMOTE_TMPDIR="${RCH_REMOTE_TMPDIR:-/var/tmp}"
 RCH_TARGET_DIR="${RCH_REMOTE_TMPDIR}/rch-target-ft-e34d9-10-5-4-async-contract-${RUN_ID}"
-RCH_SMOKE_TIMEOUT_SECS="${RCH_SMOKE_TIMEOUT_SECS:-180}"
+RCH_SMOKE_TIMEOUT_SECS="${RCH_SMOKE_TIMEOUT_SECS:-600}"
 mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}"
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"

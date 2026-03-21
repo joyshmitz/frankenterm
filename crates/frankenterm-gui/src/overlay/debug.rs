@@ -1,5 +1,6 @@
 use crate::scripting::guiwin::GuiWin;
 use chrono::prelude::*;
+use flume::{Receiver, bounded};
 use futures::FutureExt;
 use luahelper::ValuePrinter;
 use mlua::Value;
@@ -187,7 +188,7 @@ pub fn show_debug_overlay(
 
             let (host_res, text) = block_on(promise::spawn::spawn_into_main_thread(async move {
                 evaluate_trampoline(passed_host, line)
-                    .recv()
+                    .recv_async()
                     .await
                     .map_err(|e| mlua::Error::external(format!("{:#}", e)))
                     .expect("returning result not to fail")
@@ -209,13 +210,10 @@ pub fn show_debug_overlay(
 // Send.  We need to split off the actual evaluation future to
 // run separately, so we spawn it and use a channel to funnel
 // the result back to the caller without blocking the gui thread.
-fn evaluate_trampoline(
-    host: LuaReplHost,
-    expr: String,
-) -> smol::channel::Receiver<(LuaReplHost, String)> {
-    let (tx, rx) = smol::channel::bounded(1);
+fn evaluate_trampoline(host: LuaReplHost, expr: String) -> Receiver<(LuaReplHost, String)> {
+    let (tx, rx) = bounded(1);
     promise::spawn::spawn(async move {
-        let _ = tx.send(evaluate(host, expr).await).await;
+        let _ = tx.send_async(evaluate(host, expr).await).await;
     })
     .detach();
     rx

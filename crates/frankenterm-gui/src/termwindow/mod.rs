@@ -38,6 +38,7 @@ use config::{
     AudibleBell, ConfigHandle, Dimension, DimensionContext, FrontEndSelection, GeometryOrigin,
     GuiPosition, TermConfig, WindowCloseConfirmation, configuration,
 };
+use flume::{Sender, TrySendError};
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
 use mux::pane::{
@@ -52,7 +53,6 @@ use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
 use mux_lua::MuxPane;
 use promise::spawn::sleep;
-use smol::channel::Sender;
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, LinkedList};
 use std::ops::Add;
@@ -1133,7 +1133,7 @@ impl TermWindow {
     }
 
     fn dispatch_notif(&mut self, notif: TermWindowNotif, window: &Window) -> anyhow::Result<()> {
-        fn chan_err<T>(e: smol::channel::TrySendError<T>) -> anyhow::Error {
+        fn chan_err<T>(e: TrySendError<T>) -> anyhow::Error {
             anyhow::anyhow!("{}", e)
         }
 

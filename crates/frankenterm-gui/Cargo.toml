@@ -76,6 +76,7 @@ env_logger.workspace = true
 euclid.workspace = true
 fastrand.workspace = true
 finl_unicode.workspace = true
+flume.workspace = true
 futures.workspace = true
 hdrhistogram.workspace = true
 http_req.workspace = true
@@ -93,7 +94,6 @@ regex.workspace = true
 serde = { workspace = true, features = ["rc", "derive"] }
 serde_json.workspace = true
 shlex.workspace = true
-smol.workspace = true
 tempfile.workspace = true
 terminfo.workspace = true
 textwrap.workspace = true
