@@ -238,6 +238,19 @@ impl SearchBridge {
         } = request;
 
         let cancellation = cancellation.unwrap_or_default();
+        if cx.is_cancel_requested() {
+            cancellation.cancel();
+            return Err(SearchBridgeError::Cancelled {
+                reason: "capability context already cancelled".to_owned(),
+            });
+        }
+        if cancellation.is_cancelled() {
+            cx.set_cancel_requested(true);
+            return Err(SearchBridgeError::Cancelled {
+                reason: "bridge cancellation requested".to_owned(),
+            });
+        }
+
         let (timeout_done, timeout_fired, timeout_thread) =
             spawn_timeout_thread(timeout, cancellation.clone());
         let (cancel_done, cancel_thread) =
