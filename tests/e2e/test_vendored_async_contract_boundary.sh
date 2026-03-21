@@ -10,14 +10,19 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
-mkdir -p "${LOG_DIR}"
-
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="ft_e34d9_10_5_4_async_contract"
 CORRELATION_ID="ft-e34d9.10.5.4-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/vendored_async_contract_${RUN_ID}.jsonl"
-ARTIFACT_DIR="${ROOT_DIR}/tests/e2e/artifacts"
-mkdir -p "${ARTIFACT_DIR}"
+ARTIFACT_DIR="${ROOT_DIR}/tests/e2e/artifacts/ft_e34d9_10_5_4_async_contract"
+SUMMARY_FILE="${ARTIFACT_DIR}/summary_${RUN_ID}.json"
+RCH_REMOTE_TMPDIR="${RCH_REMOTE_TMPDIR:-/var/tmp}"
+RCH_TARGET_DIR="${RCH_REMOTE_TMPDIR}/rch-target-ft-e34d9-10-5-4-async-contract-${RUN_ID}"
+RCH_SMOKE_TIMEOUT_SECS="${RCH_SMOKE_TIMEOUT_SECS:-180}"
+mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}"
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${ARTIFACT_DIR}" "${RUN_ID}" "ft_e34d9_10_5_4_async_contract" "${ROOT_DIR}"
 
 # Structured log emitter
 emit_log() {
@@ -60,133 +65,127 @@ emit_log() {
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
+LAST_FAILURE_COUNT=0
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "${cmd}" >/dev/null 2>&1; then
+    emit_log "fail" "preflight" "prereq_check" "missing_prerequisite" "E2E-PREREQ" "${LOG_FILE}" "missing:${cmd}"
+    echo "missing required command: ${cmd}" >&2
+    exit 1
+  fi
+}
+
+record_failure_count() {
+  local file="$1"
+  local count
+  count=$(sed -n 's/.*; \([0-9][0-9]*\) failed;.*/\1/p' "${file}" | tail -n 1)
+  if [[ -z "${count}" ]]; then
+    count=$(grep -Ec '^test .* \.\.\. FAILED$' "${file}" || true)
+  fi
+  if [[ "${count}" -eq 0 ]]; then
+    count=1
+  fi
+  LAST_FAILURE_COUNT="${count}"
+  FAIL_COUNT=$((FAIL_COUNT + count))
+}
+
+run_rch_phase() {
+  local phase="$1"
+  local test_target="$2"
+  shift 2
+
+  local output_file="${ARTIFACT_DIR}/${phase}_${RUN_ID}.log"
+  local passed_count
+  local failed_count
+
+  emit_log "start" "${phase}" "${phase}_start" "begin" "none" "${output_file}" "${test_target}"
+
+  if run_rch_cargo_logged "${output_file}" env TMPDIR="${RCH_REMOTE_TMPDIR}" CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"; then
+    passed_count=$(grep -c '\.\.\. ok' "${output_file}" || true)
+    PASS_COUNT=$((PASS_COUNT + passed_count))
+    emit_log "pass" "${phase}" "${phase}_complete" "all_tests_passed" "none" "${output_file}" "passed=${passed_count};target=${test_target}"
+    echo "  PASS: ${phase} (${passed_count} tests passed)"
+  else
+    record_failure_count "${output_file}"
+    failed_count="${LAST_FAILURE_COUNT}"
+    emit_log "fail" "${phase}" "${phase}_complete" "cargo_test_failed" "CARGO-TEST-FAIL" "${output_file}" "failed=${failed_count};target=${test_target}"
+    echo "  FAIL: ${phase} (${failed_count} failures)"
+  fi
+}
+
+require_cmd jq
+require_cmd cargo
+
+echo "=== Preflight: rch remote-only execution ==="
+emit_log "start" "rch_preflight" "rch_preflight_start" "begin" "none" "${ARTIFACT_DIR}/rch_preflight_${RUN_ID}.log" "ensure_rch_ready"
+if (
+  ensure_rch_ready
+) >"${ARTIFACT_DIR}/rch_preflight_${RUN_ID}.log" 2>&1; then
+  emit_log "pass" "rch_preflight" "rch_preflight_complete" "rch_ready" "none" "${ARTIFACT_DIR}/rch_preflight_${RUN_ID}.log" "ensure_rch_ready"
+else
+  emit_log "fail" "rch_preflight" "rch_preflight_complete" "rch_unavailable_or_fail_open" "RCH-E100" "${ARTIFACT_DIR}/rch_preflight_${RUN_ID}.log" "ensure_rch_ready"
+  echo "rch preflight failed; refusing local cargo fallback" >&2
+  exit 2
+fi
 
 # ---- Phase 1: Structural / static analysis tests ----------------------------
 
 echo "=== Phase 1: Structural contract verification ==="
-emit_log "start" "structural" "phase1_start" "begin" "" "" "running vendored_async_contract_verification"
-
-if cargo test -p frankenterm-core \
-  --test vendored_async_contract_verification \
-  --no-default-features \
-  -- --test-threads=1 2>"${LOG_DIR}/structural_stderr_${RUN_ID}.txt" \
-  | tee "${LOG_DIR}/structural_stdout_${RUN_ID}.txt" \
-  | grep -E "^test result:" | tail -1 | grep -q '; 0 failed;'; then
-
-  STRUCTURAL_PASS=$(grep -c '... ok' "${LOG_DIR}/structural_stdout_${RUN_ID}.txt" || true)
-  PASS_COUNT=$((PASS_COUNT + STRUCTURAL_PASS))
-  emit_log "pass" "structural" "phase1_complete" "all_structural_tests_passed" "" \
-    "${LOG_DIR}/structural_stdout_${RUN_ID}.txt" "passed=${STRUCTURAL_PASS}"
-  echo "  PASS: ${STRUCTURAL_PASS} structural tests passed"
-else
-  STRUCTURAL_FAIL=$(grep -c 'FAILED' "${LOG_DIR}/structural_stdout_${RUN_ID}.txt" || true)
-  FAIL_COUNT=$((FAIL_COUNT + STRUCTURAL_FAIL))
-  emit_log "fail" "structural" "phase1_complete" "structural_tests_failed" \
-    "test_failure" "${LOG_DIR}/structural_stdout_${RUN_ID}.txt" "failed=${STRUCTURAL_FAIL}"
-  echo "  FAIL: structural tests failed (${STRUCTURAL_FAIL} failures)"
-fi
+run_rch_phase \
+  "structural" \
+  "cargo test -p frankenterm-core --test vendored_async_contract_verification --no-default-features -- --test-threads=1" \
+  test -p frankenterm-core --test vendored_async_contract_verification --no-default-features -- --test-threads=1
 
 # ---- Phase 2: Behavioral runtime tests --------------------------------------
 
 echo "=== Phase 2: Behavioral contract verification ==="
-emit_log "start" "behavioral" "phase2_start" "begin" "" "" "running vendored_async_contract_behavioral"
-
-if cargo test -p frankenterm-core \
-  --test vendored_async_contract_behavioral \
-  --no-default-features \
-  -- --test-threads=1 2>"${LOG_DIR}/behavioral_stderr_${RUN_ID}.txt" \
-  | tee "${LOG_DIR}/behavioral_stdout_${RUN_ID}.txt" \
-  | grep -E "^test result:" | tail -1 | grep -q '; 0 failed;'; then
-
-  BEHAVIORAL_PASS=$(grep -c '... ok' "${LOG_DIR}/behavioral_stdout_${RUN_ID}.txt" || true)
-  PASS_COUNT=$((PASS_COUNT + BEHAVIORAL_PASS))
-  emit_log "pass" "behavioral" "phase2_complete" "all_behavioral_tests_passed" "" \
-    "${LOG_DIR}/behavioral_stdout_${RUN_ID}.txt" "passed=${BEHAVIORAL_PASS}"
-  echo "  PASS: ${BEHAVIORAL_PASS} behavioral tests passed"
-else
-  BEHAVIORAL_FAIL=$(grep -c 'FAILED' "${LOG_DIR}/behavioral_stdout_${RUN_ID}.txt" || true)
-  FAIL_COUNT=$((FAIL_COUNT + BEHAVIORAL_FAIL))
-  emit_log "fail" "behavioral" "phase2_complete" "behavioral_tests_failed" \
-    "test_failure" "${LOG_DIR}/behavioral_stdout_${RUN_ID}.txt" "failed=${BEHAVIORAL_FAIL}"
-  echo "  FAIL: behavioral tests failed (${BEHAVIORAL_FAIL} failures)"
-fi
+run_rch_phase \
+  "behavioral" \
+  "cargo test -p frankenterm-core --test vendored_async_contract_behavioral --no-default-features -- --test-threads=1" \
+  test -p frankenterm-core --test vendored_async_contract_behavioral --no-default-features -- --test-threads=1
 
 # ---- Phase 3: Integration / compliance infrastructure -----------------------
 
 echo "=== Phase 3: Contract integration tests ==="
-emit_log "start" "integration" "phase3_start" "begin" "" "" "running vendored_async_contract_integration"
-
-if cargo test -p frankenterm-core \
-  --test vendored_async_contract_integration \
-  --no-default-features \
-  -- --test-threads=1 2>"${LOG_DIR}/integration_stderr_${RUN_ID}.txt" \
-  | tee "${LOG_DIR}/integration_stdout_${RUN_ID}.txt" \
-  | grep -E "^test result:" | tail -1 | grep -q '; 0 failed;'; then
-
-  INTEGRATION_PASS=$(grep -c '... ok' "${LOG_DIR}/integration_stdout_${RUN_ID}.txt" || true)
-  PASS_COUNT=$((PASS_COUNT + INTEGRATION_PASS))
-  emit_log "pass" "integration" "phase3_complete" "all_integration_tests_passed" "" \
-    "${LOG_DIR}/integration_stdout_${RUN_ID}.txt" "passed=${INTEGRATION_PASS}"
-  echo "  PASS: ${INTEGRATION_PASS} integration tests passed"
-else
-  INTEGRATION_FAIL=$(grep -c 'FAILED' "${LOG_DIR}/integration_stdout_${RUN_ID}.txt" || true)
-  FAIL_COUNT=$((FAIL_COUNT + INTEGRATION_FAIL))
-  emit_log "fail" "integration" "phase3_complete" "integration_tests_failed" \
-    "test_failure" "${LOG_DIR}/integration_stdout_${RUN_ID}.txt" "failed=${INTEGRATION_FAIL}"
-  echo "  FAIL: integration tests failed (${INTEGRATION_FAIL} failures)"
-fi
+run_rch_phase \
+  "integration" \
+  "cargo test -p frankenterm-core --test vendored_async_contract_integration --no-default-features -- --test-threads=1" \
+  test -p frankenterm-core --test vendored_async_contract_integration --no-default-features -- --test-threads=1
 
 # ---- Phase 4: Surface guard static analysis ---------------------------------
 
 echo "=== Phase 4: Surface guard confinement tests ==="
-emit_log "start" "surface_guard" "phase4_start" "begin" "" "" "running runtime_compat_surface_guard"
-
-if cargo test -p frankenterm-core \
-  --test runtime_compat_surface_guard \
-  --no-default-features \
-  -- --test-threads=1 2>"${LOG_DIR}/surface_guard_stderr_${RUN_ID}.txt" \
-  | tee "${LOG_DIR}/surface_guard_stdout_${RUN_ID}.txt" \
-  | grep -E "^test result:" | tail -1 | grep -q '; 0 failed;'; then
-
-  GUARD_PASS=$(grep -c '... ok' "${LOG_DIR}/surface_guard_stdout_${RUN_ID}.txt" || true)
-  PASS_COUNT=$((PASS_COUNT + GUARD_PASS))
-  emit_log "pass" "surface_guard" "phase4_complete" "all_guard_tests_passed" "" \
-    "${LOG_DIR}/surface_guard_stdout_${RUN_ID}.txt" "passed=${GUARD_PASS}"
-  echo "  PASS: ${GUARD_PASS} surface guard tests passed"
-else
-  GUARD_FAIL=$(grep -c 'FAILED' "${LOG_DIR}/surface_guard_stdout_${RUN_ID}.txt" || true)
-  FAIL_COUNT=$((FAIL_COUNT + GUARD_FAIL))
-  emit_log "fail" "surface_guard" "phase4_complete" "guard_tests_failed" \
-    "test_failure" "${LOG_DIR}/surface_guard_stdout_${RUN_ID}.txt" "failed=${GUARD_FAIL}"
-  echo "  FAIL: surface guard tests failed (${GUARD_FAIL} failures)"
-fi
+run_rch_phase \
+  "surface_guard" \
+  "cargo test -p frankenterm-core --test runtime_compat_surface_guard --no-default-features -- --test-threads=1" \
+  test -p frankenterm-core --test runtime_compat_surface_guard --no-default-features -- --test-threads=1
 
 # ---- Phase 5: Repeat-run stability (determinism) ----------------------------
 
 echo "=== Phase 5: Repeat-run stability (3 iterations) ==="
-emit_log "start" "stability" "phase5_start" "begin" "" "" "3-pass determinism check"
+emit_log "start" "stability" "phase5_start" "begin" "none" "${ARTIFACT_DIR}/stability_run1_${RUN_ID}.log" "3-pass determinism check"
 
 STABILITY_OK=true
 for iteration in 1 2 3; do
-  if ! cargo test -p frankenterm-core \
-    --test vendored_async_contract_behavioral \
-    --no-default-features \
-    -- --test-threads=1 \
-    > "${LOG_DIR}/stability_run${iteration}_${RUN_ID}.txt" 2>&1; then
+  stability_log="${ARTIFACT_DIR}/stability_run${iteration}_${RUN_ID}.log"
+  if ! run_rch_cargo_logged "${stability_log}" \
+    env TMPDIR="${RCH_REMOTE_TMPDIR}" CARGO_TARGET_DIR="${RCH_TARGET_DIR}" \
+    cargo test -p frankenterm-core --test vendored_async_contract_behavioral --no-default-features -- --test-threads=1; then
     STABILITY_OK=false
     emit_log "fail" "stability_run${iteration}" "phase5_iteration" \
       "stability_failure" "non_deterministic" \
-      "${LOG_DIR}/stability_run${iteration}_${RUN_ID}.txt" "iteration=${iteration}"
+      "${stability_log}" "iteration=${iteration}"
     echo "  FAIL: stability run ${iteration} failed"
   fi
 done
 
 if [ "${STABILITY_OK}" = true ]; then
-  emit_log "pass" "stability" "phase5_complete" "3_iterations_stable" "" "" "all_3_passed"
+  emit_log "pass" "stability" "phase5_complete" "3_iterations_stable" "none" "${ARTIFACT_DIR}" "all_3_passed"
   echo "  PASS: all 3 stability runs passed"
 else
   FAIL_COUNT=$((FAIL_COUNT + 1))
-  emit_log "fail" "stability" "phase5_complete" "stability_failure" "non_deterministic"
+  emit_log "fail" "stability" "phase5_complete" "stability_failure" "non_deterministic" "${ARTIFACT_DIR}" ""
   echo "  FAIL: repeat-run stability check failed"
 fi
 
@@ -204,6 +203,28 @@ emit_log "$([ "${FAIL_COUNT}" -eq 0 ] && echo 'pass' || echo 'fail')" \
   "total=${TOTAL},pass=${PASS_COUNT},fail=${FAIL_COUNT},skip=${SKIP_COUNT}" \
   "$([ "${FAIL_COUNT}" -eq 0 ] && echo 'none' || echo 'test_failure')" \
   "${LOG_FILE}" ""
+
+jq -cn \
+  --arg test "${SCENARIO_ID}" \
+  --arg run_id "${RUN_ID}" \
+  --arg correlation_id "${CORRELATION_ID}" \
+  --arg log_file "${LOG_FILE}" \
+  --arg artifact_dir "${ARTIFACT_DIR}" \
+  --argjson pass "${PASS_COUNT}" \
+  --argjson fail "${FAIL_COUNT}" \
+  --argjson skip "${SKIP_COUNT}" \
+  --argjson total "${TOTAL}" \
+  '{
+    test: $test,
+    run_id: $run_id,
+    correlation_id: $correlation_id,
+    pass: $pass,
+    fail: $fail,
+    skip: $skip,
+    total: $total,
+    log_file: $log_file,
+    artifact_dir: $artifact_dir
+  }' > "${SUMMARY_FILE}"
 
 if [ "${FAIL_COUNT}" -gt 0 ]; then
   echo "  VERDICT: FAIL"
