@@ -833,9 +833,10 @@ mod tests {
         pdu: &Pdu,
         serial: u64,
     ) -> std::io::Result<()> {
-        pdu.encode_async(stream, serial)
-            .await
+        let mut out = Vec::new();
+        pdu.encode(&mut out, serial)
             .map_err(|err| std::io::Error::other(err.to_string()))?;
+        stream.write_all(&out).await?;
         stream.flush().await
     }
 

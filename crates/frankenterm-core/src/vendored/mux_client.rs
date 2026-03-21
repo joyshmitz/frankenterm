@@ -157,6 +157,8 @@ pub struct DirectMuxClient {
     read_buf: Vec<u8>,
     serial: u64,
     pending_responses: HashMap<u64, Pdu>,
+    pending_render_changes: VecDeque<GetPaneRenderChangesResponse>,
+    render_change_snapshots: HashMap<u64, GetPaneRenderChangesResponse>,
     config: DirectMuxClientConfig,
     compression_mode: CompressionMode,
 }
@@ -168,6 +170,7 @@ impl std::fmt::Debug for DirectMuxClient {
             .field("socket_path", &self.socket_path)
             .field("serial", &self.serial)
             .field("pending_responses", &self.pending_responses.len())
+            .field("pending_render_changes", &self.pending_render_changes.len())
             .field("compression_mode", &self.compression_mode)
             .finish_non_exhaustive()
     }
@@ -281,6 +284,8 @@ impl DirectMuxClient {
             read_buf: Vec::new(),
             serial: 0,
             pending_responses: HashMap::new(),
+            pending_render_changes: VecDeque::new(),
+            render_change_snapshots: HashMap::new(),
             config,
         };
 
@@ -340,6 +345,8 @@ impl DirectMuxClient {
             read_buf: Vec::new(),
             serial: 0,
             pending_responses: HashMap::new(),
+            pending_render_changes: VecDeque::new(),
+            render_change_snapshots: HashMap::new(),
             config,
         };
 
@@ -416,18 +423,13 @@ impl DirectMuxClient {
         &mut self,
         pane_id: u64,
     ) -> Result<GetPaneRenderChangesResponse, DirectMuxError> {
-        let response = self
-            .send_request(Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+        let serial = self
+            .send_request_only(Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
                 pane_id: pane_id as usize,
             }))
             .await?;
-        match response {
-            Pdu::GetPaneRenderChangesResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "GetPaneRenderChangesResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
-        }
+        let response = self.await_response(serial).await?;
+        self.resolve_render_change_response(pane_id, response)
     }
 
     /// Poll render changes using an explicit capability context.
@@ -437,21 +439,16 @@ impl DirectMuxClient {
         cx: &Cx,
         pane_id: u64,
     ) -> Result<GetPaneRenderChangesResponse, DirectMuxError> {
-        let response = self
-            .send_request_with_cx(
+        let serial = self
+            .send_request_only_with_cx(
                 cx,
                 Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
                     pane_id: pane_id as usize,
                 }),
             )
             .await?;
-        match response {
-            Pdu::GetPaneRenderChangesResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "GetPaneRenderChangesResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
-        }
+        let response = self.await_response_with_cx(cx, serial).await?;
+        self.resolve_render_change_response(pane_id, response)
     }
 
     /// Fetch specific lines from a pane's scrollback.
@@ -1079,6 +1076,10 @@ impl DirectMuxClient {
             if decoded.serial == serial {
                 return Self::response_from_pdu(decoded.pdu);
             }
+            if decoded.serial == 0 {
+                self.stash_unilateral_pdu(decoded.pdu);
+                continue;
+            }
             tracing::trace!(
                 connection_id = self.connection_id,
                 request_serial = serial,
@@ -1111,6 +1112,10 @@ impl DirectMuxClient {
             if decoded.serial == serial {
                 return Self::response_from_pdu(decoded.pdu);
             }
+            if decoded.serial == 0 {
+                self.stash_unilateral_pdu(decoded.pdu);
+                continue;
+            }
             tracing::trace!(
                 connection_id = self.connection_id,
                 request_serial = serial,
@@ -1127,6 +1132,96 @@ impl DirectMuxClient {
         match pdu {
             Pdu::ErrorResponse(err) => Err(DirectMuxError::RemoteError(err.reason)),
             other => Ok(other),
+        }
+    }
+
+    fn resolve_render_change_response(
+        &mut self,
+        pane_id: u64,
+        response: Pdu,
+    ) -> Result<GetPaneRenderChangesResponse, DirectMuxError> {
+        match response {
+            Pdu::GetPaneRenderChangesResponse(payload) => {
+                self.remember_render_change_snapshot(&payload);
+                Ok(payload)
+            }
+            Pdu::LivenessResponse(liveness) => {
+                if liveness.pane_id as u64 != pane_id {
+                    return Err(DirectMuxError::UnexpectedResponse {
+                        expected: format!("LivenessResponse for pane {pane_id}"),
+                        got: format!("LivenessResponse for pane {}", liveness.pane_id),
+                    });
+                }
+                if !liveness.is_alive {
+                    return Err(DirectMuxError::RemoteError(format!(
+                        "pane {pane_id} is not alive"
+                    )));
+                }
+                if let Some(payload) = self.take_pending_render_change(pane_id) {
+                    return Ok(payload);
+                }
+                self.render_change_snapshots
+                    .get(&pane_id)
+                    .map(|cached| Self::idle_render_snapshot(cached))
+                    .ok_or_else(|| DirectMuxError::UnexpectedResponse {
+                        expected: format!(
+                            "GetPaneRenderChangesResponse or cached render snapshot for pane {pane_id}"
+                        ),
+                        got: "LivenessResponse without accompanying render delta".to_string(),
+                    })
+            }
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "LivenessResponse or GetPaneRenderChangesResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
+    }
+
+    fn stash_unilateral_pdu(&mut self, pdu: Pdu) {
+        match pdu {
+            Pdu::GetPaneRenderChangesResponse(payload) => {
+                self.remember_render_change_snapshot(&payload);
+                self.pending_render_changes.push_back(payload);
+            }
+            other => {
+                tracing::trace!(
+                    connection_id = self.connection_id,
+                    response_pdu = other.pdu_name(),
+                    phase = "unilateral_drop",
+                    "ignoring unsupported unilateral mux PDU"
+                );
+            }
+        }
+    }
+
+    fn take_pending_render_change(&mut self, pane_id: u64) -> Option<GetPaneRenderChangesResponse> {
+        let idx = self
+            .pending_render_changes
+            .iter()
+            .position(|payload| payload.pane_id as u64 == pane_id)?;
+        self.pending_render_changes.remove(idx)
+    }
+
+    fn remember_render_change_snapshot(&mut self, payload: &GetPaneRenderChangesResponse) {
+        self.render_change_snapshots
+            .insert(payload.pane_id as u64, Self::idle_render_snapshot(payload));
+    }
+
+    fn idle_render_snapshot(
+        payload: &GetPaneRenderChangesResponse,
+    ) -> GetPaneRenderChangesResponse {
+        GetPaneRenderChangesResponse {
+            pane_id: payload.pane_id,
+            mouse_grabbed: payload.mouse_grabbed,
+            cursor_position: payload.cursor_position,
+            dimensions: payload.dimensions,
+            tiered_scrollback_status: payload.tiered_scrollback_status,
+            dirty_lines: Vec::new(),
+            title: payload.title.clone(),
+            working_dir: payload.working_dir.clone(),
+            bonus_lines: Vec::new().into(),
+            input_serial: None,
+            seqno: payload.seqno,
         }
     }
 
@@ -1966,6 +2061,18 @@ mod tests {
         }
     }
 
+    async fn write_response_pdu(
+        stream: &mut compat_unix::UnixStream,
+        pdu: &Pdu,
+        serial: u64,
+    ) -> std::io::Result<()> {
+        let mut out = Vec::new();
+        pdu.encode(&mut out, serial)
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        stream.write_all(&out).await?;
+        stream.flush().await
+    }
+
     #[test]
     fn decode_from_buffer_roundtrip() {
         let mut buf = Vec::new();
@@ -2355,6 +2462,230 @@ mod tests {
         });
     }
 
+    #[test]
+    fn get_pane_render_changes_accepts_unilateral_render_delta_after_liveness() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("render-delta-sideband.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                let response =
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "sideband-render-test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                    });
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write codec response");
+                            }
+                            Pdu::SetClientId(_) => {
+                                let response = Pdu::UnitResponse(UnitResponse {});
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write client response");
+                            }
+                            Pdu::GetPaneRenderChanges(request) => {
+                                let sideband = Pdu::GetPaneRenderChangesResponse(
+                                    GetPaneRenderChangesResponse {
+                                        pane_id: request.pane_id,
+                                        mouse_grabbed: false,
+                                        cursor_position:
+                                            mux::renderable::StableCursorPosition::default(),
+                                        dimensions: mux::renderable::RenderableDimensions {
+                                            cols: 80,
+                                            viewport_rows: 24,
+                                            scrollback_rows: 0,
+                                            physical_top: 0,
+                                            scrollback_top: 0,
+                                            dpi: 96,
+                                            pixel_width: 0,
+                                            pixel_height: 0,
+                                            reverse_video: false,
+                                        },
+                                        tiered_scrollback_status: None,
+                                        dirty_lines: vec![0..1],
+                                        title: "sideband-pane".to_string(),
+                                        working_dir: None,
+                                        bonus_lines: Vec::new().into(),
+                                        input_serial: None,
+                                        seqno: 9,
+                                    },
+                                );
+                                write_response_pdu(&mut stream, &sideband, 0)
+                                    .await
+                                    .expect("write sideband render response");
+
+                                let liveness = Pdu::LivenessResponse(codec::LivenessResponse {
+                                    pane_id: request.pane_id,
+                                    is_alive: true,
+                                });
+                                write_response_pdu(&mut stream, &liveness, decoded.serial)
+                                    .await
+                                    .expect("write liveness response");
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            let render = client
+                .get_pane_render_changes(12)
+                .await
+                .expect("sideband render changes should succeed");
+            assert_eq!(render.pane_id, 12);
+            assert_eq!(render.seqno, 9);
+            assert_eq!(render.title, "sideband-pane");
+            assert_eq!(render.dirty_lines, vec![0..1]);
+
+            drop(client);
+            server.await.expect("server task");
+        });
+    }
+
+    #[test]
+    fn get_pane_render_changes_reuses_cached_snapshot_when_liveness_has_no_delta() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("render-delta-cache.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut render_requests = 0usize;
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                let response =
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "cached-render-test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                    });
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write codec response");
+                            }
+                            Pdu::SetClientId(_) => {
+                                let response = Pdu::UnitResponse(UnitResponse {});
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write client response");
+                            }
+                            Pdu::GetPaneRenderChanges(request) => {
+                                render_requests += 1;
+                                if render_requests == 1 {
+                                    let sideband = Pdu::GetPaneRenderChangesResponse(
+                                        GetPaneRenderChangesResponse {
+                                            pane_id: request.pane_id,
+                                            mouse_grabbed: false,
+                                            cursor_position:
+                                                mux::renderable::StableCursorPosition::default(),
+                                            dimensions: mux::renderable::RenderableDimensions {
+                                                cols: 120,
+                                                viewport_rows: 40,
+                                                scrollback_rows: 200,
+                                                physical_top: 10,
+                                                scrollback_top: 0,
+                                                dpi: 96,
+                                                pixel_width: 0,
+                                                pixel_height: 0,
+                                                reverse_video: false,
+                                            },
+                                            tiered_scrollback_status: None,
+                                            dirty_lines: vec![10..12],
+                                            title: "cached-pane".to_string(),
+                                            working_dir: None,
+                                            bonus_lines: Vec::new().into(),
+                                            input_serial: None,
+                                            seqno: 14,
+                                        },
+                                    );
+                                    write_response_pdu(&mut stream, &sideband, 0)
+                                        .await
+                                        .expect("write first sideband");
+                                }
+
+                                let liveness = Pdu::LivenessResponse(codec::LivenessResponse {
+                                    pane_id: request.pane_id,
+                                    is_alive: true,
+                                });
+                                write_response_pdu(&mut stream, &liveness, decoded.serial)
+                                    .await
+                                    .expect("write liveness response");
+
+                                if render_requests == 2 {
+                                    return;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+
+            let first = client
+                .get_pane_render_changes(27)
+                .await
+                .expect("first render changes should succeed");
+            assert_eq!(first.seqno, 14);
+            assert_eq!(first.dirty_lines, vec![10..12]);
+
+            let second = client
+                .get_pane_render_changes(27)
+                .await
+                .expect("cached render snapshot should be reused");
+            assert_eq!(second.seqno, 14);
+            assert!(second.dirty_lines.is_empty());
+            assert!(second.bonus_lines.extract_data().0.is_empty());
+            assert_eq!(second.title, "cached-pane");
+            assert_eq!(second.dimensions.cols, 120);
+
+            drop(client);
+            server.await.expect("server task");
+        });
+    }
+
     #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn request_methods_with_cx_reject_unexpected_response_types() {
@@ -2620,18 +2951,15 @@ mod tests {
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
                                     });
-                                let mut out = Vec::new();
-                                response
-                                    .encode(&mut out, decoded.serial)
-                                    .expect("encode response");
-                                stream.write_all(&out).await.expect("write response");
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write response");
                             }
                             Pdu::SetClientId(_) => {
-                                let mut out = Vec::new();
-                                Pdu::UnitResponse(UnitResponse {})
-                                    .encode(&mut out, decoded.serial)
-                                    .expect("encode response");
-                                stream.write_all(&out).await.expect("write response");
+                                let response = Pdu::UnitResponse(UnitResponse {});
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write response");
                             }
                             Pdu::GetPaneRenderChanges(request) => {
                                 batch_requests.push((decoded.serial, request.pane_id));
@@ -2665,11 +2993,9 @@ mod tests {
                                                 seqno: idx + 1,
                                             },
                                         );
-                                        let mut out = Vec::new();
-                                        response
-                                            .encode(&mut out, *serial)
-                                            .expect("encode response");
-                                        stream.write_all(&out).await.expect("write response");
+                                        write_response_pdu(&mut stream, &response, *serial)
+                                            .await
+                                            .expect("write response");
                                     }
                                     return;
                                 }
@@ -2734,18 +3060,15 @@ mod tests {
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
                                     });
-                                let mut out = Vec::new();
-                                response
-                                    .encode(&mut out, decoded.serial)
-                                    .expect("encode response");
-                                stream.write_all(&out).await.expect("write response");
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write response");
                             }
                             Pdu::SetClientId(_) => {
-                                let mut out = Vec::new();
-                                Pdu::UnitResponse(UnitResponse {})
-                                    .encode(&mut out, decoded.serial)
-                                    .expect("encode response");
-                                stream.write_all(&out).await.expect("write response");
+                                let response = Pdu::UnitResponse(UnitResponse {});
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write response");
                             }
                             Pdu::GetPaneRenderChanges(request) => {
                                 batch_requests.push((decoded.serial, request.pane_id));
@@ -2779,11 +3102,9 @@ mod tests {
                                                 seqno: idx + 1,
                                             },
                                         );
-                                        let mut out = Vec::new();
-                                        response
-                                            .encode(&mut out, *serial)
-                                            .expect("encode response");
-                                        stream.write_all(&out).await.expect("write response");
+                                        write_response_pdu(&mut stream, &response, *serial)
+                                            .await
+                                            .expect("write response");
                                     }
                                     return;
                                 }
@@ -2851,18 +3172,15 @@ mod tests {
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
                                     });
-                                let mut out = Vec::new();
-                                response
-                                    .encode(&mut out, decoded.serial)
-                                    .expect("encode response");
-                                stream.write_all(&out).await.expect("write response");
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write response");
                             }
                             Pdu::SetClientId(_) => {
-                                let mut out = Vec::new();
-                                Pdu::UnitResponse(UnitResponse {})
-                                    .encode(&mut out, decoded.serial)
-                                    .expect("encode response");
-                                stream.write_all(&out).await.expect("write response");
+                                let response = Pdu::UnitResponse(UnitResponse {});
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write response");
                             }
                             Pdu::GetPaneRenderChanges(request) => {
                                 let response = Pdu::GetPaneRenderChangesResponse(
@@ -2891,11 +3209,9 @@ mod tests {
                                         seqno: request.pane_id,
                                     },
                                 );
-                                let mut out = Vec::new();
-                                response
-                                    .encode(&mut out, decoded.serial)
-                                    .expect("encode response");
-                                stream.write_all(&out).await.expect("write response");
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write response");
                             }
                             _ => {}
                         }
@@ -2956,18 +3272,15 @@ mod tests {
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
                                     });
-                                let mut out = Vec::new();
-                                response
-                                    .encode(&mut out, decoded.serial)
-                                    .expect("encode response");
-                                stream.write_all(&out).await.expect("write response");
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write response");
                             }
                             Pdu::SetClientId(_) => {
-                                let mut out = Vec::new();
-                                Pdu::UnitResponse(UnitResponse {})
-                                    .encode(&mut out, decoded.serial)
-                                    .expect("encode response");
-                                stream.write_all(&out).await.expect("write response");
+                                let response = Pdu::UnitResponse(UnitResponse {});
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write response");
                             }
                             Pdu::GetPaneRenderChanges(request) => {
                                 let response = Pdu::GetPaneRenderChangesResponse(
@@ -2996,11 +3309,9 @@ mod tests {
                                         seqno: request.pane_id,
                                     },
                                 );
-                                let mut out = Vec::new();
-                                response
-                                    .encode(&mut out, decoded.serial)
-                                    .expect("encode response");
-                                stream.write_all(&out).await.expect("write response");
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write response");
                             }
                             _ => {}
                         }
@@ -3092,11 +3403,9 @@ mod tests {
                             _ => continue,
                         };
 
-                        let mut out = Vec::new();
-                        response
-                            .encode(&mut out, decoded.serial)
-                            .expect("encode response");
-                        stream.write_all(&out).await.expect("write response");
+                        write_response_pdu(&mut stream, &response, decoded.serial)
+                            .await
+                            .expect("write response");
 
                         if render_serials.len() == expected_requests {
                             return render_serials;

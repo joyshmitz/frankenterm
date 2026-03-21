@@ -221,14 +221,18 @@ fn build_loader(settings: &McpClientConfig) -> FrameworkConfigLoader {
         FrameworkConfigLoader::new()
     } else {
         let mut paths = settings.discovery_paths.iter();
-        let first = paths
-            .next()
-            .expect("discovery_paths must be non-empty when default paths are disabled");
-        let mut loader = FrameworkConfigLoader::from_path(first.clone());
-        for path in paths {
-            loader = loader.with_path(path.clone());
+        if let Some(first) = paths.next() {
+            let mut loader = FrameworkConfigLoader::from_path(first.clone());
+            for path in paths {
+                loader = loader.with_path(path.clone());
+            }
+            return loader;
+        } else {
+            // If default paths are disabled and no custom paths are provided,
+            // return a loader pointing to a nonexistent path to ensure it finds nothing,
+            // rather than panicking. (The caller should ideally guard against this).
+            return FrameworkConfigLoader::from_path("/dev/null");
         }
-        return loader;
     };
 
     for path in settings.discovery_paths.iter().rev() {
