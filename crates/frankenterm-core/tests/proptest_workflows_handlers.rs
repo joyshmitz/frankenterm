@@ -6,6 +6,7 @@
 // and FallbackNextStepPlan.
 #![allow(clippy::ignored_unit_patterns)]
 
+#[cfg(feature = "browser")]
 use std::path::PathBuf;
 
 use proptest::prelude::*;
