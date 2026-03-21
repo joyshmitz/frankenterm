@@ -177,8 +177,15 @@ impl ByteCompressor {
         let compressed = self.compress_with_level(input, level);
 
         if self.config.include_size_prefix {
+            let input_len: u32 = input.len().try_into().unwrap_or_else(|_| {
+                tracing::error!(
+                    input_len = input.len(),
+                    "input exceeds u32::MAX for size prefix, truncating"
+                );
+                u32::MAX
+            });
             let mut result = Vec::with_capacity(4 + compressed.len());
-            result.extend_from_slice(&(input.len() as u32).to_le_bytes());
+            result.extend_from_slice(&input_len.to_le_bytes());
             result.extend_from_slice(&compressed);
             result
         } else {
@@ -315,7 +322,15 @@ impl ByteCompressor {
             .and_then(|mut c| c.compress(input));
         match result {
             Ok(compressed) => compressed,
-            Err(_) => input.to_vec(), // Fallback: return uncompressed
+            Err(err) => {
+                tracing::warn!(
+                    input_len = input.len(),
+                    level,
+                    error = %err,
+                    "zstd compression failed, returning uncompressed — decompression will fail"
+                );
+                input.to_vec()
+            }
         }
     }
 

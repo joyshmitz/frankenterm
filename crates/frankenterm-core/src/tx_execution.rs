@@ -321,7 +321,13 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             } else {
                 TxPhase::Aborted
             };
-            let _ = ledger.transition_phase(terminal_phase);
+            if let Err(err) = ledger.transition_phase(terminal_phase) {
+                tracing::warn!(
+                    phase = ?terminal_phase,
+                    error = %err,
+                    "failed to transition ledger to terminal phase"
+                );
+            }
         }
 
         // Emit completion event
@@ -609,13 +615,19 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 },
             };
 
-            let _ = ledger.append(
+            if let Err(err) = ledger.append(
                 idem_key,
                 outcome,
                 crate::tx_plan_compiler::StepRisk::Low,
                 &format!("agent-{}", step_result.step_id.0),
                 now_ms as u64,
-            );
+            ) {
+                tracing::warn!(
+                    step_id = %step_result.step_id.0,
+                    error = %err,
+                    "failed to record commit step result in idempotency ledger"
+                );
+            }
 
             let event_kind = if step_result.outcome.is_committed() {
                 TxEventKind::StepCommitted
@@ -681,13 +693,19 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     }
                 };
 
-                let _ = ledger.append(
+                if let Err(err) = ledger.append(
                     idem_key,
                     outcome,
                     crate::tx_plan_compiler::StepRisk::Low,
                     &format!("agent-{step_id}"),
                     now_ms as u64,
-                );
+                ) {
+                    tracing::warn!(
+                        step_id = %step_id,
+                        error = %err,
+                        "failed to record compensation step result in idempotency ledger"
+                    );
+                }
 
                 events.push(self.make_event(
                     TxEventKind::StepCompensated,

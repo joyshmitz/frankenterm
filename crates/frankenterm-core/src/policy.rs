@@ -2140,7 +2140,9 @@ impl RateLimiter {
 }
 
 fn prune_old(timestamps: &mut Vec<Instant>, window_start: Instant) {
-    timestamps.retain(|t| *t > window_start);
+    // Use >= to include timestamps exactly at the window boundary,
+    // preventing an off-by-one that would shrink the effective window.
+    timestamps.retain(|t| *t >= window_start);
 }
 
 fn retry_after(now: Instant, timestamps: &[Instant]) -> Duration {
