@@ -428,7 +428,7 @@ proptest! {
         prop_assert_eq!(tree.get(&id).unwrap().state, ScopeState::Draining);
         prop_assert_eq!(tree.get(&id).unwrap().shutdown_requested_at_ms, Some(ts + 200));
 
-        tree.finalize(&id).unwrap();
+        tree.finalize(&id, ts + 200).unwrap();
         prop_assert_eq!(tree.get(&id).unwrap().state, ScopeState::Finalizing);
 
         tree.close(&id, ts + 300).unwrap();
@@ -481,7 +481,7 @@ proptest! {
         let id = ScopeId("s".into());
         tree.register(id.clone(), ScopeTier::Daemon, &ScopeId::root(), "s", ts).unwrap();
         // Cannot finalize from Created
-        let err = tree.finalize(&id);
+        let err = tree.finalize(&id, ts);
         let is_invalid = matches!(err, Err(ScopeTreeError::InvalidTransition { .. }));
         prop_assert!(is_invalid);
     }
@@ -506,7 +506,7 @@ proptest! {
         let ghost = ScopeId("ghost".into());
         let start_err = matches!(tree.start(&ghost, ts), Err(ScopeTreeError::ScopeNotFound { .. }));
         let shutdown_err = matches!(tree.request_shutdown(&ghost, ts), Err(ScopeTreeError::ScopeNotFound { .. }));
-        let finalize_err = matches!(tree.finalize(&ghost), Err(ScopeTreeError::ScopeNotFound { .. }));
+        let finalize_err = matches!(tree.finalize(&ghost, ts), Err(ScopeTreeError::ScopeNotFound { .. }));
         let close_err = matches!(tree.close(&ghost, ts), Err(ScopeTreeError::ScopeNotFound { .. }));
         prop_assert!(start_err);
         prop_assert!(shutdown_err);
@@ -532,7 +532,7 @@ proptest! {
         }
 
         tree.request_shutdown(&parent, ts + 100).unwrap();
-        let result = tree.finalize(&parent);
+        let result = tree.finalize(&parent, ts + 100);
         let has_live = matches!(result, Err(ScopeTreeError::HasLiveChildren { .. }));
         prop_assert!(has_live, "finalize must fail with {} live children", num_children);
     }
@@ -559,12 +559,12 @@ proptest! {
         for i in 0..num_children {
             let cid = ScopeId(format!("c{i}"));
             tree.request_shutdown(&cid, ts + 101).unwrap();
-            tree.finalize(&cid).unwrap();
+            tree.finalize(&cid, ts + 101).unwrap();
             tree.close(&cid, ts + 102).unwrap();
         }
 
         // Now parent can finalize
-        tree.finalize(&parent).unwrap();
+        tree.finalize(&parent, ts + 150).unwrap();
         tree.close(&parent, ts + 200).unwrap();
         let is_closed = tree.get(&parent).unwrap().state.is_terminal();
         prop_assert!(is_closed);
@@ -631,7 +631,7 @@ proptest! {
         tree.start(&ScopeId::root(), ts).unwrap();
         tree.start(&id, ts + 1).unwrap();
         tree.request_shutdown(&id, ts + 2).unwrap();
-        tree.finalize(&id).unwrap();
+        tree.finalize(&id, ts + 2).unwrap();
         tree.close(&id, ts + 3).unwrap();
 
         let order = tree.shutdown_order();

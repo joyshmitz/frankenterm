@@ -306,7 +306,7 @@ proptest! {
         tree.register(scope.clone(), ScopeTier::Daemon, &ScopeId::root(), "z", 1000).unwrap();
         tree.start(&scope, 1100).unwrap();
         tree.request_shutdown(&scope, 2000).unwrap();
-        tree.finalize(&scope).unwrap();
+        tree.finalize(&scope, 2000).unwrap();
 
         // Check at shutdown_time + elapsed
         let check_ms = 2000 + elapsed_ms;

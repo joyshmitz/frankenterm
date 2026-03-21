@@ -1,4 +1,5 @@
 //! Property-based tests for robot_types module.
+#![allow(dead_code)]
 //!
 //! Verifies invariants for:
 //! - ErrorCode: `robot.*` parse/as_str roundtrip,

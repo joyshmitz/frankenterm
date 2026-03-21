@@ -979,7 +979,8 @@ fn search_result_empty_hits_count_consistency() {
 #[cfg(feature = "cass-export")]
 mod cass_export_tests {
     use super::*;
-    use proptest::prelude::*;
+    // Removed unused import
+
 
     fn arb_export_query() -> impl Strategy<Value = CassExportQuery> {
         (
