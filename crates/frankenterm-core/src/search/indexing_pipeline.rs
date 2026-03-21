@@ -407,7 +407,7 @@ impl ContentIndexingPipeline {
                     entry.1 = doc.captured_at_ms;
                 }
                 if entry.0.is_none() {
-                    entry.0 = doc.session_id.clone();
+                    entry.0.clone_from(&doc.session_id);
                 }
             }
             handled_by_pane

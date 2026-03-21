@@ -304,7 +304,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         };
 
         // Determine final outcome
-        let (final_state, outcome) = self.determine_final_outcome(
+        let (final_state, outcome) = Self::determine_final_outcome(
             contract.lifecycle_state,
             &commit_report,
             compensation_report.as_ref(),
@@ -705,7 +705,6 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     fn determine_final_outcome(
-        &self,
         current_state: MissionTxState,
         commit_report: &TxCommitReport,
         compensation_report: Option<&TxCompensationReport>,

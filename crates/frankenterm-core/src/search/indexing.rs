@@ -283,7 +283,7 @@ struct FlushOutcome {
 
 /// Detailed ingest outcome used by higher-level pipeline accounting.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct IngestOutcome {
+pub struct IngestOutcome {
     pub(crate) report: IndexingIngestReport,
     pub(crate) accepted_docs_by_pane: HashMap<u64, u64>,
 }
