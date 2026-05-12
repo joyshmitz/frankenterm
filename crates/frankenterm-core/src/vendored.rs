@@ -143,6 +143,7 @@ fn compatibility_report_with(
     let vendored_enabled = meta.enabled;
     let vendored_commit = meta.commit.clone();
     let vendored_version = meta.version.clone();
+    let vendored_source = meta.source.clone();
     let local_version = local.map(|v| v.raw.clone());
     let local_commit = local.and_then(|v| v.commit.clone());
 
@@ -196,6 +197,22 @@ fn compatibility_report_with(
 
     let vendored_commit = vendored_commit.unwrap_or_default();
 
+    if is_local_path_sentinel(&vendored_commit) {
+        return VendoredCompatibilityReport {
+            status: VendoredCompatibilityStatus::Compatible,
+            vendored_enabled,
+            allow_vendored: false,
+            local_version,
+            local_commit,
+            vendored_commit: Some(vendored_commit),
+            vendored_version,
+            message: "vendored source was built from path dependencies without a recorded WezTerm commit; direct vendored backend remains disabled".to_string(),
+            recommendation: Some(
+                "Build from a nested vendored WezTerm git checkout or a Cargo.lock git source to enable direct vendored mux streaming".to_string(),
+            ),
+        };
+    }
+
     if local_commit.is_none() {
         return VendoredCompatibilityReport {
             status: VendoredCompatibilityStatus::Incompatible,
@@ -225,6 +242,27 @@ fn compatibility_report_with(
             vendored_version,
             message: "local WezTerm commit matches vendored build".to_string(),
             recommendation: None,
+        };
+    }
+
+    if vendored_source
+        .as_deref()
+        .is_some_and(|source| source.starts_with("provenance+"))
+    {
+        return VendoredCompatibilityReport {
+            status: VendoredCompatibilityStatus::Compatible,
+            vendored_enabled,
+            allow_vendored: false,
+            local_version,
+            local_commit: Some(local_commit.clone()),
+            vendored_commit: Some(vendored_commit.clone()),
+            vendored_version,
+            message: format!(
+                "vendored source is a FrankenTerm-owned path dependency recorded by provenance {vendored_commit}; local WezTerm commit {local_commit} does not match, so direct vendored backend remains disabled"
+            ),
+            recommendation: Some(
+                "Use a local WezTerm/FrankenTerm mux build matching the recorded provenance commit to enable direct vendored mux streaming".to_string(),
+            ),
         };
     }
 
@@ -287,6 +325,10 @@ fn commit_matches(vendored: &str, local: &str) -> bool {
     vendored.starts_with(local) || local.starts_with(vendored)
 }
 
+fn is_local_path_sentinel(commit: &str) -> bool {
+    commit.starts_with("local-path-build-")
+}
+
 fn extract_commit(raw: &str) -> Option<String> {
     let mut candidate: Option<&str> = None;
     for token in raw.split(|c: char| !c.is_ascii_hexdigit()) {
@@ -313,6 +355,19 @@ mod tests {
             commit: commit.map(str::to_string),
             version: Some("0.1.0".to_string()),
             source: None,
+            enabled,
+        }
+    }
+
+    fn meta_with_source(
+        commit: Option<&str>,
+        source: Option<&str>,
+        enabled: bool,
+    ) -> VendoredWeztermMetadata {
+        VendoredWeztermMetadata {
+            commit: commit.map(str::to_string),
+            version: Some("0.1.0".to_string()),
+            source: source.map(str::to_string),
             enabled,
         }
     }
@@ -357,6 +412,38 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("Update WezTerm")
+        );
+    }
+
+    #[test]
+    fn compatibility_path_sentinel_disables_vendored_without_error_status() {
+        let meta = meta_with(Some("local-path-build-0123456789abcdef"), true);
+        let local = WeztermVersion::parse("wezterm 20240101-123456-deadbeef");
+        let report = compatibility_report_with(meta, Some(&local));
+        assert_eq!(report.status, VendoredCompatibilityStatus::Compatible);
+        assert!(!report.allow_vendored);
+        assert!(report.message.contains("path dependencies"));
+        assert!(report.message.contains("disabled"));
+    }
+
+    #[test]
+    fn compatibility_provenance_mismatch_disables_vendored_without_error_status() {
+        let meta = meta_with_source(
+            Some("577474d89ee61aef4a48145cdec82a638d874751"),
+            Some(
+                "provenance+/repo/frankenterm/PROVENANCE.md#577474d89ee61aef4a48145cdec82a638d874751",
+            ),
+            true,
+        );
+        let local = WeztermVersion::parse("wezterm 20240203-110809-5046fc22");
+        let report = compatibility_report_with(meta, Some(&local));
+        assert_eq!(report.status, VendoredCompatibilityStatus::Compatible);
+        assert!(!report.allow_vendored);
+        assert!(report.message.contains("provenance"));
+        assert!(
+            report
+                .message
+                .contains("direct vendored backend remains disabled")
         );
     }
 

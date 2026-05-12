@@ -22,8 +22,10 @@ fn main() {
     // Path-dep layout: refresh metadata when vendored mux/term manifests change.
     let mux_manifest = vendored_root.join("mux").join("Cargo.toml");
     let term_manifest = vendored_root.join("term").join("Cargo.toml");
+    let provenance_path = vendored_root.join("PROVENANCE.md");
     println!("cargo:rerun-if-changed={}", mux_manifest.display());
     println!("cargo:rerun-if-changed={}", term_manifest.display());
+    println!("cargo:rerun-if-changed={}", provenance_path.display());
 
     let packages = fs::read_to_string(&lock_path)
         .map(|contents| parse_lock_packages(&contents))
@@ -123,13 +125,15 @@ fn select_vendored_metadata(
     }
 
     // Fallback: default workspace layout ships `mux`/`frankenterm-term` as path
-    // dependencies, so Cargo.lock has no `source` field. Resolve the vendored
-    // commit by probing the vendored tree itself. If the workspace isn't a git
-    // checkout (cargo-install tarball, release bundle), emit a deterministic
-    // sentinel derived from the vendored manifests so `vendored.rs` doesn't
-    // trip its fail-closed "commit not recorded" guard.
-    let commit = git_head_commit(vendored_root).or_else(|| source_hash_sentinel(vendored_root));
-    let resolved_source = source.or_else(|| Some(format!("path+{}", vendored_root.display())));
+    // dependencies, so Cargo.lock has no `source` field. Only trust `git` when
+    // the vendored tree is its own checkout/submodule; otherwise `git -C
+    // frankenterm rev-parse HEAD` walks up to the FrankenTerm repo and returns
+    // the wrong project commit. When no nested vendored checkout exists, use
+    // the vendored provenance record, then finally a local path sentinel.
+    let (commit, source_from_path) = path_dep_vendored_metadata(vendored_root);
+    let resolved_source = source
+        .or(source_from_path)
+        .or_else(|| Some(format!("path+{}", vendored_root.display())));
 
     // When falling back to the filesystem, prefer the mux manifest version
     // (matches the `mux` lockfile entry name lookup above). This keeps the
@@ -148,15 +152,51 @@ fn extract_commit(source: &str) -> Option<String> {
     }
 }
 
+fn path_dep_vendored_metadata(vendored_root: &Path) -> (Option<String>, Option<String>) {
+    if let Some(commit) = git_head_commit(vendored_root) {
+        return (
+            Some(commit),
+            Some(format!("git+file://{}", vendored_root.display())),
+        );
+    }
+
+    if let Some(commit) = provenance_reference_commit(vendored_root) {
+        return (
+            Some(commit.clone()),
+            Some(format!(
+                "provenance+{}#{}",
+                vendored_root.join("PROVENANCE.md").display(),
+                commit
+            )),
+        );
+    }
+
+    let sentinel = source_hash_sentinel(vendored_root);
+    let source = sentinel
+        .as_ref()
+        .map(|_| format!("path+{}", vendored_root.display()));
+    (sentinel, source)
+}
+
 fn git_head_commit(dir: &Path) -> Option<String> {
-    if !dir.join(".git").exists() && !dir.join("../.git").exists() {
-        // Fast rejection: neither the vendored tree nor its parent is a git
-        // checkout. Still try `git rev-parse` below in case the user uses a
-        // worktree or unconventional `.git` location — but short-circuit the
-        // usual cargo-install tarball case to avoid spawning git needlessly.
-        if !has_git_ancestor(dir) {
-            return None;
-        }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let top_level = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if top_level.is_empty() {
+        return None;
+    }
+    let top_level = canonical_path(Path::new(&top_level))?;
+    let vendored_root = canonical_path(dir)?;
+    if top_level != vendored_root {
+        return None;
     }
 
     let output = Command::new("git")
@@ -177,15 +217,30 @@ fn git_head_commit(dir: &Path) -> Option<String> {
     }
 }
 
-fn has_git_ancestor(dir: &Path) -> bool {
-    let mut cursor: Option<PathBuf> = Some(dir.to_path_buf());
-    while let Some(path) = cursor {
-        if path.join(".git").exists() {
-            return true;
+fn canonical_path(path: &Path) -> Option<PathBuf> {
+    path.canonicalize().ok()
+}
+
+fn provenance_reference_commit(vendored_root: &Path) -> Option<String> {
+    let provenance = fs::read_to_string(vendored_root.join("PROVENANCE.md")).ok()?;
+    parse_provenance_reference_commit(&provenance)
+}
+
+fn parse_provenance_reference_commit(provenance: &str) -> Option<String> {
+    for label in ["Reference commit:", "Initial import reference:"] {
+        for line in provenance.lines() {
+            let trimmed = line.trim();
+            let Some(value) = trimmed.strip_prefix(label) else {
+                continue;
+            };
+            let value = value.trim();
+            let value = value.trim_matches('`').trim();
+            if value.len() >= 7 && value.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some(value.to_string());
+            }
         }
-        cursor = path.parent().map(Path::to_path_buf);
     }
-    false
+    None
 }
 
 fn read_manifest_version(crate_dir: &Path) -> Option<String> {
@@ -288,14 +343,80 @@ mod tests {
         assert_eq!(commit.as_deref(), Some("aaaaaaaa"));
     }
 
-    // Case: path-dep + git checkout → HEAD commit.
     #[test]
-    fn select_path_dep_in_git_checkout_uses_head() {
-        // Use the actual project vendored tree as fixture — it's a git repo.
+    fn parse_provenance_reference_prefers_reference_commit() {
+        let provenance = r#"
+# FrankenTerm Provenance
+
+Reference commit: `577474d89ee61aef4a48145cdec82a638d874751`
+Initial import reference: `05343b387085842b434d267f91b6b0ec157e4331`
+"#;
+        assert_eq!(
+            parse_provenance_reference_commit(provenance).as_deref(),
+            Some("577474d89ee61aef4a48145cdec82a638d874751")
+        );
+    }
+
+    #[test]
+    fn git_head_commit_rejects_parent_checkout() {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
         let vendored = workspace.join("frankenterm");
         if !vendored.join("mux").join("Cargo.toml").exists() {
             eprintln!("skip: vendored tree not present in this checkout");
+            return;
+        }
+
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&vendored)
+            .arg("rev-parse")
+            .arg("--show-toplevel")
+            .output();
+        let Ok(output) = output else {
+            eprintln!("skip: git unavailable");
+            return;
+        };
+        if !output.status.success() {
+            eprintln!("skip: checkout unavailable");
+            return;
+        }
+
+        let top_level = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if canonical_path(Path::new(&top_level)) != canonical_path(&vendored) {
+            assert!(
+                git_head_commit(&vendored).is_none(),
+                "parent repo HEAD must not be recorded as vendored WezTerm metadata"
+            );
+        }
+    }
+
+    // Case: path-dep + nested git checkout → HEAD commit.
+    #[test]
+    fn select_path_dep_in_git_checkout_uses_head() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let vendored = workspace.join("frankenterm");
+        if !vendored.join("mux").join("Cargo.toml").exists() {
+            eprintln!("skip: vendored tree not present in this checkout");
+            return;
+        }
+        if canonical_path(&vendored)
+            != Command::new("git")
+                .arg("-C")
+                .arg(&vendored)
+                .arg("rev-parse")
+                .arg("--show-toplevel")
+                .output()
+                .ok()
+                .and_then(|output| {
+                    if output.status.success() {
+                        let top_level = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        canonical_path(Path::new(&top_level))
+                    } else {
+                        None
+                    }
+                })
+        {
+            eprintln!("skip: vendored tree is not a nested git checkout");
             return;
         }
 
@@ -308,6 +429,43 @@ mod tests {
         assert!(commit.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(version.as_deref(), Some("0.1.0"));
         assert!(source.is_some());
+    }
+
+    #[test]
+    fn select_path_dep_parent_checkout_uses_provenance_not_parent_head() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let vendored = workspace.join("frankenterm");
+        if !vendored.join("PROVENANCE.md").exists() {
+            eprintln!("skip: vendored provenance not present in this checkout");
+            return;
+        }
+
+        let parent_head = Command::new("git")
+            .arg("-C")
+            .arg(&vendored)
+            .arg("rev-parse")
+            .arg("HEAD")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+
+        let mux = pkg_with_source("mux", "0.1.0", None);
+        let term = pkg_with_source("frankenterm-term", "0.1.0", None);
+        let (commit, _version, source) =
+            select_vendored_metadata(Some(&mux), Some(&term), &vendored);
+        let commit = commit.expect("provenance commit should be recorded");
+        assert_eq!(
+            provenance_reference_commit(&vendored).as_deref(),
+            Some(commit.as_str())
+        );
+        if let Some(parent_head) = parent_head {
+            assert_ne!(commit, parent_head);
+        }
+        assert!(
+            source.as_deref().unwrap_or("").starts_with("provenance+"),
+            "path-dep checkout without nested .git should report provenance source"
+        );
     }
 
     // Case: path-dep + non-git tree → deterministic sentinel.
