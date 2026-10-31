@@ -83,6 +83,27 @@ final class MobileHostKeyVerificationTests: XCTestCase {
               destinationRouteIDs: [route], hostKeyVerification: probe)
     }
 
+    func testHostAlgorithmReviewShowsRetainedDenyAllSeparatelyFromUnsetSourcePolicy() async throws {
+        let f = try await fixture()
+        let document = try f.saved.document()
+        let trust = try XCTUnwrap(document.hostTrust.first { $0.id == "jump-trust" })
+        let retained = try WorkspaceHostAlgorithmPolicy(hostKeyAlgorithms: [], caSignatureAlgorithms: ["rsa-sha2-256"])
+        let shown = try WorkspaceHostAlgorithmPresentation(document: document, trustID: trust.id,
+            historicalPolicies: [trust.canonicalTrustScope: retained])
+        XCTAssertTrue(shown.isVisible)
+        XCTAssertTrue(shown.showsEffective)
+        XCTAssertTrue(shown.historicalRestrictionsApply)
+        XCTAssertFalse(shown.aliasesRestrict)
+        XCTAssertEqual(WorkspaceHostAlgorithmPresentation.description(shown.imported.hostKeyAlgorithms), "No additional restriction")
+        XCTAssertEqual(WorkspaceHostAlgorithmPresentation.description(shown.effective.hostKeyAlgorithms), "None allowed")
+        XCTAssertEqual(WorkspaceHostAlgorithmPresentation.description(shown.effective.caSignatureAlgorithms), "rsa-sha2-256")
+
+        let otherHost = try WorkspaceHostAlgorithmPresentation(document: document, trustID: "target-trust",
+            historicalPolicies: [trust.canonicalTrustScope: retained])
+        XCTAssertFalse(otherHost.isVisible, "A different host must not borrow this endpoint's historical restrictions.")
+        XCTAssertFalse(otherHost.historicalRestrictionsApply)
+    }
+
     private func password(_ f: Fixture, probe: Bool) async throws -> WorkspaceSSHPasswordIdentity {
         try await f.broker.passwordIdentity(workspaceID: f.saved.id, expectedRevision: f.saved.revision, routeID: "hop",
             presentedHostKey: f.host, transitForRouteID: probe ? "destination" : nil, hostKeyProbe: probe ? f.probe : nil)

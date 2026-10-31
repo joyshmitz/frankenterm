@@ -212,7 +212,35 @@ The phone saves a public pin separately from the original imported manifest and 
 
 For a server whose key was verified on this phone, **Check for a Changed Host Key…** uses the same bounded public-key exchange. Its review displays the previous and newly observed fingerprints, requires another independent comparison, and offers **Replace Phone-Verified Key**. An unchanged key reports that no trust change is needed. Replacement is bound to the exact previous phone pin and its source policy; it cannot replace imported pins, change required trust policy or override existing revocations. It updates one host trust record, including routes that share that record, while leaving other trust records for the same endpoint intact. Saving disconnects the workspace and requires a fresh **Connect**.
 
-Local pins survive relaunch and unchanged source-policy reimports. An endpoint, alias or trust-policy change deactivates the old local pin and requires a new review; newly imported positive pins take precedence. Every jump host must already have usable verified trust and an allowed sign-in method; verify missing hop trust first or import it from the Mac. A store-owned, five-minute permission covers only that exact transit path and is rechecked before signing and forwarding. Cancellation, revocation, workspace replacement and expiry retire it; normal destination authentication never inherits it. Backgrounding, restore and closing Keys cancel and join the check. Transient Face ID inactivity can finish without reopening the network or publishing a stale review. Catalog versions 1–8 migrate to version 9 without inventing positive trust or changing authenticated import history.
+Local pins survive relaunch and unchanged source-policy reimports. An endpoint, alias or trust-policy change deactivates the old local pin and requires a new review; newly imported positive pins take precedence. Every jump host must already have usable verified trust and an allowed sign-in method; verify missing hop trust first or import it from the Mac. A store-owned, five-minute permission covers only that exact transit path and is rechecked before signing and forwarding. Cancellation, revocation, workspace replacement and expiry retire it; normal destination authentication never inherits it. Backgrounding, restore and closing Keys cancel and join the check. Transient Face ID inactivity can finish without reopening the network or publishing a stale review. Catalog versions 1–9 migrate to version 10 without inventing positive trust or changing authenticated import history.
+
+### Mandatory host and CA signature policy
+
+The Rust desktop exporter and native Mac SSH-source exporter now preserve literal
+`HostKeyAlgorithms` and `CASignatureAlgorithms` allowlists. Each destination and
+jump host carries its own ordered restrictions through public `.ftworkspace` and
+encrypted FTAG export. The phone narrows native negotiation before key exchange,
+then verifies the actual exchanged signature before offering credentials. RSA
+SHA-256 and SHA-512 remain distinct even when the public key and fingerprint are
+identical. A host certificate's CA signature is checked separately from its
+subject's exchange signature.
+
+Restrictions are mandatory under `ssh_host_algorithm_policy_v1`. The durable
+catalog retains their intersection across same-scope aliases, renamed trust
+records and reimports; stripping or widening a later export cannot relax a
+policy already accepted on this phone. Route readiness, explicit sign-in
+selection, first-use host-key checks, password/MFA authentication and active
+session validation all use the effective policy. An empty intersection blocks
+access before credentials are offered.
+
+The supported source form is an explicit ordered list of algorithm names.
+Default-dependent `+`/`-` expressions and wildcard restrictions remain required
+unresolved settings because a passive export cannot infer the source OpenSSH
+version's defaults. Valid `^` preference lists remain visibly inactive instead
+of creating guessed defaults. KRL files and additional freshness requirements
+remain unsupported. See the native SSH package's
+[algorithm contract](FrankenTermSSH/README.md#mandatory-host-signature-algorithms)
+for the exact wire fields and enforcement boundaries.
 
 ## Phone-generated SSH identities
 

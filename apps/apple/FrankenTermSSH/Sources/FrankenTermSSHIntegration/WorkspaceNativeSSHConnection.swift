@@ -146,6 +146,10 @@ public actor WorkspaceNativeSSHConnection {
         // An explicit Observe/Use Existing Pane request cannot manufacture a
         // direct shell when its mux transport is absent or disabled.
         guard !requiresExistingMux || muxCommand != nil else { throw TerminalMuxError.unavailable }
+        let hostAlgorithms = try await store.hostAlgorithmPolicy(workspaceID: workspaceID,
+            expectedRevision: expectedRevision, routeID: routeID, support: WorkspaceNativeSSHAuthentication.routeSupport)
+        let negotiation = try WorkspaceNativeSSHAuthentication.hostKeyNegotiation(for: route,
+            document: document, algorithmPolicy: hostAlgorithms)
         let endpoint = try NativeSSHEndpoint(host: route.host, port: route.port)
         let hops = try document.orderedJumpRoutes(forRouteID: routeID)
         let hopChoices: [[WorkspaceSSHAuthenticationChoice]]
@@ -191,7 +195,7 @@ public actor WorkspaceNativeSSHConnection {
         do {
             try await broker.validateForeground(foreground)
             try Task.checkCancellation()
-            try await session.setHostKeyPolicy(WorkspaceNativeSSHAuthentication.hostKeyPolicy(for: route, document: document))
+            try await session.setHostKeyPolicy(negotiation.profile, allowedAlgorithms: negotiation.algorithms)
             let authenticated = try await authenticate(session: session, choice: authentication,
                 route: route, workspaceID: workspaceID, revision: expectedRevision, broker: broker,
                 passwordPrompter: passwordPrompter, keyboardInteractivePrompter: keyboardInteractivePrompter,
@@ -311,14 +315,17 @@ public actor WorkspaceNativeSSHConnection {
                         }
                         try await broker.validateForeground(foreground)
                         try Task.checkCancellation()
+                        let hostAlgorithms = try await store.hostAlgorithmPolicy(workspaceID: workspaceID,
+                            expectedRevision: revision, routeID: hop.id, support: WorkspaceNativeSSHAuthentication.routeSupport)
+                        let negotiation = try WorkspaceNativeSSHAuthentication.hostKeyNegotiation(for: hop,
+                            document: entry.workspace.document(), algorithmPolicy: hostAlgorithms)
                         let endpoint = try NativeSSHEndpoint(host: hop.host, port: hop.port)
                         if session == nil {
                             session = try await NativeSSHConnector.connect(to: endpoint, timeout: connectionTimeout,
                                                                            networkLifetime: lease)
                         }
                         guard let owner = session, owner.endpoint == endpoint else { throw SSHAuthenticationError.denied }
-                        try await owner.setHostKeyPolicy(WorkspaceNativeSSHAuthentication.hostKeyPolicy(
-                            for: hop, document: entry.workspace.document()))
+                        try await owner.setHostKeyPolicy(negotiation.profile, allowedAlgorithms: negotiation.algorithms)
                         pending = (index, plan, attempt)
                         if attempt.selection.authentication.requiresForegroundPrompt { usedPrompt = true }
                         let authenticated = try await authenticate(session: owner, choice: attempt.selection.authentication,
