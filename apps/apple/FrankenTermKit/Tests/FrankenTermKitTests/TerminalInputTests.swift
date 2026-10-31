@@ -519,6 +519,31 @@ final class TerminalInputTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(session("fourth").takeFromEarlierLaunch(), "the later session's input still awaits an answer")
     }
 
+    func testUnansweredInputIsScopedToItsStableTerminalAndPreservesLegacyPrimaryHint() throws {
+        let suite = "frankenterm.tests.unanswered-slots.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite)), leftID = UUID(), rightID = UUID()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        func session(_ launch: String, _ slot: UUID? = nil) -> TerminalUnansweredInput {
+            TerminalUnansweredInput(workspace: "w", machine: "alpha", defaults: defaults,
+                                    launch: launch, terminalSessionID: slot)
+        }
+        defaults.set("legacy previous-owner", forKey: "frankenterm.input.unanswered.w.alpha")
+        XCTAssertFalse(session("current", leftID).takeFromEarlierLaunch())
+        XCTAssertTrue(session("current").takeFromEarlierLaunch(), "nil retains the exact pre-v4 hint key")
+
+        let primary = session("current"), left = session("current", leftID), right = session("current", rightID)
+        primary.set(true); left.set(true); right.set(true)
+        left.set(false)
+        XCTAssertFalse(session("next", leftID).takeFromEarlierLaunch())
+        XCTAssertTrue(session("next", rightID).takeFromEarlierLaunch(), "closing one slot cannot clear its sibling")
+        XCTAssertTrue(session("next").takeFromEarlierLaunch(), "an additional slot cannot clear the primary")
+
+        let replacement = session("current", leftID)
+        left.set(true); replacement.set(true); left.set(false)
+        XCTAssertTrue(session("next", leftID).takeFromEarlierLaunch(), "a replaced controller cannot clear its slot's new owner")
+        XCTAssertFalse(session("next", leftID).takeFromEarlierLaunch())
+    }
+
     func testInvalidTransportCountsCloseWithoutInventingAcceptedBytes() async throws {
         for result in [TerminalTransportWrite.accepted(0), .accepted(-1), .accepted(Int.max), .failed] {
             let (coordinator, transport, source, focus) = try await setup()

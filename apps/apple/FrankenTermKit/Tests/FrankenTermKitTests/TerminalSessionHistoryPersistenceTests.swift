@@ -91,7 +91,7 @@ final class TerminalSessionHistoryPersistenceTests: XCTestCase {
                     XCTAssertNil(bytes)
                 } else {
                     let object = try StrictJSON.decode(XCTUnwrap(bytes)).object()
-                    XCTAssertEqual(object["version"], .number(markerPublished ? "3" : "1"))
+                    XCTAssertEqual(object["version"], .number(markerPublished ? "4" : "1"))
                     XCTAssertEqual(try object.required("records").array().count, markerPublished ? 1 : 0)
                 }
 
@@ -138,7 +138,7 @@ final class TerminalSessionHistoryPersistenceTests: XCTestCase {
         let bytes = try Data(contentsOf: root.appendingPathComponent("catalog.json"))
         let attributes = try FileManager.default.attributesOfItem(atPath: root.appendingPathComponent("catalog.json").path)
         XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
-        XCTAssertEqual(try StrictJSON.decode(bytes).object()["version"], .number("3"))
+        XCTAssertEqual(try StrictJSON.decode(bytes).object()["version"], .number("4"))
     }
 
     func testAnchoredVersionTwoMigratesAndRetainsNoticeAcrossMultipleRelaunches() async throws {
@@ -150,7 +150,8 @@ final class TerminalSessionHistoryPersistenceTests: XCTestCase {
         var legacy = try StrictJSON.decode(XCTUnwrap(files.read(.catalog, limit: 512 * 1024))).object()
         legacy["version"] = .number("2")
         legacy["records"] = .array(try legacy.required("records").array().map {
-            var row = try $0.object(); row["unclean"] = nil; return .object(row)
+            var row = try $0.object(); row["unclean"] = nil; row["terminal_session_id"] = nil
+            return .object(row)
         })
         try files.write(StrictJSON.encode(.object(legacy)), to: .catalog)
         let recoveredStorage = try FileTerminalSessionHistoryPersistence(directory: root, identifier: identifier)
@@ -160,9 +161,10 @@ final class TerminalSessionHistoryPersistenceTests: XCTestCase {
         XCTAssertTrue(recovered[0].hasRecoveryNotice)
         _ = try await second.continueAfterInterruption(recovered[0])
         let migrated = try StrictJSON.decode(XCTUnwrap(files.read(.catalog, limit: 512 * 1024))).object()
-        XCTAssertEqual(migrated["version"], .number("3"))
+        XCTAssertEqual(migrated["version"], .number("4"))
         let row = try migrated.required("records").array()[0].object()
         XCTAssertEqual(row["unclean"], .boolean(true))
+        XCTAssertEqual(row["terminal_session_id"], .null)
         let third = try TerminalSessionJournal(persistence: recoveredStorage, processID: UUID())
         let retained = try await third.records()
         XCTAssertEqual(retained[0].scope, connection)
@@ -240,6 +242,7 @@ final class TerminalSessionHistoryPersistenceTests: XCTestCase {
         object["version"] = .number("1")
         object["records"] = .array(try object.required("records").array().map {
             var fields = try $0.object(); fields["input_evidence"] = nil; fields["unclean"] = nil
+            fields["terminal_session_id"] = nil
             return .object(fields)
         })
         let legacy = try StrictJSON.encode(.object(object)), files = try FileWorkspacePersistence(directory: root)

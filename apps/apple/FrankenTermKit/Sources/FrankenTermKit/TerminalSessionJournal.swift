@@ -9,9 +9,15 @@ public struct TerminalSessionScope: Hashable, Sendable {
     public let routeID: String
     public let transportID: UUID
     public let channelID: UUID
+    /// The stable local terminal slot, independent of a connection attempt.
+    /// Nil is the original primary slot, including every version 1–3 record.
+    /// Retrying a slot retains this identity; an explicitly added terminal gets
+    /// its own identity and never continues or dismisses a sibling's history.
+    public let terminalSessionID: UUID?
 
     public init(workspaceID: UUID, workspaceRevision: UUID, machineID: String,
-                routeID: String, transportID: UUID, channelID: UUID) throws {
+                routeID: String, transportID: UUID, channelID: UUID,
+                terminalSessionID: UUID? = nil) throws {
         do {
             _ = try WorkspaceDocument.identifier(machineID)
             _ = try WorkspaceDocument.identifier(routeID)
@@ -19,6 +25,7 @@ public struct TerminalSessionScope: Hashable, Sendable {
         self.workspaceID = workspaceID; self.workspaceRevision = workspaceRevision
         self.machineID = machineID; self.routeID = routeID
         self.transportID = transportID; self.channelID = channelID
+        self.terminalSessionID = terminalSessionID
     }
 }
 
@@ -62,6 +69,16 @@ public struct TerminalSessionRecord: Identifiable, Hashable, Sendable {
     public let hasRecoveryNotice: Bool
     fileprivate let revision: UUID
     fileprivate let reviewer: UUID
+
+    /// Select only this logical terminal's history. Route, revision, transport
+    /// and channel changes must not erase its earlier effects; sibling slots
+    /// must not borrow them. Machine-wide recovery reviews may instead present
+    /// all records explicitly and acknowledge their exact captured snapshots.
+    public func belongsTo(workspaceID: UUID, machineID: String,
+                          terminalSessionID: UUID? = nil) -> Bool {
+        scope.workspaceID == workspaceID && scope.machineID == machineID &&
+            scope.terminalSessionID == terminalSessionID
+    }
 }
 
 public enum TerminalSessionJournalError: Error, Equatable, Sendable, LocalizedError {
@@ -77,7 +94,7 @@ public enum TerminalSessionJournalError: Error, Equatable, Sendable, LocalizedEr
         case .corruptStore: return "Session history could not be validated. No new shell was authorized."
         case .busy: return "Another session history transaction is active."
         case .capacity: return "Review unresolved session history before creating more sessions."
-        case .reviewRequired: return "An earlier session for this machine may have unknown effects. Review it before creating a new session."
+        case .reviewRequired: return "An earlier connection for this terminal may have unknown effects. Review it before creating a new session."
         case .activeSession: return "Close the current local session before resolving its history."
         case .staleReview: return "Session history changed. Review the current record again."
         case .invalidEpoch: return "This session marker belongs to another owner."
@@ -110,10 +127,12 @@ private enum TerminalSessionProcess {
 /// pump consumer and outcome delivery. There is no implicit "clean" close: SSH
 /// delivery and local close cannot prove which remote effects occurred.
 ///
-/// Unretired records block another creation for the same installed workspace
-/// and machine, including route/revision changes and relaunch. Continuing a
-/// retired epoch permits an independently approved replacement connection while
-/// retaining crash uncertainty until explicitly dismissed. This actor neither
+/// Unretired records block another creation for the same installed workspace,
+/// machine and logical terminal slot, including route/revision changes and
+/// relaunch. A deliberately added slot can coexist with those records, subject
+/// to the shared history bounds; removing a slot never discards its uncertainty.
+/// Continuing a retired epoch permits an independently approved replacement
+/// connection while retaining crash uncertainty until explicitly dismissed. This actor neither
 /// connects nor replays anything, and it never stores input, output, keys,
 /// hostnames, error strings, or payload hashes. A new live frame cannot clear
 /// earlier uncertainty.
@@ -132,11 +151,13 @@ public actor TerminalSessionJournal {
         let id: UUID
         var entries: [Entry]
     }
-    private struct Machine: Hashable {
+    private struct Slot: Hashable {
         let workspace: UUID
         let machine: String
+        let terminalSession: UUID?
         init(_ scope: TerminalSessionScope) {
             workspace = scope.workspaceID; machine = scope.machineID
+            terminalSession = scope.terminalSessionID
         }
     }
 
@@ -198,9 +219,9 @@ public actor TerminalSessionJournal {
         try Task.checkCancellation()
         return try transaction {
             var catalog = try load()
-            let machine = Machine(scope)
+            let slot = Slot(scope)
             guard !catalog.entries.contains(where: {
-                Self.blocksNewSession($0) && Machine($0.scope) == machine
+                Self.blocksNewSession($0) && Slot($0.scope) == slot
             }) else { throw TerminalSessionJournalError.reviewRequired }
             guard catalog.entries.filter(Self.blocksNewSession).count < maximumUnresolved
             else { throw TerminalSessionJournalError.capacity }
@@ -510,7 +531,7 @@ public actor TerminalSessionJournal {
             }
             let version = try object.required("version").uint()
             guard Set(object.keys) == ["format", "version", "id", "records"],
-                  (1...3).contains(version) else {
+                  (1...4).contains(version) else {
                 throw TerminalSessionJournalError.corruptStore
             }
             let id = try Self.uuid(object, "id")
@@ -518,7 +539,7 @@ public actor TerminalSessionJournal {
             let values = try object.required("records").array()
             guard values.count <= Self.hardUnresolvedLimit + Self.hardResolvedLimit + Self.hardRecoveryLimit
             else { throw TerminalSessionJournalError.corruptStore }
-            var ids: Set<UUID> = [], machines: Set<Machine> = []
+            var ids: Set<UUID> = [], slots: Set<Slot> = []
             var unresolved = 0, resolved = 0, recovery = 0
             var entries: [Entry] = []
             for value in values {
@@ -527,6 +548,7 @@ public actor TerminalSessionJournal {
                     "machine", "route", "transport", "channel", "process", "owner", "state"]
                 if version >= 2 { keys.insert("input_evidence") }
                 if version >= 3 { keys.insert("unclean") }
+                if version >= 4 { keys.insert("terminal_session_id") }
                 guard Set(fields.keys) == keys,
                       let state = TerminalSessionRecordState(rawValue: try fields.text("state")),
                       version >= 3 || state != .continued
@@ -539,10 +561,15 @@ public actor TerminalSessionJournal {
                     evidence = TerminalInputEvidence(rawValue: raw)
                     guard evidence.isValid else { throw TerminalSessionJournalError.corruptStore }
                 }
+                let terminalSessionID: UUID?
+                if version >= 4, fields["terminal_session_id"] != .null {
+                    terminalSessionID = try Self.uuid(fields, "terminal_session_id")
+                } else { terminalSessionID = nil }
                 let scope = try TerminalSessionScope(workspaceID: Self.uuid(fields, "workspace"),
                     workspaceRevision: Self.uuid(fields, "workspace_revision"),
                     machineID: fields.text("machine"), routeID: fields.text("route"),
-                    transportID: Self.uuid(fields, "transport"), channelID: Self.uuid(fields, "channel"))
+                    transportID: Self.uuid(fields, "transport"), channelID: Self.uuid(fields, "channel"),
+                    terminalSessionID: terminalSessionID)
                 let entry = try Entry(id: Self.uuid(fields, "id"), revision: Self.uuid(fields, "revision"),
                                       scope: scope, process: Self.uuid(fields, "process"),
                                       owner: Self.uuid(fields, "owner"), state: state, inputEvidence: evidence,
@@ -552,7 +579,7 @@ public actor TerminalSessionJournal {
                 else { throw TerminalSessionJournalError.corruptStore }
                 if Self.blocksNewSession(entry) {
                     unresolved += 1
-                    guard machines.insert(Machine(scope)).inserted
+                    guard slots.insert(Slot(scope)).inserted
                     else { throw TerminalSessionJournalError.corruptStore }
                 } else if state == .continued && needsRecoveryNotice(entry) { recovery += 1 }
                 else { resolved += 1 }
@@ -588,6 +615,7 @@ public actor TerminalSessionJournal {
                 "machine": .string(entry.scope.machineID), "route": .string(entry.scope.routeID),
                 "transport": .string(entry.scope.transportID.uuidString),
                 "channel": .string(entry.scope.channelID.uuidString),
+                "terminal_session_id": entry.scope.terminalSessionID.map { .string($0.uuidString) } ?? .null,
                 "process": .string(entry.process.uuidString), "owner": .string(entry.owner.uuidString),
                 "state": .string(entry.state.rawValue),
                 "input_evidence": .number(String(entry.inputEvidence.rawValue)),
@@ -595,7 +623,7 @@ public actor TerminalSessionJournal {
             ])
         }
         let bytes = try StrictJSON.encode(.object([
-            "format": .string(Self.format), "version": .number("3"),
+            "format": .string(Self.format), "version": .number("4"),
             "id": .string(catalog.id.uuidString), "records": .array(records)
         ]))
         guard bytes.count <= Self.maximumBytes else { throw TerminalSessionJournalError.capacity }

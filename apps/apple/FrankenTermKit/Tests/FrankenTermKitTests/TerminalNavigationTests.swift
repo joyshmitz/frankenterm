@@ -273,4 +273,19 @@ final class TerminalNavigationTests: XCTestCase {
         }
         XCTAssertEqual(visited, [c7, a1, a3])
     }
+
+    func testUnseenDirectTabsRemainDistinctWithinOneMachine() {
+        typealias Source = TerminalUnseenOutput.Source
+        let primary = Source(machineID: "host"), first = Source(machineID: "host", terminalSessionID: UUID())
+        let second = Source(machineID: "host", terminalSessionID: UUID()), other = Source(machineID: "other")
+        let ring = [primary, first, second, other]
+        XCTAssertEqual(Set(ring).count, 4)
+        XCTAssertEqual(TerminalUnseenOutput.next(after: primary, ring: ring, unseen: [second, first]), first)
+        XCTAssertEqual(TerminalUnseenOutput.next(after: first, ring: ring, unseen: [primary, second]), second)
+        XCTAssertEqual(TerminalUnseenOutput.next(after: other, ring: ring, unseen: [first, primary]), primary)
+        XCTAssertNil(TerminalUnseenOutput.next(after: first, ring: ring, unseen: [first]))
+        let retired = Source(machineID: "host", terminalSessionID: UUID())
+        XCTAssertNil(TerminalUnseenOutput.next(after: primary, ring: ring, unseen: [retired]),
+            "An old tab's activity cannot mark another tab on the same host as its target.")
+    }
 }

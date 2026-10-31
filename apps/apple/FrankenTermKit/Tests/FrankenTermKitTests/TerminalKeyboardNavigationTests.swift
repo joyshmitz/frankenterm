@@ -65,6 +65,7 @@ final class TerminalKeyboardNavigationTests: XCTestCase {
         let sources: [TerminalSource]
         let encoders: [NavigationEncoder]
         let bindings: [TerminalKeyboardNavigationBinding]
+        let inventory: [TerminalNavigationMachine]
     }
     private func fixture(limits: TerminalInputLimits = .init()) async throws -> Fixture {
         let input = try TerminalInputCoordinator(limits: limits)
@@ -86,7 +87,7 @@ final class TerminalKeyboardNavigationTests: XCTestCase {
         navigation.resume()
         try await navigation.activateSelection()
         return .init(input: input, owner: owner, navigation: navigation, transports: transports, sources: sources,
-                     encoders: encoders, bindings: bindings)
+                     encoders: encoders, bindings: bindings, inventory: [a, b, offline])
     }
     private func move(_ f: Fixture, axis: TerminalNavigationAxis) async throws {
         try await f.navigation.perform(XCTUnwrap(f.navigation.navigation.plan(axis: axis, direction: .next)))
@@ -226,6 +227,57 @@ final class TerminalKeyboardNavigationTests: XCTestCase {
         let usage = await f.input.accounting()
         XCTAssertEqual(usage.streams, 0)
         try await otherCoordinator.disconnect(foreign); try await otherCoordinator.retire(foreign)
+        try await finish(f)
+    }
+
+    func testInactiveTabUsesTheCompositionBarrierWithoutReceivingInputAuthority() async throws {
+        let f = try await fixture(), old = try XCTUnwrap(f.owner.keyboard)
+        let pane = TerminalNavigationPaneID(id: UUID(), incarnation: UUID())
+        let inactive = TerminalNavigationSelection(machineID: "A", paneID: pane)
+        try f.owner.replaceBindings(f.bindings, inactiveSelections: [inactive])
+        let inventory = try f.inventory.map { machine in
+            try TerminalNavigationMachine(id: machine.id, name: machine.name,
+                panes: machine.panes + (machine.id == "A" ? [.init(id: pane, title: "Connecting")] : []))
+        }
+        try f.navigation.replaceInventory(inventory)
+        try old.insertText("first:")
+        try old.setMarkedText("候補", selectedRange: NSRange(location: 2, length: 0))
+        try await f.navigation.perform(XCTUnwrap(f.navigation.navigation.plan(paneID: pane)))
+        XCTAssertEqual(f.owner.currentSelection, inactive)
+        XCTAssertNil(f.owner.keyboard)
+        XCTAssertThrowsError(try old.insertText("late"))
+        try f.owner.replaceBindings(f.bindings, inactiveSelections: [inactive])
+        XCTAssertEqual(f.owner.currentSelection, inactive, "An unrelated inventory refresh preserves an inert selection.")
+        try await f.navigation.perform(XCTUnwrap(f.navigation.navigation.plan(paneID: f.bindings[1].paneID)))
+        let sibling = try XCTUnwrap(f.owner.keyboard)
+        XCTAssertEqual(sibling.originalFocus.source, f.sources[1])
+        try sibling.insertText("second"); await sibling.waitUntilSettled()
+        try await drain(f)
+        let firstBytes = await f.transports[0].bytes(), secondBytes = await f.transports[1].bytes()
+        XCTAssertEqual(firstBytes, Data("first:候補".utf8)); XCTAssertEqual(secondBytes, Data("second".utf8))
+        try await finish(f)
+    }
+
+    func testInactiveTabInventoryRejectsAmbiguityAndForeignMachineSelectionAtomically() async throws {
+        let f = try await fixture(), original = try XCTUnwrap(f.owner.keyboard)
+        let pane = TerminalNavigationPaneID(id: UUID(), incarnation: UUID())
+        let inactive = TerminalNavigationSelection(machineID: "A", paneID: pane)
+        XCTAssertThrowsError(try f.owner.replaceBindings(f.bindings,
+            inactiveSelections: [.init(machineID: "A", paneID: f.bindings[0].paneID)]))
+        XCTAssertThrowsError(try f.owner.replaceBindings(f.bindings, inactiveSelections: [inactive, inactive]))
+        XCTAssertThrowsError(try f.owner.replaceBindings(f.bindings, inactiveSelections: [.init(machineID: "A", paneID: nil)]))
+        XCTAssertThrowsError(try f.owner.replaceBindings(f.bindings, inactiveSelections: (0..<126).map { _ in
+            .init(machineID: "A", paneID: .init(id: UUID(), incarnation: UUID()))
+        }))
+        XCTAssertTrue(f.owner.keyboard === original)
+        try f.owner.replaceBindings(f.bindings, inactiveSelections: [inactive])
+        do {
+            _ = try await f.owner.prepare(.init(machineID: "B", paneID: pane))
+            XCTFail("An inactive tab cannot be rebound to another machine.")
+        } catch { XCTAssertEqual(error as? TerminalNavigationError, .unavailable) }
+        XCTAssertThrowsError(try f.owner.replaceBindings(f.bindings,
+            inactiveSelections: [.init(machineID: "B", paneID: pane)]))
+        XCTAssertTrue(f.owner.keyboard === original)
         try await finish(f)
     }
 

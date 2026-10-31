@@ -14,9 +14,15 @@ public struct TerminalConnectionResidency: Sendable {
         public let machineID: String
         public let id: UUID
         public let state: State
-        public init(machineID: String, id: UUID, state: State) {
-            self.machineID = machineID; self.id = id; self.state = state
+        public let terminalSessionID: UUID?
+        public init(machineID: String, id: UUID, state: State, terminalSessionID: UUID? = nil) {
+            self.machineID = machineID; self.id = id; self.state = state; self.terminalSessionID = terminalSessionID
         }
+    }
+    private struct Slot: Hashable {
+        let machineID: String
+        let terminalSessionID: UUID?
+        init(_ owner: Owner) { machineID = owner.machineID; terminalSessionID = owner.terminalSessionID }
     }
     public enum Decision: Equatable, Sendable {
         case available, alreadyOwned, blocked
@@ -39,22 +45,26 @@ public struct TerminalConnectionResidency: Sendable {
     /// eligible preparer, never the selected/requested machine or a live shell.
     /// This function does no I/O and does not reserve or free any resource.
     public func decision(for machineID: String, priority: [String], owners: [Owner],
-                         protecting protected: Set<String> = []) throws -> Decision {
+                         protecting protected: Set<String> = [], terminalSessionID: UUID? = nil) throws -> Decision {
         guard priority.count <= 128, owners.count <= 128,
               !priority.contains(where: { $0.isEmpty || $0.utf8.count > 128 }),
               Set(priority).count == priority.count,
-              Set(owners.map(\.machineID)).count == owners.count,
+              Set(owners.map(Slot.init)).count == owners.count,
               Set(owners.map(\.id)).count == owners.count else { throw Failure.invalidInventory }
         let known = Set(priority)
         guard known.contains(machineID), protected.isSubset(of: known),
               owners.allSatisfy({ known.contains($0.machineID) }) else {
             throw Failure.invalidInventory
         }
-        if owners.contains(where: { $0.machineID == machineID }) { return .alreadyOwned }
+        if owners.contains(where: { $0.machineID == machineID && $0.terminalSessionID == terminalSessionID }) {
+            return .alreadyOwned
+        }
         if owners.count < limit { return .available }
-        let byMachine = Dictionary(uniqueKeysWithValues: owners.map { ($0.machineID, $0) })
+        let byMachine = Dictionary(grouping: owners, by: \.machineID)
         for id in priority.reversed() where id != machineID && !protected.contains(id) {
-            if let candidate = byMachine[id], candidate.state == .automaticPreparation,
+            if let candidate = byMachine[id]?.first(where: {
+                $0.terminalSessionID == nil && $0.state == .automaticPreparation
+            }),
                released[id] != candidate.id { return .release(candidate) }
         }
         return .blocked
@@ -64,7 +74,7 @@ public struct TerminalConnectionResidency: Sendable {
     /// mistake this unopened sign-in for a terminal ending. Failure to seal may
     /// roll back this exact marker; cancellation after sealing may not.
     public mutating func willRelease(_ owner: Owner) throws {
-        guard owner.state == .automaticPreparation, !owner.machineID.isEmpty,
+        guard owner.state == .automaticPreparation, owner.terminalSessionID == nil, !owner.machineID.isEmpty,
               owner.machineID.utf8.count <= 128,
               released.count < 128 || released[owner.machineID] != nil else { throw Failure.invalidRelease }
         released[owner.machineID] = owner.id
@@ -82,11 +92,15 @@ public struct TerminalConnectionResidency: Sendable {
     /// only if the independent connection-intent owner still authorizes it.
     /// An inactive group's preferences alone cannot cause release/reconnect
     /// thrashing. A manual route remains manual after reauthentication.
-    public func permitsPreparation(_ machineID: String, selected: String?, explicitlyRequested: Bool) -> Bool {
-        released[machineID] == nil || selected == machineID || explicitlyRequested
+    public func permitsPreparation(_ machineID: String, selected: String?, explicitlyRequested: Bool,
+                                   terminalSessionID: UUID? = nil) -> Bool {
+        if terminalSessionID != nil { return explicitlyRequested }
+        return released[machineID] == nil || selected == machineID || explicitlyRequested
     }
 
     /// Called after the successor's real owner is reserved, never optimistically
     /// while teardown is running. An old completion cannot unmark a successor.
-    public mutating func started(_ machineID: String) { released.removeValue(forKey: machineID) }
+    public mutating func started(_ machineID: String, terminalSessionID: UUID? = nil) {
+        if terminalSessionID == nil { released.removeValue(forKey: machineID) }
+    }
 }

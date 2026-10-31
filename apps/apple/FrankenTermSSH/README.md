@@ -507,11 +507,11 @@ terminal consumption, scene lifecycle, and retained input-outcome reconciliation
 protected persistence directory, separate from the workspace catalog and import
 journal. `beginCreation(scope:)` returns an opaque epoch only after its atomic
 write and durability confirmation succeed. The record binds the installed
-workspace, saved revision, machine, route, transport and channel. It contains no
+workspace, saved revision, machine, logical terminal slot, route, transport and channel. It contains no
 terminal input/output, private keys, hostnames or content-derived hashes.
 
-An unresolved record blocks another creation for the same installed workspace and
-machine, even after a route or revision changes. Passing the journal to the native
+An unresolved record blocks another creation for the same installed workspace,
+machine and terminal slot, even after a route or revision changes. Passing the journal to the native
 connection factory checks that record before DNS. Before the pump is published,
 the journal binds its exact input source to the creation epoch. `recordInput`
 persists only a bounded union of transport observations, never commands, paste
@@ -526,13 +526,42 @@ acknowledged history is pruned. File-backed journals anchor their identity outsi
 the catalog (device-only Keychain on Apple), so missing history cannot silently
 authorize a replacement shell.
 
+Journal version four stores an optional `terminal_session_id`. Versions one
+through three migrate to the original primary slot (`nil`); their existing
+uncertainty and continuity anchor remain intact. A deliberately added terminal
+uses its own UUID, while a replacement connection in that tab retains it.
+`belongsTo(workspaceID:machineID:terminalSessionID:)` selects only that slot's
+history across route and revision changes. Continuing or dismissing one tab's
+record never acknowledges a sibling. Removing a tab does not remove its records;
+machine-wide recovery review must display and acknowledge exact journal-issued
+snapshots. All slots share the existing unresolved and recovery-history bounds.
+
 `WorkspaceSSHConnectionManager` is the app-owned entry point shared by scenes.
 Construct it with the workspace store, foreground broker, dedicated journal,
 input coordinator and shared `WorkspaceNetworkActivity`. It starts with networking
 disabled. `resume()` enables foreground admission, and each `connect` separately
 requires `confirmedByUser: true`. Admission is bounded to three attempts and at
-most sixteen retained connection/settlement owners, with one owner per installed
-workspace and machine. There is no waiting queue or automatic reconnect.
+most sixteen retained connection/settlement owners. Each installed workspace and
+machine may retain four terminal owners and one independent Files owner, with at
+most two Files owners across the app. There is no waiting queue or automatic
+reconnect in the manager.
+
+The primary terminal keeps `terminalSessionID: nil`. To open another direct-SSH
+terminal, pass a new UUID with `purpose: .terminal`, `attachMux: false` and
+`requiresExistingMux: false`. The selected route must be `direct_ssh`; additional
+slot identifiers cannot authorize Files or mux connections. A duplicate live or
+pending slot is refused, and pending attempts count toward the per-machine cap.
+Each successful attempt still receives fresh transport and channel identities;
+the logical slot is local history metadata, never remote PTY recovery authority.
+Closing one owner leaves its siblings active. Suspension, workspace invalidation
+and credential or host revocation continue to settle every affected owner.
+
+`TerminalKeyboardNavigationOwner` accepts explicitly listed inactive selections
+for connecting and ended tabs. Switching to one uses the same composition and
+held-key handoff barrier as a live source, but publishes no keyboard authority.
+An authenticated replacement needs a fresh handoff. Residency counts each slot
+separately and may release only an unopened, automatically prepared primary
+connection; an explicitly created tab is never evicted to warm another machine.
 
 The returned `WorkspaceSSHConnection` is a facade over the existing native owner;
 it exposes neither the session nor an alternative authentication/transport path.

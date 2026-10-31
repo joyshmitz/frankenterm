@@ -15,6 +15,7 @@ public actor WorkspaceNativeSSHConnection {
     public nonisolated let peer: NativeSSHPeer
     public nonisolated let workspaceRevision: UUID
     public nonisolated let scope: TerminalSessionScope
+    public nonisolated var terminalSessionID: UUID? { scope.terminalSessionID }
     public nonisolated let purpose: WorkspaceSSHConnectionPurpose
     public nonisolated let host: String, port: UInt16, user: String
     /// Present when this connection attaches to the machine's existing mux
@@ -61,13 +62,14 @@ public actor WorkspaceNativeSSHConnection {
                                muxClientFactory: (@Sendable () throws -> any TerminalMuxClient)? = nil,
                                attachMux: Bool = true, muxAccessMode: TerminalMuxAccessMode = .interactive,
                                requiresExistingMux: Bool = false,
-                               purpose: WorkspaceSSHConnectionPurpose = .terminal) async throws -> WorkspaceNativeSSHConnection {
+                               purpose: WorkspaceSSHConnectionPurpose = .terminal,
+                               terminalSessionID: UUID? = nil) async throws -> WorkspaceNativeSSHConnection {
         try await connect(workspaceID: workspaceID, expectedRevision: expectedRevision, machineID: machineID,
             routeID: routeID, authentication: .publicKey(credentialID), confirmedByUser: confirmedByUser,
             store: store, broker: broker, journal: journal, networkActivity: networkActivity,
             connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout, liveness: liveness,
             muxClientFactory: muxClientFactory, attachMux: attachMux, muxAccessMode: muxAccessMode,
-            requiresExistingMux: requiresExistingMux, purpose: purpose)
+            requiresExistingMux: requiresExistingMux, purpose: purpose, terminalSessionID: terminalSessionID)
     }
 
     public static func connect(workspaceID: UUID, expectedRevision: UUID, machineID: String,
@@ -84,8 +86,12 @@ public actor WorkspaceNativeSSHConnection {
                                attachMux: Bool = true, muxAccessMode: TerminalMuxAccessMode = .interactive,
                                requiresExistingMux: Bool = false,
                                selection: WorkspaceSSHConnectionSelection? = nil,
-                               purpose: WorkspaceSSHConnectionPurpose = .terminal) async throws -> WorkspaceNativeSSHConnection {
+                               purpose: WorkspaceSSHConnectionPurpose = .terminal,
+                               terminalSessionID: UUID? = nil) async throws -> WorkspaceNativeSSHConnection {
         guard confirmedByUser else { throw WorkspaceNetworkError.confirmationRequired }
+        guard terminalSessionID == nil || (purpose == .terminal && !attachMux && !requiresExistingMux) else {
+            throw NativeSSHError.invalidInput
+        }
         guard purpose == .terminal || (!attachMux && !requiresExistingMux) else {
             throw NativeSSHError.invalidInput
         }
@@ -107,7 +113,8 @@ public actor WorkspaceNativeSSHConnection {
         if purpose == .terminal, let journal {
             let records = try await journal.records()
             guard !records.contains(where: {
-                $0.blocksNewSession && $0.scope.workspaceID == workspaceID && $0.scope.machineID == machineID
+                $0.blocksNewSession && $0.belongsTo(workspaceID: workspaceID, machineID: machineID,
+                    terminalSessionID: terminalSessionID)
             }) else { throw TerminalSessionJournalError.reviewRequired }
         }
         let lease = try networkActivity.beginConnection()
@@ -126,6 +133,7 @@ public actor WorkspaceNativeSSHConnection {
                 usableCredentialIDs: ready.usableCredentialIDs).contains(authentication) else {
             throw SSHAuthenticationError.denied
         }
+        guard terminalSessionID == nil || route.mode == "direct_ssh" else { throw NativeSSHError.invalidInput }
         if let selection {
             let options = try WorkspaceSSHRouteOptions(localState: entry, machineID: machineID,
                 routeID: routeID, support: WorkspaceNativeSSHAuthentication.routeSupport)
@@ -210,7 +218,7 @@ public actor WorkspaceNativeSSHConnection {
                 transportID: session.transportID, channelID: session.channelID)
             let scope = try TerminalSessionScope(workspaceID: workspaceID, workspaceRevision: expectedRevision,
                 machineID: machineID, routeID: routeID, transportID: session.transportID,
-                channelID: session.channelID)
+                channelID: session.channelID, terminalSessionID: terminalSessionID)
             let transport = WorkspaceNativeSSHTransport(session: session, identity: identity, broker: broker,
                 foreground: foreground, networkLease: lease, authority: authenticated.authority, liveness: liveness,
                 muxControl: muxCommand == nil ? nil : TerminalMuxControl(accessMode: muxAccessMode))
