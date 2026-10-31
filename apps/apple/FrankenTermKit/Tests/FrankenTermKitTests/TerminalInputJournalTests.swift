@@ -433,6 +433,7 @@ final class TerminalInputJournalTests: XCTestCase {
         root["version"] = .number("1")
         root["records"] = .array(try root.required("records").array().map {
             var row = try $0.object(); row["input_evidence"] = nil; row["unclean"] = nil
+            row["terminal_session_id"] = nil
             return .object(row)
         })
         f.disk.seed(try StrictJSON.encode(.object(root)), slot: .catalog)
@@ -443,9 +444,10 @@ final class TerminalInputJournalTests: XCTestCase {
         XCTAssertEqual(legacy[0].inputEvidence, [])
         try await relaunched.resolve(legacy[0])
         let migrated = try StrictJSON.decode(XCTUnwrap(f.disk.bytes(.catalog))).object()
-        XCTAssertEqual(migrated["version"], .number("3"))
+        XCTAssertEqual(migrated["version"], .number("4"))
         let row = try XCTUnwrap(migrated["records"]).array()[0].object()
         XCTAssertEqual(row["input_evidence"], .number("0"))
+        XCTAssertEqual(row["terminal_session_id"], .null)
     }
 
     func testUnknownEvidenceAndOverlargeOutcomeBatchFailClosed() async throws {

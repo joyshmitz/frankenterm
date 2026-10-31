@@ -7,18 +7,26 @@ public enum WorkspacePortabilityPolicy {
     public static func blockedRouteIDs(in workspace: WorkspaceDocument, requiredEntityIDs: Set<String>) -> Set<String> {
         guard !requiredEntityIDs.isEmpty else { return [] }
         let allRoutes = Set(workspace.routes.map(\.id))
-        let knownEntities = Set([workspace.id] + workspace.groups.map(\.id) + workspace.machines.map(\.id)
-            + workspace.routes.map(\.id) + workspace.credentials.map(\.id) + workspace.hostTrust.map(\.id)
-            + workspace.themes.map(\.id))
+        let knownEntities = workspace.entityIDs
         // An unresolved scope cannot safely be interpreted as an unrelated one.
         // Retain its preview finding and block all routes until it is understood.
         guard requiredEntityIDs.isSubset(of: knownEntities), !requiredEntityIDs.contains(workspace.id) else { return allRoutes }
 
         var affected: [String: Set<String>] = [:]
         var dependents: [String: Set<String>] = [:]
+        let trusts = Dictionary(uniqueKeysWithValues: workspace.hostTrust.map { ($0.id, $0) })
+        var sourcesByScope: [String: Set<String>] = [:]
+        for trust in workspace.hostTrust {
+            sourcesByScope[trust.canonicalTrustScope, default: []].formUnion(trust.revocationSourceIDs)
+        }
         for route in workspace.routes {
             affected[route.id, default: []].insert(route.id)
             affected[route.trustID, default: []].insert(route.id)
+            if let trust = trusts[route.trustID] {
+                for sourceID in sourcesByScope[trust.canonicalTrustScope] ?? [] {
+                    affected[sourceID, default: []].insert(route.id)
+                }
+            }
             for credentialID in route.credentialIDs { affected[credentialID, default: []].insert(route.id) }
             for hopID in route.jumpRoutes { dependents[hopID, default: []].insert(route.id) }
         }
@@ -53,7 +61,7 @@ public enum WorkspacePortabilityPolicy {
 /// material, credentials from the vault, or executable source data enters it.
 public struct WorkspaceChangeReview: Sendable {
     public enum Entity: String, Sendable {
-        case workspace, source, preferences, group, machine, route, credential, hostTrust, theme, portability
+        case workspace, source, preferences, group, machine, route, credential, hostTrust, hostRevocationSource, theme, portability
         public var title: String {
             switch self {
             case .workspace: "Workspace"
@@ -64,6 +72,7 @@ public struct WorkspaceChangeReview: Sendable {
             case .route: "Connection route"
             case .credential: "Credential reference"
             case .hostTrust: "Host trust"
+            case .hostRevocationSource: "Host revocation source"
             case .theme: "Theme"
             case .portability: "Portability requirement"
             }
@@ -111,7 +120,7 @@ public struct WorkspaceChangeReview: Sendable {
             guard result.count < 65_536 else { throw FTError.limit("workspace.review_changes") }
             let security: Bool
             switch entity {
-            case .route, .credential, .hostTrust: security = true
+            case .route, .credential, .hostTrust, .hostRevocationSource: security = true
             case .portability:
                 let priorDisposition = try old?.object()["disposition"]?.uint()
                 let nextDisposition = try new?.object()["disposition"]?.uint()
@@ -144,7 +153,8 @@ public struct WorkspaceChangeReview: Sendable {
         try compare(entity: .workspace, id: incoming.id, old: before, new: after,
                     excluding: ["format", "version", "bundle_id", "source", "workspace"])
         let sections: [(String, Entity)] = [("groups", .group), ("machines", .machine), ("routes", .route),
-            ("credentials", .credential), ("host_trust", .hostTrust), ("themes", .theme)]
+            ("credentials", .credential), ("host_trust", .hostTrust),
+            ("host_revocation_sources", .hostRevocationSource), ("themes", .theme)]
         try compare(entity: .workspace, id: incoming.id, old: oldWorkspace, new: newWorkspace,
                     excluding: Set(sections.map(\.0)).union(["id", "preferences"]))
         try compare(entity: .preferences, id: incoming.id, old: oldWorkspace.required("preferences").object(),
@@ -152,7 +162,9 @@ public struct WorkspaceChangeReview: Sendable {
         for (section, entity) in sections {
             func records(_ workspace: [String: JSONValue]) throws -> [String: [String: JSONValue]] {
                 var indexed: [String: [String: JSONValue]] = [:]
-                for value in try workspace.required(section).array() {
+                let values = section == "host_revocation_sources"
+                    ? workspace[section] ?? .array([]) : try workspace.required(section)
+                for value in try values.array() {
                     let record = try value.object(), id = try record.text("id")
                     guard indexed.updateValue(record, forKey: id) == nil else { throw FTError.malformed("workspace.review_id") }
                 }

@@ -28,6 +28,7 @@ public final class TerminalKeyboardNavigationOwner: TerminalNavigationFocusOwner
     private let coordinator: TerminalInputCoordinator
     private let sceneID: UUID, workspaceID: String
     private var bindings: [TerminalNavigationPaneID: TerminalKeyboardNavigationBinding]
+    private var inactiveSelections: [TerminalNavigationPaneID: String]
     private var focus: TerminalFocus?
     private struct Pending {
         let preparation: TerminalNavigationPreparation
@@ -39,9 +40,11 @@ public final class TerminalKeyboardNavigationOwner: TerminalNavigationFocusOwner
     private var cleanup: (id: UUID, task: Task<Void, Never>)?
 
     public init(coordinator: TerminalInputCoordinator, sceneID: UUID, workspaceID: String,
-                bindings: [TerminalKeyboardNavigationBinding]) throws {
+                bindings: [TerminalKeyboardNavigationBinding],
+                inactiveSelections: [TerminalNavigationSelection] = []) throws {
         self.coordinator = coordinator; self.sceneID = sceneID; self.workspaceID = workspaceID
         self.bindings = try Self.checked(bindings, workspaceID: workspaceID)
+        self.inactiveSelections = try Self.checkedInactive(inactiveSelections, bindings: self.bindings)
     }
     private static func checked(_ values: [TerminalKeyboardNavigationBinding], workspaceID: String)
         throws -> [TerminalNavigationPaneID: TerminalKeyboardNavigationBinding] {
@@ -57,27 +60,63 @@ public final class TerminalKeyboardNavigationOwner: TerminalNavigationFocusOwner
         }
         return result
     }
+    private static func checkedInactive(_ values: [TerminalNavigationSelection],
+        bindings: [TerminalNavigationPaneID: TerminalKeyboardNavigationBinding]) throws -> [TerminalNavigationPaneID: String] {
+        guard values.count <= 128 - bindings.count else { throw TerminalNavigationError.capacity }
+        var result: [TerminalNavigationPaneID: String] = [:]
+        for value in values {
+            guard let id = value.paneID, !value.machineID.isEmpty, value.machineID.utf8.count <= 128,
+                  bindings[id] == nil, result.updateValue(value.machineID, forKey: id) == nil else {
+                throw TerminalNavigationError.invalidInventory
+            }
+        }
+        return result
+    }
     /// New bindings must be installed before inventory offers them. Removal of
     /// the visible source seals its input before publishing the changed list.
     /// Other sources' admitted input and transport ownership remain untouched.
-    public func replaceBindings(_ values: [TerminalKeyboardNavigationBinding]) throws {
+    public func replaceBindings(_ values: [TerminalKeyboardNavigationBinding],
+                                inactiveSelections: [TerminalNavigationSelection] = []) throws {
         let replacement = try Self.checked(values, workspaceID: workspaceID)
+        let inactive = try Self.checkedInactive(inactiveSelections, bindings: replacement)
         guard !preparing, pending == nil else { throw TerminalNavigationError.busy }
         for (id, binding) in replacement {
             if let old = bindings[id], old.source != binding.source { throw TerminalNavigationError.stale }
         }
-        if let id = currentSelection?.paneID, replacement[id] == nil { seal() }
-        bindings = replacement
+        for (id, machine) in inactive {
+            if let old = self.inactiveSelections[id], old != machine { throw TerminalNavigationError.stale }
+            if let old = bindings[id], old.source.identity.machineID != machine { throw TerminalNavigationError.stale }
+        }
+        for (id, binding) in replacement {
+            if let old = self.inactiveSelections[id], old != binding.source.identity.machineID {
+                throw TerminalNavigationError.stale
+            }
+        }
+        if let selected = currentSelection, let id = selected.paneID {
+            if bindings[id] != nil {
+                if replacement[id] == nil { seal() }
+            } else if replacement[id] != nil || inactive[id] != selected.machineID {
+                // A newly authenticated source needs its own focus handoff;
+                // selecting a placeholder never pre-authorizes its future input.
+                seal()
+            }
+        }
+        bindings = replacement; self.inactiveSelections = inactive
     }
 
     public func prepare(_ destination: TerminalNavigationSelection) async throws -> TerminalNavigationPreparation {
         guard !preparing, pending == nil, cleanup == nil else { throw TerminalNavigationError.busy }
         let binding: TerminalKeyboardNavigationBinding?
         if let id = destination.paneID {
-            guard let value = bindings[id], value.source.identity.machineID == destination.machineID else {
+            if let value = bindings[id], value.source.identity.machineID == destination.machineID {
+                binding = value
+            } else if inactiveSelections[id] == destination.machineID {
+                // Connecting and ended tabs use the ordinary composition and
+                // held-key barrier, but have no source and receive no keyboard.
+                binding = nil
+            } else {
                 throw TerminalNavigationError.unavailable
             }
-            binding = value
         } else { binding = nil }
         try Task.checkCancellation()
         preparing = true

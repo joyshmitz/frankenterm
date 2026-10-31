@@ -299,10 +299,14 @@ public struct TerminalNavigation: Sendable {
 /// Next New Output steps through it from what is on screen and wraps, so
 /// repeated presses visit each waiting source in turn. Choosing grants no input.
 public enum TerminalUnseenOutput {
-    /// A machine's own terminal (no pane), or one pane of its mux.
+    /// The primary terminal, an explicitly identified direct-SSH tab, or one
+    /// pane of the machine's mux. These are navigation hints, never authority.
     public struct Source: Hashable, Sendable {
         public let machineID: String, paneID: Int?
-        public init(machineID: String, paneID: Int? = nil) { self.machineID = machineID; self.paneID = paneID }
+        public let terminalSessionID: UUID?
+        public init(machineID: String, paneID: Int? = nil, terminalSessionID: UUID? = nil) {
+            self.machineID = machineID; self.paneID = paneID; self.terminalSessionID = terminalSessionID
+        }
     }
 
     /// The first unseen source after `current` in `ring`, wrapping; never

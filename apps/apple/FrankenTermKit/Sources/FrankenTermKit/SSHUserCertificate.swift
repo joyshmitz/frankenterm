@@ -17,6 +17,8 @@ public struct SSHUserCertificate: Equatable, Sendable, CustomDebugStringConverti
     public static let capability = "ssh_user_certificate_v1"
     public let blob: Data, algorithm: String, fingerprint: String
     public let subject: SSHPublicIdentity, authority: SSHPublicIdentity
+    /// Exact signed key ID bytes, retained for revocation matching only.
+    public let keyID: Data
     public let serial: UInt64, validAfter: UInt64, validBefore: UInt64
     public let principals: [String], criticalOptions: [String: Data], extensions: Set<String>
     /// Preserve signed extension payloads for exact renewal-policy comparison.
@@ -28,6 +30,7 @@ public struct SSHUserCertificate: Equatable, Sendable, CustomDebugStringConverti
         let parsed = try SSHCertificateFields(blob: blob, kind: .user)
         self.blob = parsed.blob; algorithm = parsed.algorithm; fingerprint = parsed.fingerprint
         subject = parsed.subject; authority = parsed.authority
+        keyID = parsed.keyID
         serial = parsed.serial; validAfter = parsed.validAfter; validBefore = parsed.validBefore
         principals = parsed.principals; criticalOptions = parsed.criticalOptions
         extensionOptions = parsed.extensionOptions; extensions = Set(parsed.extensionOptions.keys)
@@ -70,6 +73,7 @@ struct SSHCertificateFields {
     static let maximumBlobBytes = 32 * 1024
     let blob: Data, algorithm: String, fingerprint: String, signatureAlgorithm: String
     let subject: SSHPublicIdentity, authority: SSHPublicIdentity
+    let keyID: Data
     let serial: UInt64, validAfter: UInt64, validBefore: UInt64
     let principals: [String], criticalOptions: [String: Data], extensionOptions: [String: Data]
     let reserved: Data
@@ -98,8 +102,10 @@ struct SSHCertificateFields {
         let subject = try SSHPublicIdentity(blob: subjectBlob)
         let serial = try reader.uint(8)
         guard try reader.uint(4) == kind.rawValue else { throw FTError.unsupported("certificate.type") }
-        // The signed key ID is opaque metadata, never a trusted UI label.
-        _ = try reader.sshString(cap: kind == .user ? 1024 : Self.maximumBlobBytes)
+        // OpenSSH uses a C string here. Preserve exact non-NUL bytes for KRL
+        // comparisons; this metadata never becomes a trusted UI label.
+        let keyID = try reader.sshString(cap: kind == .user ? 1024 : Self.maximumBlobBytes)
+        guard !keyID.contains(0) else { throw FTError.malformed("certificate.key_id") }
         var principalBytes = ByteCursor(try reader.sshString(cap: Self.maximumBlobBytes))
         var principals: [String] = [], seen = Set<Data>()
         while principalBytes.remaining > 0 {
@@ -131,6 +137,7 @@ struct SSHCertificateFields {
         guard reader.remaining == 0 else { throw FTError.malformed("certificate.trailing_bytes") }
         signatureAlgorithm = try Self.verify(signature: signature, message: signedPrefix, authority: authority)
         self.blob = blob; self.algorithm = algorithm; self.subject = subject; self.authority = authority
+        self.keyID = keyID
         self.serial = serial; self.validAfter = validAfter; self.validBefore = validBefore
         self.principals = principals; self.criticalOptions = criticalOptions
         extensionOptions = extensionValues; self.reserved = reserved

@@ -33,6 +33,12 @@ public struct OfflineRestoreReview: Sendable {
     public let removesMachines: Bool
     public let isRollback: Bool
     public let preservedHostRevocationCount: Int
+    public let preservedHostRevocationSourcesByTrustScope: [String: [WorkspaceHostRevocationSource]]
+    public var preservedHostRevocationSourceCount: Int {
+        Set(preservedHostRevocationSourcesByTrustScope.values.flatMap { $0 }.map {
+            $0.sourceKind + ":" + $0.sourceSHA256
+        }).count
+    }
     public let preservedHostRequirementCount: Int
     public let firstAcceptedRevision: UUID?
     public let routeReadiness: [WorkspaceDocument.RouteReadiness]
@@ -431,6 +437,7 @@ public actor OfflineRestore<C: AirGapCryptography> {
                            inactiveSettingCount: decoded.annotations.count, expectedRevision: prior.existingWorkspace?.revision,
                            removesMachines: prior.removesMachines, isRollback: prior.requiresRollbackApproval,
                            preservedHostRevocationCount: prior.preservedHostRevocationCount,
+                           preservedHostRevocationSourcesByTrustScope: prior.preservedHostRevocationSourcesByTrustScope,
                            preservedHostRequirementCount: prior.preservedHostRequirementCount,
                            firstAcceptedRevision: prior.firstAcceptedRevision,
                            routeReadiness: preview.routes,

@@ -94,6 +94,7 @@ public struct WorkspaceSSHRouteOptions: Sendable {
                 revokedHostKeysByTrustScope: localState.revokedHostKeysByTrustScope,
                 requiredHostCapabilitiesByTrustScope: localState.requiredHostCapabilitiesByTrustScope,
                 hostAlgorithmPoliciesByTrustScope: localState.hostAlgorithmPoliciesByTrustScope,
+                hostRevocationSourcesByTrustScope: localState.hostRevocationSourcesByTrustScope,
                 transitForRouteID: routeID)
             guard readiness.isLocallyReady else { throw WorkspaceSSHConnectionSelectionError.routeUnavailable }
             return .init(route: hop, authenticationChoices: try choices(hop, usable: readiness.usableCredentialIDs))

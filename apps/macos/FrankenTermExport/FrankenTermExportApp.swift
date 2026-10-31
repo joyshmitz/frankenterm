@@ -271,6 +271,7 @@ private actor MacExportEngine {
         // destination and jump. Never pool unrelated aliases' trust or treat an
         // unreadable revocation source as an absent file.
         let knownHostFiles = try pending.source.loadKnownHostFiles(for: aliases)
+        let hostRevocationFiles = try pending.source.loadHostRevocationFiles(for: aliases)
         let support = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
                                                   appropriateFor: nil, create: true)
         let sourceID = crypto.sha256(Data(pending.url.standardizedFileURL.path.utf8)).map { String(format: "%02x", $0) }.joined()
@@ -281,7 +282,8 @@ private actor MacExportEngine {
             } ?? SSHWorkspaceRegistry()
             let result = try pending.source.export(aliases: aliases, workspaceName: "SSH Machines", defaultUser: NSUserName(),
                 publicIdentityFiles: publicIdentityFiles, publicCertificateFiles: publicCertificateFiles,
-                knownHostFiles: knownHostFiles, registry: &registry, using: crypto)
+                knownHostFiles: knownHostFiles, hostRevocationFiles: hostRevocationFiles,
+                registry: &registry, using: crypto)
             let selected = try WorkspaceExportSelection(workspace: result.workspace,
                 groupIDs: [result.workspace.initialGroupID], findings: result.portability)
             _ = try selected.review(decisions: [:], loadedFingerprints: [])

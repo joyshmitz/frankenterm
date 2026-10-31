@@ -222,6 +222,13 @@ enum WorkspaceDeviceKeyOverlay {
             "root_extensions": root["extensions"] ?? .object([:]),
             "workspace_extensions": workspace["extensions"] ?? .object([:])
         ]
+        let sourceIDs = Set(document.hostTrust.filter { trustPolicy[$0.id] != nil }.flatMap(\.revocationSourceIDs))
+        if !sourceIDs.isEmpty {
+            let sources = document.hostRevocationSources.filter { sourceIDs.contains($0.id) }.sorted { $0.id < $1.id }
+            identity["revocation_sources"] = .array(try sources.map {
+                .string(Data(SHA256.hash(data: try StrictJSON.encode($0.json))).base64EncodedString())
+            })
+        }
         if hasContext {
             identity["authentication_contexts"] = .array(actual.map { .array($0.map(JSONValue.string)) })
         }

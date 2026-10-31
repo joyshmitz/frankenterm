@@ -104,6 +104,41 @@ final class MobileHostKeyVerificationTests: XCTestCase {
         XCTAssertFalse(otherHost.historicalRestrictionsApply)
     }
 
+    func testHostRevocationReviewShowsRetainedSourcesAndKnownDenialsInTheirOwnScope() async throws {
+        let f = try await fixture(), document = try f.saved.document()
+        let trust = try XCTUnwrap(document.hostTrust.first { $0.id == "jump-trust" })
+        let source = try WorkspaceHostRevocationSource(id: "earlier-revocations", sourceKind: "openssh_krl_v1",
+            sourceSHA256: "SHA256:" + Data(repeating: 7, count: 32).base64EncodedString().replacingOccurrences(of: "=", with: ""),
+            krlVersion: UInt64.max, generatedAt: 1,
+            policy: .init(revokedSHA256: [Data(repeating: 9, count: 32)]))
+        let history = [trust.canonicalTrustScope: [source]]
+        let retained = try WorkspaceHostRevocationPresentation(document: document, trustID: trust.id,
+            historicalSources: history)
+        XCTAssertTrue(retained.isVisible)
+        XCTAssertEqual(retained.sources, [source])
+        XCTAssertEqual(retained.retainedSourceCount, 1)
+        XCTAssertTrue(retained.deniesKnownKey(f.host))
+        let unrelated = try WorkspaceHostRevocationPresentation(document: document, trustID: "target-trust",
+            historicalSources: history)
+        XCTAssertFalse(unrelated.isVisible)
+        XCTAssertEqual(unrelated.retainedSourceCount, 0)
+        XCTAssertFalse(unrelated.deniesKnownKey(f.host))
+
+        var root = try JSONSerialization.jsonObject(with: document.raw) as! [String: Any]
+        var workspace = root["workspace"] as! [String: Any]
+        workspace["host_revocation_sources"] = [try JSONSerialization.jsonObject(with: source.json.encoded())]
+        var trusts = workspace["host_trust"] as! [[String: Any]]
+        let index = try XCTUnwrap(trusts.firstIndex { $0["id"] as? String == trust.id })
+        trusts[index]["revocation_source_refs"] = [source.id]
+        workspace["host_trust"] = trusts; root["workspace"] = workspace
+        let incoming = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root, options: [.sortedKeys]))
+        let current = try WorkspaceHostRevocationPresentation(document: incoming, trustID: trust.id,
+            historicalSources: history)
+        XCTAssertEqual(current.sources, [source], "The same source is not counted twice across imports.")
+        XCTAssertEqual(current.retainedSourceCount, 0)
+        XCTAssertTrue(current.deniesKnownKey(f.host))
+    }
+
     private func password(_ f: Fixture, probe: Bool) async throws -> WorkspaceSSHPasswordIdentity {
         try await f.broker.passwordIdentity(workspaceID: f.saved.id, expectedRevision: f.saved.revision, routeID: "hop",
             presentedHostKey: f.host, transitForRouteID: probe ? "destination" : nil, hostKeyProbe: probe ? f.probe : nil)

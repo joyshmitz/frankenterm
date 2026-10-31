@@ -40,6 +40,22 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     let workspaceName: String
     private(set) var machines: [SceneMachine]
     private(set) var sessions: [String: TerminalSessionController] = [:]
+    /// The nil-slot primary keeps the existing group/mux scheduling contract.
+    /// Extra slots are deliberate direct-SSH terminals and never auto-respawn.
+    struct DirectTerminalSlot: Identifiable {
+        let id: UUID
+        let number: Int
+        var controller: TerminalSessionController
+    }
+    private(set) var additionalSessions: [String: [DirectTerminalSlot]] = [:]
+    private(set) var selectedTerminalSessionIDs: [String: UUID] = [:]
+    private(set) var invalidatedTerminalSlots: Set<UUID> = []
+    @ObservationIgnored private var additionalJobs: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var installedAuthenticationOwnerID: UUID?
+    private(set) var orphanedTerminalRecords: [TerminalSessionRecord] = []
+    private(set) var terminalHistoryFailure: String?
+    private(set) var reviewingTerminalHistory = false
+    @ObservationIgnored private var terminalHistoryGeneration = UUID()
     /// Each machine's theme now; a pick in the scene changes it live.
     private(set) var themes: [String: WorkspaceDocument.Theme] = [:]
     /// The machine on screen; follows committed navigation only.
@@ -88,7 +104,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     @ObservationIgnored let connections: MobileConnections
     @ObservationIgnored let owner: TerminalKeyboardNavigationOwner
     @ObservationIgnored let navigation: TerminalNavigationCoordinator
-    @ObservationIgnored private var bindings: [String: TerminalKeyboardNavigationBinding] = [:]
+    @ObservationIgnored private var bindings: [UUID: TerminalKeyboardNavigationBinding] = [:]
     @ObservationIgnored private(set) var closed = false
     /// The app is active (not behind a Face ID sheet, alert or the switcher).
     @ObservationIgnored private var foreground = true
@@ -104,6 +120,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     private struct GroupAppearance {
         let id: UUID
         let machineID: String
+        let terminalSessionID: UUID?
         let group: TerminalConnectionIntent.Group?
         let navigationGroup: TerminalNavigationGroup?
         let connectOnOpen: Bool
@@ -192,7 +209,266 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     }
 
     var selectedMachine: SceneMachine? { machines.first { $0.id == selectedMachineID } }
-    var selectedSession: TerminalSessionController? { selectedMachineID.flatMap { sessions[$0] } }
+    var selectedSession: TerminalSessionController? { selectedMachineID.flatMap { displayedSession($0) } }
+
+    func displayedSession(_ machineID: String) -> TerminalSessionController? {
+        session(machineID: machineID, terminalSessionID: selectedTerminalSessionIDs[machineID])
+    }
+
+    private func session(machineID: String, terminalSessionID: UUID?) -> TerminalSessionController? {
+        guard let terminalSessionID else { return sessions[machineID] }
+        return additionalSessions[machineID]?.first { $0.id == terminalSessionID }?.controller
+    }
+
+    func terminalControllers(_ machineID: String) -> [TerminalSessionController] {
+        [sessions[machineID]].compactMap { $0 } + (additionalSessions[machineID] ?? []).map(\.controller)
+    }
+
+    private var allControllers: [TerminalSessionController] {
+        machines.flatMap { terminalControllers($0.id) }
+    }
+
+    private func owns(_ controller: TerminalSessionController) -> Bool {
+        session(machineID: controller.target.machineID, terminalSessionID: controller.terminalSessionID) === controller
+    }
+
+    func terminalTitle(_ controller: TerminalSessionController) -> String {
+        let number = additionalSessions[controller.target.machineID]?.first { $0.controller === controller }?.number ?? 1
+        return "Terminal \(number)"
+    }
+
+    private func selection(for controller: TerminalSessionController,
+                           bindings values: [UUID: TerminalKeyboardNavigationBinding]? = nil) -> TerminalNavigationSelection {
+        let binding = (values ?? bindings)[controller.id]
+        return .init(machineID: controller.target.machineID,
+            paneID: binding?.paneID ?? .init(id: controller.id, incarnation: controller.id))
+    }
+
+    private func controller(for selection: TerminalNavigationSelection) -> TerminalSessionController? {
+        terminalControllers(selection.machineID).first { self.selection(for: $0) == selection }
+    }
+
+    private var selectedBinding: TerminalKeyboardNavigationBinding? {
+        selectedSession.flatMap { bindings[$0.id] }
+    }
+
+    private func updateTerminalAuthenticationOwner() {
+        if !closed, onScreen, let controller = selectedSession {
+            installedAuthenticationOwnerID = controller.id
+            connections.selectTerminalAuthenticationOwner(controller)
+        } else if let previous = installedAuthenticationOwnerID {
+            connections.releaseTerminalAuthenticationOwner(previous)
+            installedAuthenticationOwnerID = nil
+        }
+    }
+
+    var canCreateAdditionalTerminal: Bool {
+        guard permitsTerminalCreation, onScreen, let machineID = selectedMachineID,
+              let primary = sessions[machineID], primary.phase == .live,
+              primary.additionalTerminalTarget != nil,
+              !disconnected.contains(machineID), additionalJobs.isEmpty,
+              !openingSplit, selectedSession?.clipboardIsPresenting != true,
+              navigation.phase == .ready || navigation.phase == .inactive else { return false }
+        return terminalControllers(machineID).count < WorkspaceSSHConnectionManager.maximumTerminalSessionsPerMachine
+            && additionalSessions.values.reduce(0, { $0 + $1.count }) < residency.limit
+            && allControllers.filter({ !$0.settled }).count < residency.limit
+    }
+
+    /// A new local slot is admitted only by this deliberate action. Its tab
+    /// selection must finish the old keyboard handoff before sign-in starts.
+    func newTerminal() {
+        guard canCreateAdditionalTerminal, let machineID = selectedMachineID,
+              var target = sessions[machineID]?.additionalTerminalTarget else { return }
+        if let theme = themes[machineID] { target = target.wearing(theme) }
+        let slotID = UUID()
+        let controller = TerminalSessionController(target: target, connections: connections, focus: self,
+            terminalSessionID: slotID)
+        let number = max(1, additionalSessions[machineID]?.map(\.number).max() ?? 1) + 1
+        additionalSessions[machineID, default: []].append(.init(id: slotID, number: number, controller: controller))
+        observeAdditional(controller)
+        startAdditional(controller)
+    }
+
+    private func observeAdditional(_ controller: TerminalSessionController) {
+        controller.onChange = { [weak self, weak controller] in
+            guard let self, let controller, self.owns(controller) else { return }
+            self.reconcileRemoteFiles()
+            // No reconnect scheduler or machine-level terminal-ended intent:
+            // a sibling ending cannot replace another tab's shell.
+            self.reconcile()
+        }
+    }
+
+    private func startAdditional(_ controller: TerminalSessionController) {
+        guard let slotID = controller.terminalSessionID, additionalJobs[slotID] == nil else { return }
+        let generation = appearanceGeneration
+        additionalJobs[slotID] = Task { [weak self, controller] in
+            guard let self else { return }
+            defer { self.additionalJobs[slotID] = nil; self.reconcile() }
+            do {
+                try await self.whileBusy {
+                    guard self.owns(controller), self.permitsTerminalCreation, self.onScreen,
+                          self.appearanceGeneration == generation else { throw CancellationError() }
+                    try self.publishBindings(self.bindings)
+                    guard let paneID = self.selection(for: controller).paneID,
+                          let plan = try self.navigation.navigation.plan(paneID: paneID)
+                            ?? self.navigation.navigation.activationPlan() else { throw TerminalNavigationError.unavailable }
+                    try await self.navigation.perform(plan)
+                }
+                guard !Task.isCancelled, self.owns(controller), self.selectedSession === controller,
+                      self.permitsTerminalCreation, self.appearanceGeneration == generation else { throw CancellationError() }
+                await controller.activateTerminal(explicit: true)
+            } catch {
+                controller.requestStop()
+                await controller.stop()
+                if !Task.isCancelled, !self.closed { self.report(error) }
+            }
+        }
+    }
+
+    func selectTerminal(_ controller: TerminalSessionController) {
+        guard owns(controller), permitsCanvasNavigation, !openingSplit else { return }
+        let generation = canvasGeneration, expected = controller.id
+        Task { [weak self, weak controller] in
+            guard let self, let controller else { return }
+            do {
+                try await self.whileBusy {
+                    guard self.permitsCanvasNavigation, self.canvasGeneration == generation,
+                          self.owns(controller), controller.id == expected else { throw TerminalNavigationError.stale }
+                    guard let paneID = self.selection(for: controller).paneID,
+                          let plan = try self.navigation.navigation.plan(paneID: paneID)
+                            ?? self.navigation.navigation.activationPlan() else { return }
+                    try await self.navigation.perform(plan)
+                }
+            } catch { if !Task.isCancelled { self.report(error) } }
+        }
+    }
+
+    /// Replaces only the selected logical slot. Its own journal continuation
+    /// and consent are preserved; sibling slots never participate.
+    func restartTerminal(_ controller: TerminalSessionController) {
+        guard permitsTerminalCreation, onScreen, owns(controller), selectedSession === controller,
+              controller.settled, let slotID = controller.terminalSessionID,
+              !invalidatedTerminalSlots.contains(slotID),
+              additionalJobs[slotID] == nil,
+              allControllers.filter({ !$0.settled }).count < residency.limit,
+              let index = additionalSessions[controller.target.machineID]?.firstIndex(where: { $0.id == slotID }) else { return }
+        var target = controller.target
+        do { try connectionIntent.approveConnection(target.machineID) }
+        catch { report(error); return }
+        if let theme = themes[target.machineID] { target = target.wearing(theme) }
+        let replacement = TerminalSessionController(target: target, connections: connections, focus: self,
+            inputDelivery: controller.inputDelivery, terminalSessionID: slotID)
+        controller.discardRetainedOutput(); controller.discardHostKeyMismatch()
+        additionalSessions[target.machineID]?[index].controller = replacement
+        observeAdditional(replacement)
+        startAdditional(replacement)
+    }
+
+    func endTerminal(_ controller: TerminalSessionController) {
+        guard !closed, owns(controller) else { return }
+        if let slotID = controller.terminalSessionID { additionalJobs[slotID]?.cancel() }
+        else {
+            controllerJobs[controller.target.machineID]?.task.cancel()
+            requestedConnections.remove(controller.target.machineID)
+            cancelReconnect(controller.target.machineID)
+        }
+        controller.requestStop()
+        Task { await controller.stop() }
+    }
+
+    func removeTerminal(_ controller: TerminalSessionController) {
+        guard permitsTerminalCreation, onScreen, owns(controller), controller.settled,
+              let slotID = controller.terminalSessionID, additionalJobs[slotID] == nil,
+              navigation.phase == .ready || navigation.phase == .inactive else { return }
+        let machineID = controller.target.machineID
+        let wasSelected = displayedSession(machineID) === controller
+        controller.discardRetainedOutput(); controller.discardHostKeyMismatch()
+        additionalSessions[machineID]?.removeAll { $0.id == slotID }
+        invalidatedTerminalSlots.remove(slotID)
+        if selectedTerminalSessionIDs[machineID] == slotID { selectedTerminalSessionIDs[machineID] = nil }
+        do { try publishBindings(bindings) } catch { report(error) }
+        updateTerminalAuthenticationOwner()
+        updatePresentationVisibility()
+        if wasSelected, let primary = sessions[machineID], selectedMachineID == machineID,
+           bindings[primary.id] != nil || additionalSessions[machineID]?.isEmpty == false {
+            selectTerminal(primary)
+        }
+        refreshTerminalHistory()
+    }
+
+    /// Orphaned tabs survive only as bounded durable metadata. Loading them
+    /// cannot reconnect, execute input, or grant permission to a new shell.
+    func refreshTerminalHistory() {
+        let generation = UUID(); terminalHistoryGeneration = generation
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let records = try await self.connections.journal.records()
+                guard !self.closed, self.terminalHistoryGeneration == generation else { return }
+                self.orphanedTerminalRecords = self.orphanedRecords(in: records)
+            } catch {
+                guard !self.closed, self.terminalHistoryGeneration == generation else { return }
+                self.terminalHistoryFailure = "Earlier terminal history could not be read: \(TerminalSessionController.describe(error))"
+            }
+        }
+    }
+
+    private func orphanedRecords(in records: [TerminalSessionRecord]) -> [TerminalSessionRecord] {
+        records.filter { record in
+            guard record.scope.workspaceID == workspaceID, let slotID = record.scope.terminalSessionID,
+                  record.canResolve, record.hasRecoveryNotice || record.blocksNewSession else { return false }
+            return additionalSessions[record.scope.machineID]?.contains(where: { $0.id == slotID }) != true
+        }
+    }
+
+    func earlierTerminals(_ machineID: String) -> [TerminalSessionRecord] {
+        orphanedTerminalRecords.filter { $0.scope.machineID == machineID }
+    }
+
+    /// The button supplies the exact snapshots it displayed. A later record
+    /// stays visible; ambiguous writes require a successful explicit retry.
+    func acknowledgeEarlierTerminals(_ reviewed: [TerminalSessionRecord], machineID: String) {
+        guard permitsTerminalCreation, onScreen, selectedMachineID == machineID, !reviewingTerminalHistory,
+              reviewed.allSatisfy({ $0.scope.machineID == machineID && orphanedTerminalRecords.contains($0) }) else { return }
+        reviewingTerminalHistory = true
+        terminalHistoryGeneration = UUID()
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.reviewingTerminalHistory = false }
+            do {
+                try await self.connections.journal.acknowledgeRecovery(reviewed.filter(\.hasRecoveryNotice))
+                for record in reviewed where !record.hasRecoveryNotice { try await self.connections.journal.resolve(record) }
+                let current = try await self.connections.journal.records()
+                self.clearReviewedTerminalHints(reviewed, current: current)
+                self.orphanedTerminalRecords = self.orphanedRecords(in: current)
+                self.terminalHistoryFailure = nil
+            } catch {
+                if let current = try? await self.connections.journal.records() {
+                    self.clearReviewedTerminalHints(reviewed, current: current)
+                    self.orphanedTerminalRecords = self.orphanedRecords(in: current)
+                }
+                self.terminalHistoryFailure = "Earlier terminal history could not be acknowledged: \(TerminalSessionController.describe(error)) Review again to retry."
+            }
+        }
+    }
+
+    /// Crash hints are non-authoritative and may outlive a removed slot. Only
+    /// exact user-reviewed, now-resolved slots can consume an earlier launch's
+    /// hint; a fresh record or current controller always keeps it. Readback
+    /// after an ambiguous write may clear this hint but never the failure UI.
+    private func clearReviewedTerminalHints(_ reviewed: [TerminalSessionRecord], current: [TerminalSessionRecord]) {
+        for record in reviewed {
+            guard record.scope.workspaceID == workspaceID, let slotID = record.scope.terminalSessionID,
+                  session(machineID: record.scope.machineID, terminalSessionID: slotID) == nil,
+                  !current.contains(where: {
+                      $0.belongsTo(workspaceID: workspaceID, machineID: record.scope.machineID, terminalSessionID: slotID)
+                          && ($0.blocksNewSession || $0.hasRecoveryNotice)
+                  }) else { continue }
+            _ = TerminalUnansweredInput(workspace: workspaceID.uuidString, machine: record.scope.machineID,
+                terminalSessionID: slotID).takeFromEarlierLaunch()
+        }
+    }
     /// Review and copy actions must still belong to the visible machine's
     /// exact failed controller and workspace revision. A captured sheet is
     /// not authority after navigation or replacement, and cannot expose or
@@ -200,7 +476,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func hostKeyMismatch(for controller: TerminalSessionController) -> WorkspaceSSHConnectionHostKeyMismatch? {
         guard !closed, foreground, !inBackground, onScreen,
               selectedMachineID == controller.target.machineID,
-              sessions[controller.target.machineID] === controller,
+              selectedSession === controller,
               controller.target.workspaceID == workspaceID, controller.target.revision == revision,
               case .couldNotConnect = controller.phase,
               let mismatch = controller.hostKeyMismatch,
@@ -267,7 +543,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             && overviewPresented && presentedPanel == .remoteFiles && remoteFiles === files
             && selectedMachineID == files.target.machineID
             && workspaceID == files.target.workspaceID && revision == files.target.revision
-            && sessions[files.target.machineID] === files.source
+            && selectedSession === files.source
             && files.source.remoteFilesTarget == files.target
     }
 
@@ -328,7 +604,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         var paneCount = 0
         guard machines.count <= TerminalFleetOverview.maximumMachines else { throw TerminalFleetOverview.Failure.capacity }
         for machine in navigationMachines {
-            let session = sessions[machine.id]
+            let session = displayedSession(machine.id)
             let status: TerminalFleetOverview.Status
             switch self.status(of: machine.id) {
             case .live: status = .live
@@ -436,7 +712,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                     case .machine(let id): machineID = id
                     case .pane(let id, _, _): machineID = id
                     }
-                    if let plan = try self.navigation.navigation.plan(machineID: machineID) {
+                    if let plan = try self.machinePlan(machineID) {
                         try await self.navigation.perform(plan)
                     }
                     try self.checkOverviewNavigation(generation)
@@ -498,7 +774,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         // Switching how the phone uses a shared pane reconnects it.
         if changingMuxModes.contains(machineID) { return .connecting }
         if disconnected.contains(machineID) { return .disconnected }
-        guard let session = sessions[machineID] else {
+        guard let session = displayedSession(machineID) else {
             return connectionIntent.shouldPrepare(machineID) ? .connecting : .disconnected
         }
         if residency.wasReleased(machineID: machineID, ownerID: session.id) {
@@ -506,11 +782,11 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             return connectionIntent.shouldPrepare(machineID) && permitsPreparation(machineID) ? .connecting : .disconnected
         }
         switch session.phase {
-        case .idle, .connecting: return .connecting
+        case .idle, .connecting: return session.settled && session.terminalSessionID != nil ? .attention : .connecting
         case .ready: return .ready
         case .live: return .live
         case .ended, .failed, .couldNotConnect:
-            return autoConnect && session.dropped && connectionIntent.permitsReconnect(machineID)
+            return session.terminalSessionID == nil && autoConnect && session.dropped && connectionIntent.permitsReconnect(machineID)
                 && reconnectPolicies[machineID, default: .init()].nextDelay != nil
                 ? .connecting : .attention
         }
@@ -518,7 +794,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     /// A live machine off screen with output the phone has not shown since.
     func hasUnseenOutput(_ machineID: String) -> Bool {
-        machineID != selectedMachineID && status(of: machineID) == .live && sessions[machineID]?.hasUnseenOutput == true
+        terminalControllers(machineID).contains {
+            $0.phase == .live && $0.hasUnseenOutput && (machineID != selectedMachineID || selectedSession !== $0)
+        }
     }
 
     /// Input notices remain meaningful after reconnect, independently of the
@@ -526,11 +804,17 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// failure. Unavailable routes still need their key or trust requirement
     /// resolved before the machine can connect.
     func attentionReasons(_ machineID: String) -> Set<TerminalAttentionReason> {
-        let status = status(of: machineID), session = sessions[machineID]
-        return TerminalAttentionReason.observed(input: session?.inputDelivery ?? .init(),
-            keyboardNeedsDecision: session?.localInputNeedsDecision == true,
-            connectionNeedsAttention: status == .attention || status == .unavailable,
+        var reasons = TerminalAttentionReason.observed(input: .init(),
+            keyboardNeedsDecision: false,
+            connectionNeedsAttention: status(of: machineID) == .attention || status(of: machineID) == .unavailable
+                || !earlierTerminals(machineID).isEmpty,
             newOutput: hasUnseenOutput(machineID))
+        for controller in terminalControllers(machineID) {
+            reasons.formUnion(TerminalAttentionReason.observed(input: controller.inputDelivery,
+                keyboardNeedsDecision: controller.localInputNeedsDecision,
+                connectionNeedsAttention: false, newOutput: false))
+        }
+        return reasons
     }
 
     func requiresNewSession(_ machineID: String) -> Bool { connectionIntent.requiresNewSession.contains(machineID) }
@@ -562,10 +846,12 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         onScreen = true
         setForeground(active)
         let id = UUID(); appearanceGeneration = id
-        pendingGroupAppearance = GroupAppearance(id: id, machineID: machineID, group: group,
+        pendingGroupAppearance = GroupAppearance(id: id, machineID: machineID,
+                                                 terminalSessionID: selectedTerminalSessionIDs[machineID], group: group,
                                                  navigationGroup: navigationGroup, connectOnOpen: connectOnOpen)
         startGroupAppearance()
         updatePresentationVisibility()
+        refreshTerminalHistory()
     }
 
     /// One retained worker and one latest request, even when navigation is busy.
@@ -609,6 +895,13 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                     }
                 }
                 try self.checkGroupAppearance(request)
+                if let desired = self.session(machineID: request.machineID, terminalSessionID: request.terminalSessionID),
+                   let paneID = self.selection(for: desired).paneID,
+                   self.navigation.navigation.machines.first(where: { $0.id == request.machineID })?.panes.contains(where: { $0.id == paneID }) == true,
+                   let plan = try self.navigation.navigation.plan(paneID: paneID) {
+                    try await self.navigation.perform(plan)
+                    try self.checkGroupAppearance(request)
+                }
                 guard self.navigation.navigation.group == request.navigationGroup,
                       self.selectedMachineID == request.machineID else { throw TerminalNavigationError.stale }
                 if request.connectOnOpen {
@@ -647,11 +940,12 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// keyboard and rendering stop until it returns.
     func disappear() {
         guard !closed else { return }
-        for controller in sessions.values { controller.discardHostKeyMismatch() }
+        for controller in allControllers { controller.discardHostKeyMismatch() }
         splitGeneration = UUID(); splitJob?.cancel()
         cancelOverview()
         cancelGroupAppearance()
         onScreen = false
+        updateTerminalAuthenticationOwner()
         canvasGeneration = UUID()
         appearanceSelection = nil
         navigation.suspend()
@@ -703,14 +997,14 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func enteredBackground() {
         guard !closed else { return }
         cancelOverview()
-        for controller in sessions.values { controller.discardHostKeyMismatch() }
+        for controller in allControllers { controller.discardHostKeyMismatch() }
         inBackground = true
         cancelGroupAppearance()
         // iOS may stop executing immediately after its grace period. Time we
         // cannot observe a session must not count as a stable live interval.
         for id in Array(reconnectPolicies.keys) { reconnectPolicies[id]?.recordEnd() }
         cancelReconnects()
-        for controller in sessions.values { controller.suspendPendingTerminalCreation() }
+        for controller in allControllers { controller.suspendPendingTerminalCreation() }
     }
 
     /// A hint from the device's network path, never proof that a transport
@@ -727,7 +1021,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         for id in sessions.keys where connectionIntent.permitsReconnect(id) {
             reconnectPolicies[id, default: .init()].networkChanged()
         }
-        for session in sessions.values { session.networkRouteChanged() }
+        for session in allControllers { session.networkRouteChanged() }
         reconcile()
     }
 
@@ -750,7 +1044,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 try await whileBusy {
                     guard self.appearanceGeneration == appearance, !self.groupAppearanceBlocksInput,
                           self.navigationMachineIDs.contains(machineID) else { throw TerminalNavigationError.stale }
-                    guard let plan = try self.navigation.navigation.plan(machineID: machineID) else { return }
+                    guard let plan = try self.machinePlan(machineID) else { return }
                     try await self.navigation.perform(plan)
                 }
             } catch { report(error) }
@@ -777,17 +1071,17 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                     try Task.checkCancellation()
                     guard self.splitGeneration == generation, self.appearanceGeneration == appearance,
                           !self.closed, self.onScreen, self.foreground, self.splitAvailable,
-                          self.selectedMachineID == first, self.sessions[first] === original,
+                          self.selectedMachineID == first, self.displayedSession(first) === original,
                           !self.overviewBlocksInput, !self.groupAppearanceBlocksInput,
                           self.navigationMachineIDs.contains(machineID) else { throw CancellationError() }
-                    guard let plan = try self.navigation.navigation.plan(machineID: machineID) else {
+                    guard let plan = try self.machinePlan(machineID) else {
                         throw TerminalNavigationError.unavailable
                     }
                     try await self.navigation.perform(plan)
                 }
                 try Task.checkCancellation()
                 guard self.splitGeneration == generation, !self.closed, self.onScreen,
-                      self.selectedMachineID == machineID, self.sessions[first] === original else {
+                      self.selectedMachineID == machineID, self.displayedSession(first) === original else {
                     throw CancellationError()
                 }
                 try self.splitLayout.open(first: first, second: machineID, available: self.navigationMachineIDs)
@@ -824,8 +1118,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                     guard self.appearanceGeneration == appearance, !self.groupAppearanceBlocksInput else {
                         throw TerminalNavigationError.stale
                     }
-                    guard let plan = try self.navigation.navigation.plan(axis: .machine,
-                                                                         direction: forward ? .next : .previous) else { return }
+                    guard let adjacent = try self.navigation.navigation.plan(axis: .machine,
+                                                                         direction: forward ? .next : .previous),
+                          let plan = try self.machinePlan(adjacent.destination.machineID) else { return }
                     try await self.navigation.perform(plan)
                 }
             } catch { report(error) }
@@ -838,12 +1133,33 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// is ignored, as a swipe is.
     func stepPane(forward: Bool) {
         guard !closed, !overviewBlocksInput, !groupAppearanceBlocksInput,
-              let session = selectedSession, session.phase == .live,
-              !session.paneNavigationBusy, !session.clipboardIsPresenting,
-              let control = session.muxControl else { return }
+              let session = selectedSession,
+              !session.paneNavigationBusy, !session.clipboardIsPresenting else { return }
         do {
-            if let plan = try control.inputRouting.navigation(forward: forward) { session.showPane(plan.paneID) }
+            if let control = session.muxControl, session.phase == .live {
+                if let plan = try control.inputRouting.navigation(forward: forward) { session.showPane(plan.paneID) }
+            } else if let action = captureCanvasAction(.pane, forward ? .next : .previous) {
+                Task { do { try await action() } catch { report(error) } }
+            }
         } catch { report(error) }
+    }
+
+    private func machinePlan(_ machineID: String) throws -> TerminalNavigationPlan? {
+        if let controller = displayedSession(machineID),
+           let paneID = selection(for: controller).paneID,
+           navigation.navigation.machines.first(where: { $0.id == machineID })?.panes.contains(where: { $0.id == paneID }) == true {
+            return try navigation.navigation.plan(paneID: paneID)
+        }
+        return try navigation.navigation.plan(machineID: machineID)
+    }
+
+    private func localPanePlan(_ direction: TerminalNavigationDirection) throws -> TerminalNavigationPlan? {
+        guard let machineID = selectedMachineID, let selectedSession else { return nil }
+        let controllers = terminalControllers(machineID)
+        guard controllers.count > 1, let index = controllers.firstIndex(where: { $0 === selectedSession }) else { return nil }
+        let next = (index + (direction == .next ? 1 : controllers.count - 1)) % controllers.count
+        guard let paneID = selection(for: controllers[next]).paneID else { return nil }
+        return try navigation.navigation.plan(paneID: paneID)
     }
 
     /// A machine or pane other than the one on screen has output the phone
@@ -883,23 +1199,43 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     private func nextAttention() -> TerminalUnseenOutput.Source? {
         var ring: [TerminalUnseenOutput.Source] = [], attention: Set<TerminalUnseenOutput.Source> = []
-        var current = selectedMachineID.map { TerminalUnseenOutput.Source(machineID: $0) }
+        var current = selectedMachineID.map {
+            TerminalUnseenOutput.Source(machineID: $0, terminalSessionID: selectedSession?.terminalSessionID)
+        }
         for id in navigationMachineIDs {
-            let machine = TerminalUnseenOutput.Source(machineID: id)
-            let reasons = attentionReasons(id)
-            ring.append(machine)
-            // Machine-wide warnings belong to the machine, never an invented
-            // pane attribution. The selected machine already shows its notice.
-            if id != selectedMachineID, !reasons.subtracting([.newOutput]).isEmpty { attention.insert(machine) }
-            if let session = sessions[id], session.phase == .live, let state = session.muxControl?.current,
-               !state.panes.isEmpty {
-                for pane in state.panes {
-                    let source = TerminalUnseenOutput.Source(machineID: id, paneID: pane.paneId)
-                    ring.append(source)
-                    if id == selectedMachineID, pane.paneId == state.shown { current = source }
-                    else if status(of: id) == .live, state.unread.contains(pane.paneId) { attention.insert(source) }
+            let controllers = terminalControllers(id)
+            if controllers.isEmpty {
+                let source = TerminalUnseenOutput.Source(machineID: id)
+                ring.append(source)
+                if id != selectedMachineID, !attentionReasons(id).isEmpty { attention.insert(source) }
+            }
+            for controller in controllers {
+                let source = TerminalUnseenOutput.Source(machineID: id, terminalSessionID: controller.terminalSessionID)
+                ring.append(source)
+                if id != selectedMachineID, controller.terminalSessionID == nil, !earlierTerminals(id).isEmpty {
+                    attention.insert(source)
                 }
-            } else if reasons.contains(.newOutput) { attention.insert(machine) }
+                let selected = selectedSession === controller
+                let needsConnection: Bool
+                switch controller.phase {
+                case .failed, .couldNotConnect: needsConnection = true
+                case .ended: needsConnection = controller.dropped
+                case .idle, .connecting, .ready, .live: needsConnection = false
+                }
+                let reasons = TerminalAttentionReason.observed(input: controller.inputDelivery,
+                    keyboardNeedsDecision: controller.localInputNeedsDecision,
+                    connectionNeedsAttention: needsConnection,
+                    newOutput: controller.phase == .live && controller.hasUnseenOutput)
+                if !selected, !reasons.isEmpty { attention.insert(source) }
+                if controller.phase == .live, let state = controller.muxControl?.current {
+                    for pane in state.panes {
+                        let paneSource = TerminalUnseenOutput.Source(machineID: id, paneID: pane.paneId)
+                        ring.append(paneSource)
+                        if selected, pane.paneId == state.shown { current = paneSource }
+                        else if state.unread.contains(pane.paneId) { attention.insert(paneSource) }
+                    }
+                }
+            }
         }
         return TerminalUnseenOutput.next(after: current, ring: ring, unseen: attention)
     }
@@ -908,7 +1244,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// before yielding. Reconnecting, inventory replacement, and A -> B -> A
     /// cannot turn the click into a visit to a replacement pane with its number.
     private func visitFleetSource(_ source: TerminalUnseenOutput.Source) {
-        let session = sessions[source.machineID]
+        let session = session(machineID: source.machineID, terminalSessionID: source.terminalSessionID)
         let target: TerminalFleetVisit
         do {
             var pane: TerminalMuxInputRouting.NavigationPlan?
@@ -923,22 +1259,26 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         let appearance = appearanceGeneration
         Task {
             do {
-                if target.machineID != self.selectedMachineID {
+                if target.machineID != self.selectedMachineID || self.selectedSession !== session {
                     try await whileBusy {
                         guard self.appearanceGeneration == appearance, !self.groupAppearanceBlocksInput,
                               self.foreground, self.onScreen, !self.overviewBlocksInput,
                               self.navigationMachineIDs.contains(target.machineID) else { throw TerminalNavigationError.stale }
-                        try target.validate(sessionID: self.sessions[target.machineID]?.id,
-                                            routing: self.sessions[target.machineID]?.muxControl?.inputRouting)
-                        guard let plan = try self.navigation.navigation.plan(machineID: target.machineID) else { return }
-                        try await self.navigation.perform(plan)
+                        try target.validate(sessionID: self.session(machineID: target.machineID, terminalSessionID: source.terminalSessionID)?.id,
+                                            routing: self.session(machineID: target.machineID, terminalSessionID: source.terminalSessionID)?.muxControl?.inputRouting)
+                        let plan: TerminalNavigationPlan?
+                        if let session, let paneID = self.selection(for: session).paneID,
+                           self.navigation.navigation.machines.first(where: { $0.id == target.machineID })?.panes.contains(where: { $0.id == paneID }) == true {
+                            plan = try self.navigation.navigation.plan(paneID: paneID)
+                        } else { plan = try self.navigation.navigation.plan(machineID: target.machineID) }
+                        if let plan { try await self.navigation.perform(plan) }
                     }
                 }
                 guard self.appearanceGeneration == appearance, !self.closed, self.foreground, self.onScreen,
                       !self.overviewBlocksInput, !self.groupAppearanceBlocksInput,
                       self.selectedMachineID == target.machineID else { throw TerminalNavigationError.stale }
-                try target.validate(sessionID: self.sessions[target.machineID]?.id,
-                                    routing: self.sessions[target.machineID]?.muxControl?.inputRouting)
+                try target.validate(sessionID: self.session(machineID: target.machineID, terminalSessionID: source.terminalSessionID)?.id,
+                                    routing: self.session(machineID: target.machineID, terminalSessionID: source.terminalSessionID)?.muxControl?.inputRouting)
                 guard let pane = target.pane else { return }
                 // The machine's own view settles first, as after a chip tap.
                 for _ in 0..<40 {
@@ -952,7 +1292,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                     guard self.appearanceGeneration == appearance, !self.closed, self.foreground, self.onScreen,
                           !self.overviewBlocksInput, !self.groupAppearanceBlocksInput,
                           self.selectedMachineID == target.machineID,
-                          self.sessions[target.machineID] === session else { throw TerminalNavigationError.stale }
+                          self.selectedSession === session else { throw TerminalNavigationError.stale }
                     try target.validate(sessionID: session.id, routing: control.inputRouting)
                     if !session.paneNavigationBusy {
                         try await session.navigatePane(pane)
@@ -966,22 +1306,24 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     private func nextUnseenOutput() -> TerminalUnseenOutput.Source? {
         var ring: [TerminalUnseenOutput.Source] = [], unseen: Set<TerminalUnseenOutput.Source> = []
-        var current = selectedMachineID.map { TerminalUnseenOutput.Source(machineID: $0) }
+        var current = selectedMachineID.map {
+            TerminalUnseenOutput.Source(machineID: $0, terminalSessionID: selectedSession?.terminalSessionID)
+        }
         for id in navigationMachineIDs {
-            let selected = id == selectedMachineID
-            // A machine off screen keeps its mux state current without a view.
-            if let session = sessions[id], session.phase == .live, let state = session.muxControl?.current,
-               !state.panes.isEmpty {
-                for pane in state.panes {
-                    let source = TerminalUnseenOutput.Source(machineID: id, paneID: pane.paneId)
+            for session in terminalControllers(id) {
+                let selected = selectedSession === session
+                if session.phase == .live, let state = session.muxControl?.current, !state.panes.isEmpty {
+                    for pane in state.panes {
+                        let source = TerminalUnseenOutput.Source(machineID: id, paneID: pane.paneId)
+                        ring.append(source)
+                        if selected, pane.paneId == state.shown { current = source }
+                        else if state.unread.contains(pane.paneId) { unseen.insert(source) }
+                    }
+                } else {
+                    let source = TerminalUnseenOutput.Source(machineID: id, terminalSessionID: session.terminalSessionID)
                     ring.append(source)
-                    if selected, pane.paneId == state.shown { current = source }
-                    else if status(of: id) == .live, state.unread.contains(pane.paneId) { unseen.insert(source) }
+                    if !selected, session.phase == .live, session.hasUnseenOutput { unseen.insert(source) }
                 }
-            } else {
-                let source = TerminalUnseenOutput.Source(machineID: id)
-                ring.append(source)
-                if hasUnseenOutput(id) { unseen.insert(source) }
             }
         }
         return TerminalUnseenOutput.next(after: current, ring: ring, unseen: unseen)
@@ -1013,12 +1355,20 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         }
         switch axis {
         case .machine:
-            guard let plan = try? navigation.navigation.plan(axis: .machine, direction: direction) else { return nil }
+            guard let adjacent = try? navigation.navigation.plan(axis: .machine, direction: direction),
+                  let plan = try? machinePlan(adjacent.destination.machineID) else { return nil }
             return { [weak self] in
                 guard let self, stillCurrent() else { throw TerminalNavigationError.stale }
                 try await self.navigation.perform(plan)
             }
         case .pane:
+            if selectedSession?.muxControl == nil {
+                guard let plan = try? localPanePlan(direction) else { return nil }
+                return { [weak self] in
+                    guard let self, stillCurrent() else { throw TerminalNavigationError.stale }
+                    try await self.navigation.perform(plan)
+                }
+            }
             guard let session = selectedSession, session.phase == .live, let control = session.muxControl,
                   let plan = try? control.inputRouting.navigation(forward: direction == .next) else { return nil }
             return { [weak session, weak control] in
@@ -1040,6 +1390,22 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// this exact machine even when its route is manual or its old PTY ended.
     func openTerminal(_ machineID: String) {
         requestConnection(machineID, terminal: true)
+    }
+
+    func openTerminal(_ controller: TerminalSessionController) {
+        guard selectedSession === controller, owns(controller) else { return }
+        if controller.terminalSessionID == nil { openTerminal(controller.target.machineID) }
+        else if controller.phase == .ready, permitsTerminalCreation, onScreen,
+                let slotID = controller.terminalSessionID, !invalidatedTerminalSlots.contains(slotID) {
+            startAdditional(controller)
+        }
+        else { restartTerminal(controller) }
+    }
+
+    func retryConnection(_ controller: TerminalSessionController) {
+        guard selectedSession === controller, owns(controller) else { return }
+        if controller.terminalSessionID == nil { connect(controller.target.machineID) }
+        else { restartTerminal(controller) }
     }
 
     private func requestConnection(_ machineID: String, terminal: Bool) {
@@ -1110,8 +1476,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             self.reconcile()
         }
         sessions[machineID] = controller
+        updateTerminalAuthenticationOwner()
         residency.started(machineID)
-        controller.setPresentationVisible(isPresented(machineID))
+        controller.setPresentationVisible(isPresented(machineID) && displayedSession(machineID) === controller)
         runController(controller, machineID: machineID, starting: true)
     }
 
@@ -1133,7 +1500,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             if !Task.isCancelled, self.permitsTerminalCreation,
                self.sessions[machineID] === controller, controller.phase == .ready {
                 let opening = self.connectionIntent.opening(machineID, creation: controller.route.sessionCreation)
-                if opening == .explicit || (opening == .onSelect && self.isVisible(machineID)) {
+                if opening == .explicit || (opening == .onSelect && self.shows(controllerID: controller.id, machineID: machineID)) {
                     await controller.activateTerminal(explicit: opening == .explicit)
                 }
             }
@@ -1160,7 +1527,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         controllerJobs[machineID]?.task.cancel()
         cancelReconnect(machineID)
         reconnectPolicies[machineID] = nil
-        if let session = sessions[machineID] {
+        for session in terminalControllers(machineID) {
+            if let slotID = session.terminalSessionID { additionalJobs[slotID]?.cancel() }
             session.requestStop()
             Task { await session.stop() }
         }
@@ -1177,13 +1545,15 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         guard permitsTerminalCreation,
               machines.contains(where: { $0.id == machineID }),
               sessions[machineID]?.id == expectedControllerID else { throw WorkspaceSSHConnectionError.stale }
-        let session = sessions[machineID]
+        let machineControllers = terminalControllers(machineID)
+        let extraStartups = machineControllers.compactMap { $0.terminalSessionID.flatMap { additionalJobs[$0] } }
         let startup = controllerJobs[machineID]?.task
         let muxChange = muxModeJobs[machineID]?.task
         let reconnect = reconnectJobs[machineID]?.task
-        session?.requestRouteChange()
+        for controller in machineControllers { controller.requestRouteChange() }
         disconnect(machineID, expectedControllerID: expectedControllerID)
-        await session?.stop()
+        for controller in machineControllers { await controller.stop() }
+        for startup in extraStartups { await startup.value }
         await startup?.value
         await muxChange?.value
         await reconnect?.value
@@ -1192,7 +1562,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
               disconnected.contains(machineID), controllerJobs[machineID] == nil else {
             throw WorkspaceSSHConnectionError.stale
         }
-        guard session == nil || session?.settled == true else { throw WorkspaceSSHConnectionError.busy }
+        guard machineControllers.allSatisfy(\.settled) else { throw WorkspaceSSHConnectionError.busy }
     }
 
     /// Publish only after current local policy was rechecked and the old owner
@@ -1202,7 +1572,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         guard permitsTerminalCreation, target.workspaceID == workspaceID, target.revision == revision,
               let index = machines.firstIndex(where: { $0.id == target.machineID }),
               sessions[target.machineID]?.id == expectedControllerID,
-              sessions[target.machineID] == nil || sessions[target.machineID]?.settled == true,
+              terminalControllers(target.machineID).allSatisfy(\.settled),
               controllerJobs[target.machineID] == nil, disconnected.contains(target.machineID) else {
             throw WorkspaceSSHConnectionError.stale
         }
@@ -1212,7 +1582,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         changedRouteMachines.insert(target.machineID)
         muxAccessSelections[target.machineID] = nil
         existingMuxRequired.remove(target.machineID)
-        sessions[target.machineID]?.discardRetainedOutput()
+        invalidatedTerminalSlots.formUnion((additionalSessions[target.machineID] ?? []).map(\.id))
+        for controller in terminalControllers(target.machineID) { controller.discardRetainedOutput() }
     }
 
     /// The mode a machine's shared pane is reconnecting in, while it is.
@@ -1281,14 +1652,14 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         let ready = Set(sessions.filter { $0.value.phase == .idle || $0.value.phase == .ready }.map(\.key))
         let readyOrder = (try? TerminalConnectionOrder.prioritize(machines.map(\.id), selected: selectedMachineID,
                                                                  including: ready)) ?? []
-        for id in readyOrder where controllerJobs.count < 3 && controllerJobs[id] == nil {
+        for id in readyOrder where controllerJobs.count + additionalJobs.count < 3 && controllerJobs[id] == nil {
             guard let controller = sessions[id], !disconnected.contains(id) else { continue }
             if controller.phase == .idle {
                 runController(controller, machineID: id, starting: true)
                 continue
             }
             let opening = connectionIntent.opening(id, creation: controller.route.sessionCreation)
-            if opening == .explicit || (opening == .onSelect && isVisible(id)) {
+            if opening == .explicit || (opening == .onSelect && shows(controllerID: controller.id, machineID: id)) {
                 runController(controller, machineID: id, starting: false)
             }
         }
@@ -1299,7 +1670,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         let first = Set(preparedOrder)
         let inventory = preparedOrder + machines.map(\.id).filter { !first.contains($0) }
         let order = (try? TerminalConnectionOrder.prioritize(inventory, selected: selectedMachineID, including: included)) ?? preparedOrder
-        var slots = max(0, 3 - controllerJobs.count)
+        var slots = max(0, 3 - controllerJobs.count - additionalJobs.count)
         for id in order {
             guard !disconnected.contains(id), controllerJobs[id] == nil, permitsPreparation(id) else { continue }
             if let session = sessions[id] {
@@ -1316,7 +1687,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 }
             }
             guard slots > 0 else { continue }
-            if sessions.values.filter({ !$0.settled }).count >= residency.limit {
+            if allControllers.filter({ !$0.settled }).count >= residency.limit {
                 // Background warming alone must never evict another warm-up.
                 // Only visible approved demand or an explicit action may do so.
                 if (onScreen && id == selectedMachineID) || requestedConnections.contains(id) {
@@ -1370,18 +1741,19 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         do {
             let priority = try TerminalConnectionOrder.prioritize(inventory, selected: selectedMachineID,
                                                                   including: Set(inventory))
-            let owned = sessions.compactMap { id, controller -> TerminalConnectionResidency.Owner? in
+            let owned = allControllers.compactMap { controller -> TerminalConnectionResidency.Owner? in
                 guard !controller.settled else { return nil }
+                let id = controller.target.machineID
                 let state: TerminalConnectionResidency.State
                 switch controller.phase {
                 case .ready:
-                    state = controllerJobs[id] == nil && controller.canReleaseUnusedPreparation
+                    state = controller.terminalSessionID == nil && controllerJobs[id] == nil && controller.canReleaseUnusedPreparation
                         && !explicitPreparations.contains(id) ? .automaticPreparation : .protectedPreparation
                 case .live: state = .terminal
                 case .idle, .connecting: state = .preparing
                 case .ended, .failed, .couldNotConnect: state = .settling
                 }
-                return .init(machineID: id, id: controller.id, state: state)
+                return .init(machineID: id, id: controller.id, state: state, terminalSessionID: controller.terminalSessionID)
             }
             let protected = Set([selectedMachineID].compactMap { $0 }).union(explicitPreparations)
             guard case let .release(candidate) = try residency.decision(for: machineID, priority: priority,
@@ -1454,8 +1826,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         guard !Task.isCancelled, !closed, onScreen, foreground, !overviewBlocksInput, !groupAppearanceBlocksInput,
               selectedSession?.keyboardActivationBlocked != true,
               let selection = navigation.navigation.selection, selection.paneID != nil,
-              sessions[selection.machineID]?.phase == .live,
-              source == nil || bindings[selection.machineID]?.source == source,
+              selectedSession?.phase == .live,
+              source == nil || selectedBinding?.source == source,
               showKeyboard || selectedSession?.terminal?.isSceneActive == true else { return }
         let displayKeyboard = showKeyboard && selectedSession?.isViewingOnly != true
         if navigation.phase == .ready, owner.keyboard?.acceptsInput == true {
@@ -1469,7 +1841,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
               !overviewBlocksInput, !groupAppearanceBlocksInput,
               navigation.navigation.selection == selection,
               selectedSession?.keyboardActivationBlocked != true,
-              source == nil || bindings[selection.machineID]?.source == source,
+              source == nil || selectedBinding?.source == source,
               showKeyboard || (selectedSession?.terminal?.isSceneActive == true
                   && selectedSession?.terminal?.sceneActivityGeneration == activity) else { return }
         let request = UUID()
@@ -1483,7 +1855,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func applyTheme(_ theme: WorkspaceDocument.Theme, to machineID: String) {
         guard !closed, machines.contains(where: { $0.id == machineID }) else { return }
         themes[machineID] = theme
-        sessions[machineID]?.applyTheme(theme)
+        for controller in terminalControllers(machineID) { controller.applyTheme(theme) }
     }
 
     /// Synchronously seal every scene-owned responder before scheduling joins.
@@ -1499,8 +1871,10 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         cancelReconnects()
         for job in muxModeJobs.values { job.task.cancel() }
         for job in controllerJobs.values { job.task.cancel() }
+        for job in additionalJobs.values { job.cancel() }
+        updateTerminalAuthenticationOwner()
         navigation.suspend()
-        for controller in sessions.values {
+        for controller in allControllers {
             controller.discardRetainedOutput()
             controller.requestStop()
         }
@@ -1511,9 +1885,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func close() async {
         requestClose()
         if let closing { await closing.value; return }
-        let controllers = Array(sessions.values), navigation = self.navigation, files = remoteFiles
+        let controllers = allControllers, navigation = self.navigation, files = remoteFiles
         let reconnects = reconnectJobs.values.map(\.task)
-        let operations = controllerJobs.values.map(\.task)
+        let operations = controllerJobs.values.map(\.task) + Array(additionalJobs.values)
         let modeChanges = muxModeJobs.values.map(\.task)
         let overview = overviewJob?.task
         let appearance = groupAppearanceJob?.task
@@ -1542,11 +1916,33 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     }
     func dismissProblem() { problem = nil }
 
-    private func inventory(_ values: [String: TerminalKeyboardNavigationBinding]) throws -> [TerminalNavigationMachine] {
+    private func inventory(_ values: [UUID: TerminalKeyboardNavigationBinding]) throws -> [TerminalNavigationMachine] {
         try machines.map { machine in
-            let panes = try values[machine.id].map { [try TerminalNavigationPane(id: $0.paneID, title: "Direct SSH")] }
-            return try TerminalNavigationMachine(id: machine.id, name: machine.name, panes: panes ?? [])
+            let hasTabs = additionalSessions[machine.id]?.isEmpty == false
+            let panes = try terminalControllers(machine.id).compactMap { controller -> TerminalNavigationPane? in
+                guard hasTabs || values[controller.id] != nil else { return nil }
+                return try TerminalNavigationPane(id: selection(for: controller, bindings: values).paneID!,
+                    title: hasTabs ? terminalTitle(controller) : "Direct SSH")
+            }
+            return try TerminalNavigationMachine(id: machine.id, name: machine.name, panes: panes)
         }
+    }
+
+    private func inactiveSelections(_ values: [UUID: TerminalKeyboardNavigationBinding]) -> [TerminalNavigationSelection] {
+        machines.flatMap { machine -> [TerminalNavigationSelection] in
+            guard additionalSessions[machine.id]?.isEmpty == false else { return [] }
+            return terminalControllers(machine.id).filter { values[$0.id] == nil }
+                .map { selection(for: $0, bindings: values) }
+        }
+    }
+
+    /// Publish the same exact inventory to the input owner and navigation.
+    /// Ended/connecting slots are inert placeholders, never fabricated input.
+    private func publishBindings(_ values: [UUID: TerminalKeyboardNavigationBinding]) throws {
+        let inventory = try inventory(values)
+        try owner.replaceBindings(Array(values.values), inactiveSelections: inactiveSelections(values))
+        bindings = values
+        try navigation.replaceInventory(inventory)
     }
 
     /// Committed navigation: show its machine and, once the destination's focus
@@ -1554,6 +1950,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// that connected in the background gets its view now.
     private func navigationChanged() {
         let selection = navigation.navigation.selection
+        let oldControllerID = selectedSession?.id
         navigationMachineIDs = navigation.navigation.machines.map(\.id)
         splitLayout.reconcile(previous: selectedMachineID, selected: selection?.machineID,
                               available: navigationMachineIDs)
@@ -1563,6 +1960,14 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             reconcileRemoteFiles()
             do { try connectionIntent.select(selectedMachineID) } catch { report(error) }
         }
+        if let selection, let controller = controller(for: selection) {
+            selectedTerminalSessionIDs[selection.machineID] = controller.terminalSessionID
+        }
+        if oldControllerID != selectedSession?.id {
+            canvasGeneration = UUID()
+            reconcileRemoteFiles()
+        }
+        updateTerminalAuthenticationOwner()
         if !groupAppearanceBlocksInput, appearanceSelection == selectedMachineID { appearanceSelection = nil }
         updatePresentationVisibility()
         if onScreen, !overviewBlocksInput, !groupAppearanceBlocksInput,
@@ -1572,7 +1977,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
               navigation.phase == .ready, let selection, selection.paneID != nil,
               let keyboard = owner.keyboard else { return }
         let visible = keyboardPresentation.flatMap { $0.selection == selection ? $0.visible : nil } ?? true
-        sessions[selection.machineID]?.install(keyboard, showKeyboard: visible)
+        controller(for: selection)?.install(keyboard, showKeyboard: visible)
     }
 
     private func isVisible(_ machineID: String) -> Bool {
@@ -1586,9 +1991,10 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     }
 
     private func updatePresentationVisibility() {
-        for (machineID, controller) in sessions {
+        for controller in allControllers {
+            let machineID = controller.target.machineID
             controller.setOverviewBlocking(overviewBlocksInput || groupAppearanceBlocksInput)
-            controller.setPresentationVisible(isPresented(machineID))
+            controller.setPresentationVisible(isPresented(machineID) && displayedSession(machineID) === controller)
         }
     }
 
@@ -1613,29 +2019,38 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     func shows(machineID: String) -> Bool { isVisible(machineID) }
 
+    func shows(controllerID: UUID, machineID: String) -> Bool {
+        isVisible(machineID) && displayedSession(machineID)?.id == controllerID
+    }
+
     func attach(machineID: String, source: TerminalSource,
                 encoder: any TerminalKeyboardEncoding) async throws -> TerminalKeyboardSession {
-        guard !closed, machines.contains(where: { $0.id == machineID }),
+        guard let controller = sessions[machineID] else { throw TerminalNavigationError.unavailable }
+        return try await attach(controllerID: controller.id, machineID: machineID, source: source, encoder: encoder)
+    }
+
+    func attach(controllerID: UUID, machineID: String, source: TerminalSource,
+                encoder: any TerminalKeyboardEncoding) async throws -> TerminalKeyboardSession {
+        guard !closed, terminalControllers(machineID).contains(where: { $0.id == controllerID }),
               source.identity.machineID == machineID else { throw TerminalNavigationError.unavailable }
         let binding = TerminalKeyboardNavigationBinding(source: source, encoder: encoder)
         // Bindings are installed before the inventory offers the new pane.
         // Recompute after each busy wait, so another machine's concurrent
         // attachment/detachment is never overwritten by an old dictionary.
         try await whileBusy {
-            guard !self.closed else { throw TerminalNavigationError.unavailable }
-            var next = self.bindings; next[machineID] = binding
-            let inventory = try self.inventory(next)
-            try self.owner.replaceBindings(Array(next.values))
-            self.bindings = next
-            try self.navigation.replaceInventory(inventory)
+            guard !self.closed, self.terminalControllers(machineID).contains(where: { $0.id == controllerID }) else {
+                throw TerminalNavigationError.unavailable
+            }
+            var next = self.bindings; next[controllerID] = binding
+            try self.publishBindings(next)
         }
         // The sign-in that led here usually ends behind Face ID's sheet, which
         // leaves the scene inactive for a moment; the keyboard waits for it
         // rather than failing the new session. Background still refuses.
         for _ in 0..<200 where !foreground && !inBackground && !closed { try await Task.sleep(for: .milliseconds(50)) }
         try await whileBusy {
-            guard !self.closed, self.bindings[machineID]?.source == source else { throw TerminalNavigationError.stale }
-            guard self.isVisible(machineID) else { throw CancellationError() }
+            guard !self.closed, self.bindings[controllerID]?.source == source else { throw TerminalNavigationError.stale }
+            guard self.shows(controllerID: controllerID, machineID: machineID) else { throw CancellationError() }
             guard let plan = try self.navigation.navigation.plan(paneID: binding.paneID)
                     ?? self.navigation.navigation.activationPlan() else { throw TerminalNavigationError.unavailable }
             try await self.navigation.perform(plan)
@@ -1647,30 +2062,49 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     }
 
     func detach(machineID: String, source: TerminalSource) async throws {
+        let departing = terminalControllers(machineID).first { bindings[$0.id]?.source == source }
         // Removing the visible source seals its input before the list changes.
         // Preserve the old map on refused binding admission. A retry also
         // reconciles inventory if an earlier inventory update failed afterward.
         try await whileBusy {
             var next = self.bindings
-            if next[machineID]?.source == source { next[machineID] = nil }
-            let inventory = try self.inventory(next)
-            try self.owner.replaceBindings(Array(next.values))
-            self.bindings = next
-            try self.navigation.replaceInventory(inventory)
+            for (id, binding) in next where binding.source == source { next[id] = nil }
+            try self.publishBindings(next)
         }
         await owner.joinSealed()
+        // Preserve this exact ended tab as an input-free ring position. This
+        // never selects a sibling or creates a replacement shell, and a newer
+        // user selection wins while the old source's cleanup is joining.
+        if let departing, owns(departing), selectedSession === departing,
+           additionalSessions[machineID]?.isEmpty == false, permitsCanvasNavigation,
+           navigation.navigation.selection?.paneID == nil {
+            try await whileBusy {
+                guard self.owns(departing), self.selectedSession === departing, self.permitsCanvasNavigation,
+                      self.bindings[departing.id] == nil,
+                      self.navigation.navigation.selection?.paneID == nil else { return }
+                guard let paneID = self.selection(for: departing).paneID,
+                      let plan = try self.navigation.navigation.plan(paneID: paneID) else { return }
+                try await self.navigation.perform(plan)
+            }
+        }
     }
 
     func fontSizeChanged(_ size: Double) {
         UserDefaults.standard.set(size, forKey: TerminalSessionController.fontSizeKey)
-        for session in sessions.values { session.setFontSize(size) }
+        for session in allControllers { session.setFontSize(size) }
     }
 
     func inputRetired(machineID: String) {
+        guard let controller = displayedSession(machineID) else { return }
+        inputRetired(controllerID: controller.id, machineID: machineID)
+    }
+
+    func inputRetired(controllerID: UUID, machineID: String) {
         // A handoff retires the old keyboard itself and reports it synchronously;
         // sealing then would invalidate the switch in flight. Only a settled
         // selection's lost input (dismissal, resign, OS) is sealed here.
         guard navigation.phase == .ready, owner.currentSelection?.machineID == machineID,
+              selectedSession?.id == controllerID,
               owner.keyboard?.acceptsInput != true else { return }
         owner.seal()
     }
@@ -1739,6 +2173,12 @@ struct WorkspaceTerminalScreen: View {
     @State private var muxSearch: TerminalSessionController?
     @State private var useTerminalReview: TerminalSessionController?
     @State private var hostKeyReview: TerminalSessionController?
+    private struct EarlierTerminalsReview: Identifiable {
+        let id = UUID()
+        let machineID: String, machineName: String
+        let records: [TerminalSessionRecord]
+    }
+    @State private var earlierTerminalsReview: EarlierTerminalsReview?
 
     var body: some View {
         let machine = scene.selectedMachine
@@ -1751,6 +2191,13 @@ struct WorkspaceTerminalScreen: View {
         let chrome: ColorScheme = TerminalSessionTarget.isDark(backgroundHex) ? .dark : .light
         VStack(spacing: 0) {
             MachineStrip(scene: scene).environment(\.colorScheme, chrome)
+            if let machine, scene.additionalSessions[machine.id]?.isEmpty == false
+                || scene.sessions[machine.id]?.additionalTerminalTarget != nil {
+                directTerminalStrip(machine).environment(\.colorScheme, chrome)
+            }
+            if let machine, !scene.earlierTerminals(machine.id).isEmpty || scene.terminalHistoryFailure != nil {
+                earlierTerminalBar(machine).environment(\.colorScheme, chrome)
+            }
             if let session = scene.selectedSession, session.phase == .live, let mux = session.muxState, !mux.panes.isEmpty {
                 muxAccessBar(session).environment(\.colorScheme, chrome)
                 PaneStrip(session: session, state: mux,
@@ -1767,7 +2214,7 @@ struct WorkspaceTerminalScreen: View {
             }
             ZStack {
                 WorkspaceCanvasHost(scene: scene, panes: canvasMachines.map {
-                    WorkspaceCanvasPane(machineID: $0.id, terminal: scene.sessions[$0.id]?.terminal)
+                    WorkspaceCanvasPane(machineID: $0.id, terminal: scene.displayedSession($0.id)?.terminal)
                 })
                 .background {
                     GeometryReader { geometry in
@@ -1781,7 +2228,7 @@ struct WorkspaceTerminalScreen: View {
                         ZStack {
                             if machine.id == scene.selectedMachineID {
                                 card(for: machine).transition(.opacity)
-                            } else if scene.sessions[machine.id]?.terminal == nil {
+                            } else if scene.displayedSession(machine.id)?.terminal == nil {
                                 Button { scene.select(machine.id) } label: {
                                     VStack(spacing: 10) {
                                         Image(systemName: "desktopcomputer").font(.title)
@@ -1840,6 +2287,7 @@ struct WorkspaceTerminalScreen: View {
         .sheet(item: $hostKeyReview) { session in
             TerminalHostKeyMismatchScreen(scene: scene, session: session)
         }
+        .sheet(item: $earlierTerminalsReview) { review in earlierTerminalReview(review) }
         .confirmationDialog("How should this phone use the shared terminal?",
             isPresented: Binding(get: { useTerminalReview != nil }, set: { if !$0 { useTerminalReview = nil } }),
             titleVisibility: .visible, presenting: useTerminalReview) { session in
@@ -1891,6 +2339,7 @@ struct WorkspaceTerminalScreen: View {
         .onDisappear {
             historyInspection?.retire(); historyInspection = nil; retainedOutput = nil
             hostKeyReview = nil
+            earlierTerminalsReview = nil
             scene.disappear()
             if !scene.closed { onShowing?(nil) }
         }
@@ -1899,9 +2348,111 @@ struct WorkspaceTerminalScreen: View {
             if phase != .active {
                 historyInspection?.retire(); historyInspection = nil; retainedOutput = nil
                 hostKeyReview = nil
+                earlierTerminalsReview = nil
             }
         }
-        .onChange(of: scene.selectedSession?.id) { _, _ in hostKeyReview = nil }
+        .onChange(of: scene.selectedSession?.id) { _, _ in hostKeyReview = nil; earlierTerminalsReview = nil }
+    }
+
+    private func directTerminalStrip(_ machine: SceneMachine) -> some View {
+        ScrollViewReader { reader in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(scene.terminalControllers(machine.id)) { controller in
+                        let selected = scene.selectedSession === controller
+                        Button { scene.selectTerminal(controller) } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: controller.phase == .live ? "terminal" : controller.settled ? "stop.circle" : "hourglass")
+                                Text(scene.terminalTitle(controller)).lineLimit(1)
+                                if !selected, controller.hasUnseenOutput {
+                                    Circle().fill(.orange).frame(width: 6, height: 6)
+                                }
+                                if controller.inputDeliveryMessage != nil || controller.localInputNeedsDecision {
+                                    Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange)
+                                }
+                            }
+                            .font(.caption.weight(selected ? .semibold : .regular))
+                            .padding(.horizontal, 12).frame(minHeight: 40)
+                            .background(selected ? Color.accentColor.opacity(0.18) : Color.primary.opacity(0.06),
+                                        in: RoundedRectangle(cornerRadius: 10))
+                        }
+                        .buttonStyle(.plain).id(controller.id)
+                        .accessibilityLabel("\(scene.terminalTitle(controller)), \(controller.phase == .live ? "live" : controller.settled ? "ended" : "connecting")\(controller.hasUnseenOutput && !selected ? ", new output" : "")")
+                        .accessibilityAddTraits(selected ? .isSelected : [])
+                        .accessibilityIdentifier("terminal.tab.\(controller.terminalSessionID?.uuidString ?? "primary")")
+                    }
+                    Button("New Terminal", systemImage: "plus") { scene.newTerminal() }
+                        .font(.caption.weight(.semibold)).buttonStyle(.bordered)
+                        .disabled(!scene.canCreateAdditionalTerminal)
+                        .accessibilityHint("Opens a separate SSH shell using Terminal 1's route and sign-in choices. Up to four terminals per machine.")
+                        .accessibilityIdentifier("terminal.tab.new")
+                }
+                .padding(.horizontal, 12).padding(.vertical, 6)
+            }
+            .background(.regularMaterial)
+            .onChange(of: scene.selectedSession?.id) { _, id in
+                if let id { withAnimation { reader.scrollTo(id, anchor: .center) } }
+            }
+        }
+    }
+
+    private func earlierTerminalBar(_ machine: SceneMachine) -> some View {
+        let records = scene.earlierTerminals(machine.id)
+        return HStack(spacing: 10) {
+            Image(systemName: "clock.badge.exclamationmark").foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Earlier Terminals").font(.caption.weight(.semibold))
+                Text(scene.terminalHistoryFailure ?? (records.contains(where: \.hasRecoveryNotice)
+                    ? "Earlier input may have unknown remote effects."
+                    : "Closed tabs have local history to review."))
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            if scene.reviewingTerminalHistory { ProgressView() }
+            else {
+                Button("Review") {
+                    earlierTerminalsReview = .init(machineID: machine.id, machineName: machine.name, records: records)
+                }
+                .font(.caption.weight(.semibold)).buttonStyle(.bordered)
+                .accessibilityIdentifier("terminal.tabs.history")
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8).background(.regularMaterial)
+    }
+
+    private func earlierTerminalReview(_ review: EarlierTerminalsReview) -> some View {
+        NavigationStack {
+            List {
+                Section {
+                    Text("These terminals are no longer open in this app. Reviewing their saved metadata does not reconnect or replay input.")
+                    if review.records.contains(where: \.hasRecoveryNotice) {
+                        Text("Some earlier input may have reached the remote machine. Its effects are unknown; check the machine before repeating a command.")
+                    }
+                    if let failure = scene.terminalHistoryFailure { Text(failure).foregroundStyle(.secondary) }
+                } header: { Text(verbatim: review.machineName) }
+                ForEach(review.records) { record in
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Earlier terminal \(record.scope.terminalSessionID?.uuidString.prefix(8) ?? "")")
+                            .font(.headline)
+                        Text(verbatim: "Route: \(record.scope.routeID)").font(.caption).foregroundStyle(.secondary)
+                        Text(record.hasRecoveryNotice ? "Input outcome is uncertain." : "The local connection was closed.")
+                            .font(.callout)
+                    }
+                }
+                Section {
+                    Button("Acknowledge Reviewed History") {
+                        scene.acknowledgeEarlierTerminals(review.records, machineID: review.machineID)
+                        earlierTerminalsReview = nil
+                    }
+                    .disabled(scene.reviewingTerminalHistory || scene.selectedMachineID != review.machineID)
+                    .accessibilityIdentifier("terminal.tabs.history.acknowledge")
+                } footer: {
+                    Text("This dismisses only the displayed local records. It does not claim that a remote command ran or that the remote shell exited.")
+                }
+            }
+            .navigationTitle("Earlier Terminals").navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { earlierTerminalsReview = nil } } }
+        }
     }
 
     @ToolbarContentBuilder private func toolbar(_ machine: SceneMachine?) -> some ToolbarContent {
@@ -1924,6 +2475,23 @@ struct WorkspaceTerminalScreen: View {
                     .disabled(session.isViewingOnly || session.clipboardIsPresenting || session.localInputNeedsDecision)
             }
             Menu {
+                if let session = scene.selectedSession, !session.attachedToMux,
+                   scene.additionalSessions[session.target.machineID]?.isEmpty == false
+                    || session.additionalTerminalTarget != nil {
+                    Button("New Terminal", systemImage: "plus.rectangle") { scene.newTerminal() }
+                        .disabled(!scene.canCreateAdditionalTerminal)
+                    if !session.settled {
+                        Button("End This Terminal", systemImage: "stop.circle", role: .destructive) { scene.endTerminal(session) }
+                    }
+                    if session.terminalSessionID != nil, session.settled {
+                        if !scene.invalidatedTerminalSlots.contains(session.terminalSessionID!) {
+                            Button("New Session in This Tab", systemImage: "arrow.clockwise") { scene.restartTerminal(session) }
+                        }
+                        Button("Remove This Tab", systemImage: "xmark.rectangle", role: .destructive) { scene.removeTerminal(session) }
+                            .accessibilityIdentifier("terminal.tab.remove")
+                    }
+                    Divider()
+                }
                 if let session = scene.selectedSession, session.remoteFilesTarget != nil {
                     Button("Remote Files", systemImage: "folder") { scene.beginRemoteFiles() }
                         .disabled(scene.openingSplit || session.clipboardIsPresenting || session.localInputNeedsDecision)
@@ -1987,7 +2555,11 @@ struct WorkspaceTerminalScreen: View {
                     Button("Theme…", systemImage: "paintpalette") { pickingTheme = true }
                         .accessibilityIdentifier("scene.theme")
                 }
-                if let machine, machine.target != nil {
+                if let machine, machine.target != nil, scene.selectedSession?.terminalSessionID != nil {
+                    Button("Disconnect \(machine.name)", systemImage: "xmark.circle", role: .destructive) {
+                        scene.disconnect(machine.id)
+                    }
+                } else if let machine, machine.target != nil {
                     switch scene.status(of: machine.id) {
                     case .disconnected, .attention:
                         if scene.requiresNewSession(machine.id), !scene.disconnected.contains(machine.id) {
@@ -2120,11 +2692,11 @@ struct WorkspaceTerminalScreen: View {
             connecting(machine, accent: accent, detail: mode == .interactive
                 ? "Fitting the shared pane to this phone…"
                 : mode == .inputOnly ? "Enabling input at the shared size…" : "Reconnecting to view only…")
-        } else if scene.disconnected.contains(machine.id) {
+        } else if scene.disconnected.contains(machine.id), scene.displayedSession(machine.id)?.terminalSessionID == nil {
             disconnectedCard(machine, accent: accent)
         } else if scene.capacityBlockedMachineID == machine.id {
             capacityCard(machine, accent: accent)
-        } else if scene.preparationWasReleased(machine.id), let session = scene.sessions[machine.id] {
+        } else if scene.preparationWasReleased(machine.id), let session = scene.displayedSession(machine.id), session.terminalSessionID == nil {
             if !session.settled, let failure = session.cleanupFailure {
                 sceneCard(symbol: "exclamationmark.triangle", title: "Sign-in cleanup needs attention",
                           message: failure, accent: accent) {
@@ -2139,10 +2711,13 @@ struct WorkspaceTerminalScreen: View {
                     Button("Connect") { scene.connect(machine.id) }.buttonStyle(.borderedProminent)
                 }
             }
-        } else if let session = scene.sessions[machine.id] {
+        } else if let session = scene.displayedSession(machine.id) {
             switch session.phase {
             case .idle, .connecting:
-                connecting(machine, accent: accent, detail: Self.via(session.route))
+                if session.settled, session.terminalSessionID != nil {
+                    endedCard(machine, message: "This terminal was not opened. Choose New Session to try again.",
+                              session: session, accent: accent)
+                } else { connecting(machine, accent: accent, detail: Self.via(session.route)) }
             case .ready:
                 readyCard(machine, session: session, accent: accent)
             case .live:
@@ -2158,10 +2733,12 @@ struct WorkspaceTerminalScreen: View {
                 } else if scene.hostKeyMismatch(for: session) != nil {
                     hostKeyChangedCard(session, accent: accent)
                 } else {
-                    connectionHelp(help, settled: session.settled) { scene.connect(machine.id) }
+                    connectionHelp(help, settled: session.settled, automaticallyRetriesTailscale: session.terminalSessionID == nil) {
+                        scene.retryConnection(session)
+                    }
                 }
             case let .ended(message), let .failed(message):
-                switch scene.status(of: machine.id) {
+                switch session.terminalSessionID == nil ? scene.status(of: machine.id) : .attention {
                 case .disconnected:
                     disconnectedCard(machine, accent: accent)
                 case .connecting:
@@ -2205,11 +2782,9 @@ struct WorkspaceTerminalScreen: View {
             }
             Menu("Close a Connection…") {
                 ForEach(scene.machines) { other in
-                    if let owned = scene.sessions[other.id], !owned.settled {
-                        Button(role: .destructive) {
-                            scene.disconnect(other.id, expectedControllerID: owned.id)
-                        } label: {
-                            Text(verbatim: "\(other.name) · \(owned.phase == .live ? "disconnect live terminal" : "close connection")")
+                    ForEach(scene.terminalControllers(other.id).filter { !$0.settled }) { owned in
+                        Button(role: .destructive) { scene.endTerminal(owned) } label: {
+                            Text(verbatim: "\(other.name) · \(scene.terminalTitle(owned)) · \(owned.phase == .live ? "disconnect terminal" : "close connection")")
                         }
                     }
                 }
@@ -2227,7 +2802,7 @@ struct WorkspaceTerminalScreen: View {
     }
 
     private func readyCard(_ machine: SceneMachine, session: TerminalSessionController, accent: Color) -> some View {
-        let ended = scene.requiresNewSession(machine.id)
+        let ended = session.terminalSessionID == nil && scene.requiresNewSession(machine.id)
         let message = session.route.mux
             ? "The connection is ready to attach to this machine's existing FrankenTerm panes."
             : (ended
@@ -2235,7 +2810,7 @@ struct WorkspaceTerminalScreen: View {
                 : "This machine is signed in. No terminal has been opened on this connection.")
         let action = session.route.mux ? "Open Existing Panes" : (ended ? "New Session" : "Open Terminal")
         return sceneCard(symbol: "checkmark.shield", title: "Signed in to \(machine.name)", message: message, accent: accent) {
-            Button(action, systemImage: "terminal") { scene.openTerminal(machine.id) }
+            Button(action, systemImage: "terminal") { scene.openTerminal(session) }
                 .buttonStyle(.borderedProminent).controlSize(.large).tint(accent)
                 .accessibilityIdentifier("terminal.ready.open")
         }
@@ -2246,18 +2821,22 @@ struct WorkspaceTerminalScreen: View {
         // Viewing a pane too large to view would end the same way again;
         // only the phone's own size can show it.
         let fits = session.paneTooLargeToView
+        let routeChanged = session.terminalSessionID.map { scene.invalidatedTerminalSlots.contains($0) } == true
         return sceneCard(symbol: "moon.zzz", title: "Session ended", message: fits
             ? message + " Use at Phone Size fits it to this phone while you use it; the desktop gets its size back when you leave."
+            : routeChanged ? "This tab used the earlier connection choice. Remove it and open a new terminal after connecting with the new route."
             : message, accent: accent) {
             Group {
-                if fits {
+                if routeChanged {
+                    Button("Remove This Tab", systemImage: "xmark.rectangle") { scene.removeTerminal(session) }
+                } else if fits {
                     Button("Use at Phone Size", systemImage: "arrow.down.right.and.arrow.up.left") {
                         scene.takePaneAtPhoneSize(machine.id, from: session)
                     }
                     .accessibilityIdentifier("terminal.ended.fit")
                 } else {
                     Button(session.route.mux ? "Reconnect Existing Panes" : "New Session", systemImage: "arrow.clockwise") {
-                        scene.openTerminal(machine.id)
+                        scene.openTerminal(session)
                     }
                 }
             }
@@ -2329,6 +2908,7 @@ struct WorkspaceTerminalScreen: View {
     /// Nothing ran, so there is no session to review: the reason, the one
     /// change that fixes it, and Try Again once the attempt has settled.
     private func connectionHelp(_ help: WorkspaceConnectionHelp, settled: Bool,
+                                automaticallyRetriesTailscale: Bool,
                                 retry: @escaping () -> Void) -> some View {
         let retry = Button("Try Again", systemImage: "arrow.clockwise", action: retry).disabled(!settled)
         return VStack(spacing: 14) {
@@ -2342,7 +2922,9 @@ struct WorkspaceTerminalScreen: View {
                 Button("Open Tailscale", systemImage: "arrow.up.forward.app") { Self.openTailscale() }
                     .buttonStyle(.borderedProminent).controlSize(.large)
                 retry.buttonStyle(.bordered)
-                Text("FrankenTerm tries again on its own when you come back with Tailscale on.")
+                Text(automaticallyRetriesTailscale
+                    ? "FrankenTerm tries again on its own when you come back with Tailscale on."
+                    : "Return here and choose Try Again after turning Tailscale on.")
                     .font(.caption).multilineTextAlignment(.center).foregroundStyle(.white.opacity(0.7))
             case .allowLocalNetwork:
                 retry.buttonStyle(.borderedProminent).controlSize(.large)

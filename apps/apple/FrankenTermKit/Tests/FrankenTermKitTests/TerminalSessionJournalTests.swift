@@ -15,9 +15,11 @@ private actor JournalStartGate {
 @MainActor
 final class TerminalSessionJournalTests: XCTestCase {
     private func scope(workspace: UUID = UUID(), revision: UUID = UUID(),
-                       machine: String = "machine-1", route: String = "route-1") throws -> TerminalSessionScope {
+                       machine: String = "machine-1", route: String = "route-1",
+                       terminalSessionID: UUID? = nil) throws -> TerminalSessionScope {
         try .init(workspaceID: workspace, workspaceRevision: revision, machineID: machine,
-                  routeID: route, transportID: UUID(), channelID: UUID())
+                  routeID: route, transportID: UUID(), channelID: UUID(),
+                  terminalSessionID: terminalSessionID)
     }
 
     private func expect(_ expected: TerminalSessionJournalError,
@@ -53,8 +55,11 @@ final class TerminalSessionJournalTests: XCTestCase {
         XCTAssertEqual(try row?.text("state"), "creationStarted")
         XCTAssertEqual(try row?.text("transport"), connection.transportID.uuidString)
         XCTAssertEqual(try row?.text("channel"), connection.channelID.uuidString)
+        XCTAssertEqual(root["version"], .number("4"))
+        XCTAssertEqual(row?["terminal_session_id"], .null)
         XCTAssertEqual(Set(try XCTUnwrap(row).keys), ["id", "revision", "workspace", "workspace_revision",
-            "machine", "route", "transport", "channel", "process", "owner", "state", "input_evidence", "unclean"])
+            "machine", "route", "transport", "channel", "terminal_session_id", "process", "owner", "state",
+            "input_evidence", "unclean"])
         XCTAssertNil(disk.bytes(.journal))
         let records = try await journal.records()
         XCTAssertEqual(records.map(\.scope), [connection])
@@ -112,6 +117,188 @@ final class TerminalSessionJournalTests: XCTestCase {
         _ = try await journal.beginCreation(scope: scope(machine: "machine-1"))
         let records = try await journal.records()
         XCTAssertEqual(records.count, 3)
+    }
+
+    func testExplicitTerminalSlotsCoexistWhileEachOwnsItsRouteIndependentHistory() async throws {
+        let disk = StoreTestPersistence(), workspace = UUID(), leftID = UUID(), rightID = UUID()
+        let first = try TerminalSessionJournal(persistence: disk)
+        let other = try TerminalSessionJournal(persistence: disk)
+        let primary = try await first.beginCreation(scope: scope(workspace: workspace))
+        let left = try await first.beginCreation(scope: scope(workspace: workspace, terminalSessionID: leftID))
+        let right = try await other.beginCreation(scope: scope(workspace: workspace, terminalSessionID: rightID))
+        let initial = try await first.records()
+        XCTAssertEqual(initial.map(\.id), [primary.id, left.id, right.id])
+        XCTAssertEqual(initial.filter { $0.belongsTo(workspaceID: workspace, machineID: "machine-1") }.map(\.id),
+                       [primary.id])
+        XCTAssertEqual(initial.filter {
+            $0.belongsTo(workspaceID: workspace, machineID: "machine-1", terminalSessionID: leftID)
+        }.map(\.id), [left.id])
+        XCTAssertFalse(initial[1].belongsTo(workspaceID: UUID(), machineID: "machine-1", terminalSessionID: leftID))
+        XCTAssertFalse(initial[1].belongsTo(workspaceID: workspace, machineID: "machine-2", terminalSessionID: leftID))
+
+        let replacement = try scope(workspace: workspace, route: "other-route", terminalSessionID: leftID)
+        XCTAssertNotEqual(replacement.workspaceRevision, left.scope.workspaceRevision)
+        await expect(.reviewRequired) { _ = try await other.beginCreation(scope: replacement) }
+        try await first.markInterrupted(epoch: left)
+        let ended = try await first.records()
+        _ = try await first.continueAfterInterruption(try XCTUnwrap(ended.first { $0.id == left.id }))
+        let next = try await other.beginCreation(scope: replacement)
+        XCTAssertNotEqual(next.id, left.id)
+        let records = try await first.records()
+        XCTAssertEqual(records.filter(\.blocksNewSession).map(\.id), [primary.id, right.id, next.id])
+        XCTAssertFalse(try XCTUnwrap(records.first { $0.id == right.id }).canResolve)
+        await expect(.reviewRequired) { _ = try await first.beginCreation(scope: primary.scope) }
+        await expect(.reviewRequired) { _ = try await first.beginCreation(scope: right.scope) }
+    }
+
+    func testFailedAdditionalSlotPublicationCannotRetireOrBlockSiblingSlots() async throws {
+        for afterPublication in [false, true] {
+            let disk = StoreTestPersistence(), workspace = UUID()
+            let journal = try TerminalSessionJournal(persistence: disk)
+            let primary = try await journal.beginCreation(scope: scope(workspace: workspace))
+            let failedScope = try scope(workspace: workspace, terminalSessionID: UUID())
+            disk.configure(afterPublication ? .after(.catalog) : .before(.catalog))
+            await expect(.recoveryRequired) { _ = try await journal.beginCreation(scope: failedScope) }
+            let sibling = try await journal.beginCreation(scope: scope(workspace: workspace, terminalSessionID: UUID()))
+            let records = try await journal.records()
+            XCTAssertEqual(records.count, afterPublication ? 3 : 2)
+            XCTAssertEqual(records.filter { $0.id == primary.id || $0.id == sibling.id }.map(\.state),
+                           [.creationStarted, .creationStarted])
+            XCTAssertFalse(try XCTUnwrap(records.first { $0.id == primary.id }).canResolve)
+            await expect(.reviewRequired) { _ = try await journal.beginCreation(scope: primary.scope) }
+            if afterPublication {
+                let failed = try XCTUnwrap(records.first { $0.scope == failedScope })
+                XCTAssertTrue(failed.canResolve, "only the failed marker's owner knows no permission escaped")
+                await expect(.reviewRequired) { _ = try await journal.beginCreation(scope: failedScope) }
+                try await journal.resolve(failed)
+            }
+            _ = try await journal.beginCreation(scope: failedScope)
+        }
+    }
+
+    func testRelaunchRetainsOrphanSlotNoticesWithoutBorrowingOrAcknowledgingSiblings() async throws {
+        let disk = StoreTestPersistence(), workspace = UUID(), orphanID = UUID(), reusedID = UUID()
+        let earlier = try TerminalSessionJournal(persistence: disk, processID: UUID())
+        let orphan = try await earlier.beginCreation(scope: scope(workspace: workspace, terminalSessionID: orphanID))
+        let reused = try await earlier.beginCreation(scope: scope(workspace: workspace, terminalSessionID: reusedID))
+        let current = try TerminalSessionJournal(persistence: disk, processID: UUID())
+        let additional = try await current.beginCreation(scope: scope(workspace: workspace, terminalSessionID: UUID()))
+        let shown = try await current.records()
+        XCTAssertEqual(shown.filter(\.hasRecoveryNotice).map(\.id), [orphan.id, reused.id])
+        XCTAssertFalse(try XCTUnwrap(shown.first { $0.id == additional.id }).hasRecoveryNotice)
+        let reviewed = try XCTUnwrap(shown.first {
+            $0.belongsTo(workspaceID: workspace, machineID: "machine-1", terminalSessionID: reusedID)
+        })
+        let continued = try await current.continueAfterInterruption(reviewed)
+        let replacement = try await current.beginCreation(scope: scope(workspace: workspace,
+            route: "replacement-route", terminalSessionID: reusedID))
+        try await current.acknowledgeRecovery([continued])
+        await expect(.staleReview) { try await current.acknowledgeRecovery([reviewed]) }
+        let retained = try await current.records()
+        XCTAssertEqual(retained.filter(\.hasRecoveryNotice).map(\.id), [orphan.id])
+        XCTAssertEqual(retained.filter(\.blocksNewSession).map(\.id), [orphan.id, additional.id, replacement.id])
+        await expect(.reviewRequired) { _ = try await current.beginCreation(scope: orphan.scope) }
+        // A machine-level review can dismiss a removed slot's exact notice;
+        // this acknowledges no new or live sibling and creates no replacement.
+        try await current.acknowledgeRecovery(retained.filter(\.hasRecoveryNotice))
+        let dismissed = try await current.records()
+        XCTAssertFalse(dismissed.contains(where: \.hasRecoveryNotice))
+        XCTAssertEqual(dismissed.filter(\.blocksNewSession).map(\.id), [additional.id, replacement.id])
+    }
+
+    func testTerminalSlotsShareGlobalCapacityWithoutEvictingUnreviewedHistory() async throws {
+        let workspace = UUID(), journal = try TerminalSessionJournal(persistence: StoreTestPersistence(),
+                                                                     maximumUnresolved: 2)
+        let primary = try await journal.beginCreation(scope: scope(workspace: workspace))
+        let sibling = try await journal.beginCreation(scope: scope(workspace: workspace, terminalSessionID: UUID()))
+        let requested = try scope(workspace: workspace, terminalSessionID: UUID())
+        await expect(.capacity) { _ = try await journal.beginCreation(scope: requested) }
+        try await journal.markInterrupted(epoch: primary)
+        await expect(.capacity) { _ = try await journal.beginCreation(scope: requested) }
+        let ended = try await journal.records()
+        _ = try await journal.continueAfterInterruption(try XCTUnwrap(ended.first { $0.id == primary.id }))
+        let admitted = try await journal.beginCreation(scope: requested)
+        let records = try await journal.records()
+        XCTAssertEqual(records.map(\.id), [primary.id, sibling.id, admitted.id])
+        XCTAssertEqual(records.filter(\.blocksNewSession).map(\.id), [sibling.id, admitted.id])
+    }
+
+    func testLegacyVersionsMigrateToPrimarySlotWithoutBorrowingAdditionalHistory() async throws {
+        for version in 1...3 {
+            let disk = StoreTestPersistence(), workspace = UUID(), explicitID = UUID()
+            let old = try TerminalSessionJournal(persistence: disk, processID: UUID())
+            let epoch = try await old.beginCreation(scope: scope(workspace: workspace))
+            var root = try StrictJSON.decode(XCTUnwrap(disk.bytes(.catalog))).object()
+            var row = try root.required("records").array()[0].object()
+            root["version"] = .number(String(version)); row["terminal_session_id"] = nil
+            if version < 3 { row["unclean"] = nil }
+            if version < 2 { row["input_evidence"] = nil }
+            else { row["input_evidence"] = .number(String(TerminalInputEvidence.unknownTransportOutcome.rawValue)) }
+            root["records"] = .array([.object(row)])
+            disk.seed(try StrictJSON.encode(.object(root)), slot: .catalog)
+
+            let reopened = try TerminalSessionJournal(persistence: disk, processID: UUID())
+            let legacy = try await reopened.records()
+            XCTAssertEqual(legacy.map(\.id), [epoch.id])
+            XCTAssertNil(legacy[0].scope.terminalSessionID)
+            XCTAssertTrue(legacy[0].belongsTo(workspaceID: workspace, machineID: "machine-1"))
+            XCTAssertFalse(legacy[0].belongsTo(workspaceID: workspace, machineID: "machine-1",
+                                               terminalSessionID: explicitID))
+            XCTAssertTrue(legacy[0].hasRecoveryNotice)
+            XCTAssertEqual(legacy[0].inputEvidence, version == 1 ? [] : [.unknownTransportOutcome])
+            await expect(.reviewRequired) { _ = try await reopened.beginCreation(scope: epoch.scope) }
+            let explicit = try await reopened.beginCreation(scope: scope(workspace: workspace,
+                                                                          terminalSessionID: explicitID))
+            let migrated = try StrictJSON.decode(XCTUnwrap(disk.bytes(.catalog))).object()
+            XCTAssertEqual(migrated["version"], .number("4"))
+            let rows = try migrated.required("records").array().map { try $0.object() }
+            XCTAssertEqual(rows[0]["terminal_session_id"], .null)
+            XCTAssertEqual(rows[1]["terminal_session_id"], .string(explicitID.uuidString))
+            let retained = try await reopened.records()
+            XCTAssertEqual(retained.filter(\.hasRecoveryNotice).map(\.id), [epoch.id])
+            XCTAssertEqual(retained.filter(\.blocksNewSession).map(\.id), [epoch.id, explicit.id])
+        }
+    }
+
+    func testVersionFourRejectsMalformedSlotIdentityAndDuplicateActiveSlotOwners() async throws {
+        let disk = StoreTestPersistence(), owner = try TerminalSessionJournal(persistence: disk)
+        let slot = try XCTUnwrap(UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"))
+        _ = try await owner.beginCreation(scope: scope(terminalSessionID: slot))
+        let root = try StrictJSON.decode(XCTUnwrap(disk.bytes(.catalog))).object()
+        let row = try root.required("records").array()[0].object()
+        var candidates: [[String: JSONValue]] = []
+        for malformed in [JSONValue?.none, .some(.boolean(false)), .some(.number("1")),
+                          .some(.string("")), .some(.string(slot.uuidString.lowercased()))] {
+            var candidate = root, invalid = row
+            invalid["terminal_session_id"] = malformed
+            candidate["records"] = .array([.object(invalid)])
+            candidates.append(candidate)
+        }
+        var smuggled = root; smuggled["version"] = .number("3"); candidates.append(smuggled)
+        var duplicate = row
+        duplicate["id"] = .string(UUID().uuidString)
+        duplicate["transport"] = .string(UUID().uuidString)
+        duplicate["channel"] = .string(UUID().uuidString)
+        for identity in [JSONValue.null, .string(slot.uuidString)] {
+            var left = row, right = duplicate, candidate = root
+            left["terminal_session_id"] = identity; right["terminal_session_id"] = identity
+            candidate["records"] = .array([.object(left), .object(right)])
+            candidates.append(candidate)
+        }
+        for candidate in candidates {
+            let storage = StoreTestPersistence(), bytes = try StrictJSON.encode(.object(candidate))
+            storage.seed(bytes, slot: .catalog)
+            let reader = try TerminalSessionJournal(persistence: storage)
+            await expect(.corruptStore) { _ = try await reader.records() }
+            XCTAssertEqual(storage.bytes(.catalog), bytes)
+        }
+        // The same physical machine may have independently owned live slots.
+        var valid = root; duplicate["terminal_session_id"] = .string(UUID().uuidString)
+        valid["records"] = .array([.object(row), .object(duplicate)])
+        let storage = StoreTestPersistence(); storage.seed(try StrictJSON.encode(.object(valid)), slot: .catalog)
+        let reader = try TerminalSessionJournal(persistence: storage)
+        let records = try await reader.records()
+        XCTAssertEqual(records.count, 2)
     }
 
     func testActiveEpochCannotResolveAndInterruptionIsIdempotent() async throws {
@@ -405,7 +592,8 @@ final class TerminalSessionJournalTests: XCTestCase {
     func testMaximumCatalogRetainsEveryRecoveryNoticeWithinTheProtectedByteLimit() async throws {
         let disk = StoreTestPersistence(), prototype = try TerminalSessionJournal(persistence: disk, processID: UUID())
         _ = try await prototype.beginCreation(scope: scope(machine: String(repeating: "m", count: 128),
-                                                          route: String(repeating: "r", count: 128)))
+                                                          route: String(repeating: "r", count: 128),
+                                                          terminalSessionID: UUID()))
         var root = try StrictJSON.decode(XCTUnwrap(disk.bytes(.catalog))).object()
         let template = try root.required("records").array()[0].object()
         var rows: [JSONValue] = []
@@ -444,6 +632,7 @@ final class TerminalSessionJournalTests: XCTestCase {
             var root = original, row = try original.required("records").array()[0].object()
             if legacy {
                 root["version"] = .number("2"); row["unclean"] = nil; row["state"] = .string("continued")
+                row["terminal_session_id"] = nil
             } else { row["unclean"] = .boolean(true) }
             root["records"] = .array([.object(row)])
             let corrupt = try StrictJSON.encode(.object(root)), storage = StoreTestPersistence()
@@ -460,14 +649,14 @@ final class TerminalSessionJournalTests: XCTestCase {
         let bytes = try XCTUnwrap(original.bytes(.catalog))
         let text = try XCTUnwrap(String(data: bytes, encoding: .utf8))
         var root = try StrictJSON.decode(bytes).object()
-        root["version"] = .number("4")
+        root["version"] = .number("5")
         let future = try StrictJSON.encode(.object(root))
-        root["version"] = .number("3")
+        root["version"] = .number("4")
         let rows = try XCTUnwrap(root["records"]).array()
         root["records"] = .array(rows + rows)
         let repeated = try StrictJSON.encode(.object(root))
-        let duplicateKey = Data(text.replacingOccurrences(of: "\"version\":3",
-                                                          with: "\"version\":3,\"version\":3").utf8)
+        let duplicateKey = Data(text.replacingOccurrences(of: "\"version\":4",
+                                                          with: "\"version\":4,\"version\":4").utf8)
         for corrupt in [Data("{".utf8), future, repeated, duplicateKey] {
             let disk = StoreTestPersistence(); disk.seed(corrupt, slot: .catalog)
             let journal = try TerminalSessionJournal(persistence: disk)

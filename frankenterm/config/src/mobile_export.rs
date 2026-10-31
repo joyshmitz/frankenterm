@@ -44,6 +44,10 @@ const MAX_EXPORTED_CERTIFICATE_BYTES: usize = 1024 * 1024;
 const USER_CERTIFICATE_CAPABILITY: &str = "ssh_user_certificate_v1";
 const HOST_CERTIFICATE_CAPABILITY: &str = "ssh_host_certificate_v1";
 const HOST_ALGORITHM_POLICY_CAPABILITY: &str = "ssh_host_algorithm_policy_v1";
+const HOST_REVOCATION_CAPABILITY: &str = "ssh_host_revocation_v1";
+const MAX_REVOCATION_SOURCE_BYTES: usize = 256 * 1024;
+const MAX_REVOCATION_ENTRIES: usize = 8192;
+const MAX_REVOCATION_AUTHORITIES: usize = 256;
 const MAX_JUMP_HOPS: usize = 3;
 const MAX_EXPORTED_ROUTES: usize = 256;
 const MAX_EXPORT_FINDINGS: usize = 1024;
@@ -241,6 +245,9 @@ pub struct SshSources {
     /// remain witnessed failures; no implicit certificate or private sibling
     /// is discovered by filename.
     pub public_certificates: BTreeMap<PathBuf, KnownHostsSource>,
+    /// Frozen RevokedHostKeys inputs. KRLs are binary and must never pass
+    /// through the text-only known-hosts source representation.
+    pub host_revocations: BTreeMap<PathBuf, HostRevocationSource>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,10 +257,17 @@ pub enum KnownHostsSource {
     Unavailable,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostRevocationSource {
+    Present(Vec<u8>),
+    Missing,
+    Unavailable,
+}
+
 /// Read one immutable, regular local source within its allocation budget.
 /// In particular, a permission error or an oversized revocation file must not
 /// be converted into the same state as ENOENT.
-fn read_source(path: &Path, limit: usize) -> KnownHostsSource {
+fn read_public_source_bytes(path: &Path, limit: usize) -> HostRevocationSource {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -263,12 +277,12 @@ fn read_source(path: &Path, limit: usize) -> KnownHostsSource {
     }
     let file = match options.open(path) {
         Ok(file) => file,
-        Err(err) if err.kind() == ErrorKind::NotFound => return KnownHostsSource::Missing,
-        Err(_) => return KnownHostsSource::Unavailable,
+        Err(err) if err.kind() == ErrorKind::NotFound => return HostRevocationSource::Missing,
+        Err(_) => return HostRevocationSource::Unavailable,
     };
     let before = match file.metadata() {
         Ok(value) if value.is_file() && value.len() <= limit as u64 => value,
-        _ => return KnownHostsSource::Unavailable,
+        _ => return HostRevocationSource::Unavailable,
     };
     #[cfg(unix)]
     {
@@ -276,7 +290,7 @@ fn read_source(path: &Path, limit: usize) -> KnownHostsSource {
         if (before.uid() != 0 && before.uid() != nix::unistd::Uid::current().as_raw())
             || before.mode() & 0o022 != 0
         {
-            return KnownHostsSource::Unavailable;
+            return HostRevocationSource::Unavailable;
         }
     }
     let mut bytes = Vec::new();
@@ -287,22 +301,31 @@ fn read_source(path: &Path, limit: usize) -> KnownHostsSource {
         || bytes.len() > limit
         || bytes.len() as u64 != before.len()
     {
-        return KnownHostsSource::Unavailable;
+        return HostRevocationSource::Unavailable;
     }
     let after = match file.metadata() {
         Ok(value) => value,
-        Err(_) => return KnownHostsSource::Unavailable,
+        Err(_) => return HostRevocationSource::Unavailable,
     };
     if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
-        return KnownHostsSource::Unavailable;
+        return HostRevocationSource::Unavailable;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if before.ctime() != after.ctime() || before.ctime_nsec() != after.ctime_nsec() {
-            return KnownHostsSource::Unavailable;
+            return HostRevocationSource::Unavailable;
         }
     }
+    HostRevocationSource::Present(bytes)
+}
+
+fn read_source(path: &Path, limit: usize) -> KnownHostsSource {
+    let bytes = match read_public_source_bytes(path, limit) {
+        HostRevocationSource::Present(bytes) => bytes,
+        HostRevocationSource::Missing => return KnownHostsSource::Missing,
+        HostRevocationSource::Unavailable => return KnownHostsSource::Unavailable,
+    };
     match String::from_utf8(bytes) {
         Ok(text) if text.lines().count() <= MAX_SOURCE_LINES => KnownHostsSource::Present(text),
         _ => KnownHostsSource::Unavailable,
@@ -679,6 +702,7 @@ impl SshSources {
         let mut known_files: BTreeSet<PathBuf> = default_known_hosts.iter().cloned().collect();
         let mut identities = BTreeSet::new();
         let mut certificate_files = BTreeSet::new();
+        let mut revocation_files = BTreeSet::new();
         for machine in &inventory.machines {
             for route in &machine.routes {
                 match route {
@@ -715,6 +739,7 @@ impl SshSources {
                                         .extend(resolver.certificate_files(&options).0);
                                 }
                                 known_files.extend(resolver.trust_files(&options).0);
+                                revocation_files.extend(resolver.revocation_files(&options).0);
                             }
                         }
                     }
@@ -798,6 +823,25 @@ impl SshSources {
                 (path, source)
             })
             .collect();
+        let mut remaining_revocation_bytes = MAX_SOURCE_BYTES;
+        let host_revocations = revocation_files
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = if index < MAX_SOURCE_FILES {
+                    read_public_source_bytes(
+                        &path,
+                        remaining_revocation_bytes.min(MAX_REVOCATION_SOURCE_BYTES),
+                    )
+                } else {
+                    HostRevocationSource::Unavailable
+                };
+                if let HostRevocationSource::Present(bytes) = &source {
+                    remaining_revocation_bytes -= bytes.len();
+                }
+                (path, source)
+            })
+            .collect();
         Self {
             config,
             system_config,
@@ -806,6 +850,7 @@ impl SshSources {
             public_keys,
             unavailable_public_keys,
             public_certificates,
+            host_revocations,
         }
     }
 }
@@ -813,6 +858,7 @@ impl SshSources {
 struct AliasResolver {
     config: frankenterm_ssh::Config,
     trust_lists: BTreeMap<String, Option<Vec<PathBuf>>>,
+    revocation_lists: BTreeMap<String, Option<Vec<PathBuf>>>,
     proxies: BTreeMap<String, ProxySetting>,
     authentication_values: BTreeMap<String, Option<String>>,
     certificate_paths: Vec<(String, Option<PathBuf>)>,
@@ -976,6 +1022,16 @@ impl AliasResolver {
             }
         }
         (paths, incomplete)
+    }
+
+    fn revocation_files(&self, options: &frankenterm_ssh::ConfigMap) -> (Vec<PathBuf>, bool) {
+        match options.get("revokedhostkeys") {
+            None => (Vec::new(), false),
+            Some(token) => match self.revocation_lists.get(token) {
+                Some(Some(paths)) => (paths.clone(), false),
+                _ => (Vec::new(), true),
+            },
+        }
     }
 
     fn authentication_value<'a>(
@@ -1318,6 +1374,7 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
         return None;
     }
     let mut trust_lists = BTreeMap::new();
+    let mut revocation_lists = BTreeMap::new();
     let mut proxies = BTreeMap::new();
     let mut authentication_values = BTreeMap::new();
     let mut certificate_paths = Vec::new();
@@ -1373,6 +1430,15 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
                 "userknownhostsfile" | "globalknownhostsfile" => {
                     let token = format!("__frankenterm_known_hosts_{}__", trust_lists.len());
                     trust_lists.insert(token.clone(), known_host_paths(value, home));
+                    passive.push_str(&format!("{} {}\n", keyword, token));
+                    continue;
+                }
+                "revokedhostkeys" => {
+                    let token = format!(
+                        "__frankenterm_host_revocations_{}__",
+                        revocation_lists.len()
+                    );
+                    revocation_lists.insert(token.clone(), known_host_paths(value, home));
                     passive.push_str(&format!("{} {}\n", keyword, token));
                     continue;
                 }
@@ -1494,6 +1560,7 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
     Some(AliasResolver {
         config: resolver,
         trust_lists,
+        revocation_lists,
         proxies,
         authentication_values,
         certificate_paths,
@@ -1852,77 +1919,7 @@ impl UserCertificate {
     }
 
     fn from_blob(blob: Vec<u8>) -> Option<Self> {
-        if blob.is_empty() || blob.len() > MAX_CERTIFICATE_BLOB_BYTES {
-            return None;
-        }
-        let mut reader = SshBlob::new(&blob);
-        let algorithm = reader.name(64)?;
-        let raw = algorithm.strip_suffix("-cert-v01@openssh.com")?;
-        if raw != "ssh-ed25519"
-            && raw != "ssh-rsa"
-            && CertificateCurve::for_algorithm(raw).is_none()
-        {
-            return None;
-        }
-        reader.string(MAX_CERTIFICATE_BLOB_BYTES)?; // nonce, authenticated below
-        let mut subject = Vec::new();
-        let mut append = |value: &[u8]| {
-            subject.extend_from_slice(&(value.len() as u32).to_be_bytes());
-            subject.extend_from_slice(value);
-        };
-        append(raw.as_bytes());
-        match raw {
-            "ssh-ed25519" => append(reader.string(32)?),
-            "ssh-rsa" => {
-                append(reader.string(9)?);
-                append(reader.string(1025)?);
-            }
-            _ => {
-                append(reader.string(16)?);
-                append(reader.string(133)?);
-            }
-        }
-        let (subject, _) = certificate_public_key(&subject)?;
-        reader.u64()?; // serial is signed opaque metadata
-        if reader.u32()? != 1 {
-            return None; // host certificates never become user identities
-        }
-        reader.string(1024)?; // key ID is not a trusted display label
-        let mut principal_bytes = SshBlob::new(reader.string(MAX_CERTIFICATE_BLOB_BYTES)?);
-        let mut principals = BTreeSet::new();
-        while !principal_bytes.finished() {
-            if principals.len() == 128 {
-                return None;
-            }
-            let principal = std::str::from_utf8(principal_bytes.string(256)?).ok()?;
-            // Foundation's CharacterSet.controlCharacters includes both Cc
-            // and Cf. Reject the same controls/format characters so a signed
-            // certificate cannot produce a document the phone cannot parse.
-            if principal.is_empty()
-                || principal
-                    .chars()
-                    .any(|character| character.is_control() || character.is_format())
-                || !principals.insert(principal)
-            {
-                return None;
-            }
-        }
-        let valid_after = reader.u64()?;
-        if valid_after >= reader.u64()? {
-            return None;
-        }
-        certificate_options(reader.string(MAX_CERTIFICATE_BLOB_BYTES)?, false)?;
-        certificate_options(reader.string(MAX_CERTIFICATE_BLOB_BYTES)?, true)?;
-        if !reader.string(MAX_CERTIFICATE_BLOB_BYTES)?.is_empty() {
-            return None;
-        }
-        let (authority, key) = certificate_public_key(reader.string(1053)?)?;
-        let signed = &blob[..reader.offset];
-        let signature = reader.string(1044)?;
-        if !reader.finished() {
-            return None;
-        }
-        verify_certificate_signature(signature, signed, &authority, &key)?;
+        let subject = verified_certificate_subject(&blob, Some(1))?;
         Some(Self { blob, subject })
     }
 
@@ -1932,6 +1929,437 @@ impl UserCertificate {
             STANDARD_NO_PAD.encode(Sha256::digest(&self.blob))
         )
     }
+}
+
+/// Parse and verify a certificate without granting any permissions. User
+/// credentials require type 1; a flat RevokedHostKeys list accepts either
+/// certificate type and denies its canonical raw subject regardless of time.
+fn verified_certificate_subject(blob: &[u8], required_type: Option<u32>) -> Option<PublicKey> {
+    if blob.is_empty() || blob.len() > MAX_CERTIFICATE_BLOB_BYTES {
+        return None;
+    }
+    let mut reader = SshBlob::new(blob);
+    let algorithm = reader.name(64)?;
+    let raw = algorithm.strip_suffix("-cert-v01@openssh.com")?;
+    if raw != "ssh-ed25519" && raw != "ssh-rsa" && CertificateCurve::for_algorithm(raw).is_none() {
+        return None;
+    }
+    reader.string(MAX_CERTIFICATE_BLOB_BYTES)?; // nonce, authenticated below
+    let mut subject = Vec::new();
+    let mut append = |value: &[u8]| {
+        subject.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        subject.extend_from_slice(value);
+    };
+    append(raw.as_bytes());
+    match raw {
+        "ssh-ed25519" => append(reader.string(32)?),
+        "ssh-rsa" => {
+            append(reader.string(9)?);
+            append(reader.string(1025)?);
+        }
+        _ => {
+            append(reader.string(16)?);
+            append(reader.string(133)?);
+        }
+    }
+    let (subject, _) = certificate_public_key(&subject)?;
+    reader.u64()?; // serial is signed opaque metadata
+    let kind = reader.u32()?;
+    if !matches!(kind, 1 | 2) || required_type.is_some_and(|required| required != kind) {
+        return None;
+    }
+    let key_id = reader.string(if kind == 1 {
+        1024
+    } else {
+        MAX_CERTIFICATE_BLOB_BYTES
+    })?;
+    if key_id.contains(&0) {
+        return None;
+    }
+    let mut principal_bytes = SshBlob::new(reader.string(MAX_CERTIFICATE_BLOB_BYTES)?);
+    let mut principals = BTreeSet::new();
+    while !principal_bytes.finished() {
+        if principals.len() == 128 {
+            return None;
+        }
+        let principal = std::str::from_utf8(principal_bytes.string(256)?).ok()?;
+        // Foundation's CharacterSet.controlCharacters includes both Cc
+        // and Cf. Reject the same controls/format characters so a signed
+        // certificate cannot produce a document the phone cannot parse.
+        if principal.is_empty()
+            || principal
+                .chars()
+                .any(|character| character.is_control() || character.is_format())
+            || !principals.insert(principal)
+        {
+            return None;
+        }
+    }
+    let valid_after = reader.u64()?;
+    if valid_after >= reader.u64()? {
+        return None;
+    }
+    certificate_options(reader.string(MAX_CERTIFICATE_BLOB_BYTES)?, false)?;
+    certificate_options(reader.string(MAX_CERTIFICATE_BLOB_BYTES)?, kind == 1)?;
+    let reserved = reader.string(MAX_CERTIFICATE_BLOB_BYTES)?;
+    if kind == 1 && !reserved.is_empty() {
+        return None;
+    }
+    let (authority, key) = certificate_public_key(reader.string(1053)?)?;
+    let signed = &blob[..reader.offset];
+    let signature = reader.string(1044)?;
+    if !reader.finished() {
+        return None;
+    }
+    verify_certificate_signature(signature, signed, &authority, &key)?;
+    Some(subject)
+}
+
+#[derive(Default)]
+struct CertificateRevocations {
+    ranges: Vec<(u64, u64)>,
+    key_ids: BTreeSet<Vec<u8>>,
+}
+
+fn normalized_revocation_ranges(mut input: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    input.sort_unstable();
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for (first, last) in input {
+        if let Some(previous) = ranges.last_mut() {
+            if previous.1 == u64::MAX || first <= previous.1 + 1 {
+                previous.1 = previous.1.max(last);
+                continue;
+            }
+        }
+        ranges.push((first, last));
+    }
+    ranges
+}
+
+#[derive(Default)]
+struct HostRevocationAccumulator {
+    sha256: BTreeSet<Vec<u8>>,
+    sha1: BTreeSet<Vec<u8>>,
+    // Empty string is the explicit wildcard CA. Fingerprint string order is
+    // the canonical wire order, shared with the Swift importer/exporter.
+    certificates: BTreeMap<String, CertificateRevocations>,
+    entries: usize,
+    sections: usize,
+    certificate_sections: usize,
+}
+
+impl HostRevocationAccumulator {
+    fn entry(&mut self) -> Option<()> {
+        self.entries = self.entries.checked_add(1)?;
+        (self.entries <= MAX_REVOCATION_ENTRIES).then_some(())
+    }
+
+    fn section(&mut self) -> Option<()> {
+        self.sections = self.sections.checked_add(1)?;
+        (self.sections <= MAX_REVOCATION_ENTRIES).then_some(())
+    }
+
+    fn range(&mut self, authority: &str, first: u64, last: u64) -> Option<()> {
+        if first == 0 || first > last {
+            return None;
+        }
+        self.entry()?;
+        self.certificates
+            .entry(authority.into())
+            .or_default()
+            .ranges
+            .push((first, last));
+        Some(())
+    }
+
+    fn certificate_section(&mut self, input: &mut SshBlob<'_>) -> Option<()> {
+        self.certificate_sections += 1;
+        if self.certificate_sections > MAX_REVOCATION_AUTHORITIES {
+            return None;
+        }
+        let blob = input.string(1053)?;
+        let authority = if blob.is_empty() {
+            String::new()
+        } else {
+            certificate_public_key(blob)?.0.fingerprint()
+        };
+        input.string(MAX_REVOCATION_SOURCE_BYTES)?; // ignored reserved bytes
+        while !input.finished() {
+            self.section()?;
+            let kind = input.take(1)?[0];
+            let mut section = SshBlob::new(input.string(MAX_REVOCATION_SOURCE_BYTES)?);
+            match kind {
+                0x20 => {
+                    while !section.finished() {
+                        let serial = section.u64()?;
+                        self.range(&authority, serial, serial)?;
+                    }
+                }
+                0x21 => self.range(&authority, section.u64()?, section.u64()?)?,
+                0x22 => {
+                    let offset = section.u64()?;
+                    let encoded = section.string(MAX_REVOCATION_SOURCE_BYTES)?;
+                    self.bitmap(&authority, offset, encoded)?;
+                }
+                0x23 => {
+                    while !section.finished() {
+                        self.entry()?;
+                        let id = section.string(1024)?;
+                        if id.contains(&0) {
+                            return None;
+                        }
+                        self.certificates
+                            .entry(authority.clone())
+                            .or_default()
+                            .key_ids
+                            .insert(id.into());
+                    }
+                }
+                0x39 => revocation_optional_extension(&mut section)?,
+                _ => return None,
+            }
+            if !section.finished() {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    fn bitmap(&mut self, authority: &str, offset: u64, encoded: &[u8]) -> Option<()> {
+        if encoded.is_empty() {
+            return Some(());
+        } // canonical zero mpint
+        let first = encoded[0];
+        if first & 0x80 != 0 {
+            return None;
+        }
+        let bytes = if first == 0 {
+            if encoded.get(1)? & 0x80 == 0 {
+                return None;
+            }
+            &encoded[1..]
+        } else {
+            encoded
+        };
+        let bits = (bytes.len() - 1) * 8 + 8 - bytes[0].leading_zeros() as usize;
+        let last = offset.checked_add((bits - 1) as u64)?;
+        let mut run = None;
+        for bit in 0..bits {
+            let set = bytes[bytes.len() - 1 - bit / 8] & (1 << (bit % 8)) != 0;
+            if set {
+                if run.is_none() {
+                    run = Some(offset + bit as u64);
+                }
+            } else if let Some(first) = run.take() {
+                self.range(authority, first, offset + bit as u64 - 1)?;
+            }
+        }
+        if let Some(first) = run {
+            self.range(authority, first, last)?;
+        }
+        Some(())
+    }
+
+    fn normalized_json(self) -> (Vec<String>, Vec<String>, Vec<Value>) {
+        let certificates = self.certificates.into_iter().filter_map(|(authority, rule)| {
+            let ranges = normalized_revocation_ranges(rule.ranges);
+            if ranges.is_empty() && rule.key_ids.is_empty() { return None; }
+            let mut result = json!({
+                "serial_ranges": ranges.into_iter().map(|(first, last)| json!({"first": first, "last": last})).collect::<Vec<_>>(),
+                "key_ids": rule.key_ids.into_iter().map(|id| STANDARD.encode(id)).collect::<Vec<_>>()
+            });
+            if !authority.is_empty() { result["authority_sha256"] = json!(authority); }
+            Some(result)
+        }).collect();
+        (
+            self.sha256
+                .into_iter()
+                .map(|hash| STANDARD.encode(hash))
+                .collect(),
+            self.sha1
+                .into_iter()
+                .map(|hash| STANDARD.encode(hash))
+                .collect(),
+            certificates,
+        )
+    }
+}
+
+fn revocation_optional_extension(input: &mut SshBlob<'_>) -> Option<()> {
+    let name = input.string(4096)?;
+    let critical = input.take(1)?[0];
+    input.string(MAX_REVOCATION_SOURCE_BYTES)?;
+    (!name.contains(&0) && critical == 0 && input.finished()).then_some(())
+}
+
+#[derive(Clone, Debug)]
+struct ParsedHostRevocation {
+    id: String,
+    document: Value,
+}
+
+/// Admit each canonical endpoint's complete normalized union before emitting
+/// a document the phone must reject. Intervals stay compact throughout.
+fn revocation_union_fits(
+    ids: &BTreeSet<String>,
+    resources: &BTreeMap<String, Value>,
+) -> Option<()> {
+    let mut sha256 = BTreeSet::new();
+    let mut sha1 = BTreeSet::new();
+    let mut certificates: BTreeMap<String, CertificateRevocations> = BTreeMap::new();
+    for id in ids {
+        let source = resources.get(id)?;
+        for hash in source["revoked_sha256"].as_array()? {
+            sha256.insert(hash.as_str()?.to_string());
+        }
+        for hash in source["revoked_sha1"].as_array()? {
+            sha1.insert(hash.as_str()?.to_string());
+        }
+        for rule in source["certificates"].as_array()? {
+            let authority = rule["authority_sha256"].as_str().unwrap_or_default();
+            let combined = certificates.entry(authority.into()).or_default();
+            for range in rule["serial_ranges"].as_array()? {
+                combined
+                    .ranges
+                    .push((range["first"].as_u64()?, range["last"].as_u64()?));
+            }
+            combined.ranges = normalized_revocation_ranges(std::mem::take(&mut combined.ranges));
+            for id in rule["key_ids"].as_array()? {
+                combined.key_ids.insert(STANDARD.decode(id.as_str()?).ok()?);
+            }
+        }
+        let entries = sha256.len()
+            + sha1.len()
+            + certificates
+                .values()
+                .map(|rule| rule.ranges.len() + rule.key_ids.len())
+                .sum::<usize>();
+        if certificates.len() > MAX_REVOCATION_AUTHORITIES || entries > MAX_REVOCATION_ENTRIES {
+            return None;
+        }
+    }
+    Some(())
+}
+
+/// The bounded passive profile shared with SSHRevokedHostKeys in the phone
+/// kit. Unknown mandatory KRL semantics and malformed suffixes invalidate the
+/// entire source. Explicit-key sections compare opaque blobs exactly; flat
+/// certificate lines instead deny their verified canonical raw subject.
+fn parse_host_revocations(bytes: &[u8]) -> Option<ParsedHostRevocation> {
+    if bytes.len() > MAX_REVOCATION_SOURCE_BYTES {
+        return None;
+    }
+    let mut policy = HostRevocationAccumulator::default();
+    let provenance = if bytes.starts_with(b"SSHKRL\n\0") {
+        let mut input = SshBlob::new(bytes);
+        input.take(8)?;
+        if input.u32()? != 1 {
+            return None;
+        }
+        let version = input.u64()?;
+        let generated = input.u64()?;
+        if input.u64()? != 0 {
+            return None;
+        }
+        input.string(MAX_REVOCATION_SOURCE_BYTES)?;
+        if input.string(MAX_REVOCATION_SOURCE_BYTES)?.contains(&0) {
+            return None;
+        }
+        while !input.finished() {
+            policy.section()?;
+            let kind = input.take(1)?[0];
+            let mut section = SshBlob::new(input.string(MAX_REVOCATION_SOURCE_BYTES)?);
+            match kind {
+                1 => policy.certificate_section(&mut section)?,
+                2 => {
+                    while !section.finished() {
+                        policy.entry()?;
+                        policy.sha256.insert(
+                            Sha256::digest(section.string(MAX_REVOCATION_SOURCE_BYTES)?).to_vec(),
+                        );
+                    }
+                }
+                3 | 5 => {
+                    while !section.finished() {
+                        policy.entry()?;
+                        let size = if kind == 3 { 20 } else { 32 };
+                        let digest = section.string(size)?;
+                        if digest.len() != size {
+                            return None;
+                        }
+                        if kind == 3 {
+                            policy.sha1.insert(digest.into());
+                        } else {
+                            policy.sha256.insert(digest.into());
+                        }
+                    }
+                }
+                255 => revocation_optional_extension(&mut section)?,
+                // Signatures are mandatory authentication semantics, not
+                // ignorable metadata. This frozen source profile is unsigned.
+                _ => return None,
+            }
+            if !section.finished() {
+                return None;
+            }
+        }
+        Some((version, generated))
+    } else {
+        for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+            if index >= MAX_SOURCE_LINES {
+                return None;
+            }
+            let line = line
+                .iter()
+                .position(|byte| !matches!(*byte, b' ' | b'\t'))
+                .map(|start| &line[start..])
+                .unwrap_or_default();
+            if line.is_empty() || line[0] == b'#' || line == b"\r" {
+                continue;
+            }
+            let mut words = line
+                .split(|byte| matches!(*byte, b' ' | b'\t' | b'\r'))
+                .filter(|word| !word.is_empty());
+            let algorithm = std::str::from_utf8(words.next()?).ok()?;
+            let base64 = words.next()?;
+            if base64.len() > 4 * ((MAX_CERTIFICATE_BLOB_BYTES + 2) / 3) {
+                return None;
+            }
+            let blob = STANDARD.decode(base64).ok()?;
+            let mut key = SshBlob::new(&blob);
+            if key.name(64)? != algorithm {
+                return None;
+            }
+            let subject = if algorithm.contains("-cert-v01@") {
+                verified_certificate_subject(&blob, None)?
+            } else {
+                certificate_public_key(&blob)?.0
+            };
+            policy.entry()?;
+            policy.sha256.insert(Sha256::digest(&subject.blob).to_vec());
+        }
+        None
+    };
+    let digest = Sha256::digest(bytes);
+    let id = format!(
+        "revocation-{}",
+        digest
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect::<String>()
+    );
+    let (sha256, sha1, certificates) = policy.normalized_json();
+    let mut document = json!({
+        "id": id,
+        "source_kind": if provenance.is_some() { "openssh_krl_v1" } else { "openssh_key_list_v1" },
+        "source_sha256": format!("SHA256:{}", STANDARD_NO_PAD.encode(digest)),
+        "revoked_sha256": sha256, "revoked_sha1": sha1, "certificates": certificates
+    });
+    if let Some((version, generated)) = provenance {
+        document["krl_version"] = json!(version);
+        document["generated_at"] = json!(generated);
+    }
+    Some(ParsedHostRevocation { id, document })
 }
 
 /// Host keys for one endpoint from known_hosts text.
@@ -2195,6 +2623,7 @@ struct Endpoint {
     host_key_algorithms: Option<Vec<String>>,
     ca_signature_algorithms: Option<Vec<String>>,
     known_hosts: Vec<PathBuf>,
+    revocation_files: Vec<PathBuf>,
     unresolved_policy: bool,
 }
 
@@ -2407,6 +2836,7 @@ fn resolve_endpoint(
             host_key_algorithms: None,
             ca_signature_algorithms: None,
             known_hosts: sources.default_known_hosts.clone(),
+            revocation_files: Vec::new(),
             unresolved_policy: false,
         }),
         RouteTarget::Alias(alias) => {
@@ -2490,6 +2920,11 @@ fn resolve_endpoint(
             let (known_hosts, mut unresolved_policy) = resolver.trust_files(&options);
             if unresolved_policy {
                 note(notes, "the SSH source has unavailable system configuration, unresolved Include/Match conditions, or unsupported passive syntax or trust-file lists; this route remains blocked on the phone".into());
+            }
+            let (revocation_files, incomplete_revocations) = resolver.revocation_files(&options);
+            if incomplete_revocations {
+                unresolved_policy = true;
+                note(notes, "RevokedHostKeys requires a complete bounded list of literal absolute or ~/ paths, or none alone; no partial revocation policy was substituted".into());
             }
             let authentication = resolver.authentication_policy(&options);
             if !authentication.problems.is_empty() {
@@ -2578,7 +3013,6 @@ fn resolve_endpoint(
             // source trust, revocation, or algorithm constraints. These are
             // preserved by a required-capability marker in the document itself.
             for keyword in [
-                "revokedhostkeys",
                 "knownhostscommand",
                 "required_rsasize",
                 "requiredrsasize",
@@ -2594,9 +3028,7 @@ fn resolve_endpoint(
             ] {
                 if let Some(value) = options.get(keyword) {
                     let disabled = match keyword {
-                        "revokedhostkeys" | "knownhostscommand" => {
-                            value.eq_ignore_ascii_case("none")
-                        }
+                        "knownhostscommand" => value.eq_ignore_ascii_case("none"),
                         "verifyhostkeydns"
                         | "checkhostip"
                         | "canonicalizehostname"
@@ -2645,6 +3077,7 @@ fn resolve_endpoint(
                 host_key_algorithms,
                 ca_signature_algorithms,
                 known_hosts,
+                revocation_files,
                 unresolved_policy,
             })
         }
@@ -3142,8 +3575,37 @@ pub fn export(
     let mut records = EndpointRecords::default();
     let mut exported = BTreeSet::new();
     let mut revoked_by_scope: BTreeMap<(String, u16), Vec<PublicKey>> = BTreeMap::new();
+    let mut revocation_ids_by_scope: BTreeMap<(String, u16), BTreeSet<String>> = BTreeMap::new();
+    let mut revocation_paths_by_scope: BTreeMap<(String, u16), BTreeSet<PathBuf>> = BTreeMap::new();
     let mut unresolved_scopes = BTreeSet::new();
     let mut resolved_routes = BTreeMap::new();
+    anyhow::ensure!(
+        sources.host_revocations.len() <= MAX_SOURCE_FILES,
+        "the revocation source inventory exceeds the phone's 64-file limit; select a smaller group"
+    );
+    let revocation_bytes = sources
+        .host_revocations
+        .values()
+        .try_fold(0usize, |total, source| match source {
+            HostRevocationSource::Present(bytes) => total.checked_add(bytes.len()),
+            _ => Some(total),
+        });
+    anyhow::ensure!(
+        revocation_bytes.is_some_and(|bytes| bytes <= MAX_SOURCE_BYTES),
+        "the revocation source inventory exceeds its 2 MiB frozen-file budget"
+    );
+    let parsed_revocations: BTreeMap<_, _> = sources
+        .host_revocations
+        .iter()
+        .map(|(path, source)| {
+            let parsed = match source {
+                HostRevocationSource::Present(bytes) => parse_host_revocations(bytes),
+                _ => None,
+            };
+            (path, parsed)
+        })
+        .collect();
+    let mut revocation_resources: BTreeMap<String, Value> = BTreeMap::new();
 
     // Collect denials before applying the selected group. Positive pins remain
     // route-specific, but omitting another machine is not permission to forget
@@ -3170,6 +3632,36 @@ pub fn export(
                     &mut route_notes,
                 );
                 let scope = endpoint_trust_scope(&resolved.endpoint);
+                revocation_paths_by_scope
+                    .entry(scope.clone())
+                    .or_default()
+                    .extend(resolved.endpoint.revocation_files.iter().cloned());
+                let revocations: Option<Vec<_>> = resolved
+                    .endpoint
+                    .revocation_files
+                    .iter()
+                    .map(|path| parsed_revocations.get(path).and_then(Option::as_ref))
+                    .collect();
+                if let Some(revocations) = revocations {
+                    let ids = revocation_ids_by_scope.entry(scope.clone()).or_default();
+                    for source in revocations {
+                        ids.insert(source.id.clone());
+                        if let Some(previous) =
+                            revocation_resources.insert(source.id.clone(), source.document.clone())
+                        {
+                            anyhow::ensure!(
+                                previous == source.document,
+                                "conflicting revocation content digest"
+                            );
+                        }
+                    }
+                } else {
+                    unresolved_scopes.insert(scope.clone());
+                    route_notes.push(ExportNote {
+                        machine: machine.id.clone(), route: Some(name.clone()),
+                        message: "RevokedHostKeys could not be captured and decoded completely; a missing, unreadable, malformed, oversized, or unsupported source keeps this host identity blocked".into(),
+                    });
+                }
                 let revoked = revoked_by_scope.entry(scope.clone()).or_default();
                 for key in &keys.revoked {
                     if !revoked.contains(key) {
@@ -3347,8 +3839,36 @@ pub fn export(
     // Denials and unresolved required trust are monotonic for one canonical
     // host-key scope, across every selected route and source spelling. Apply
     // them after collecting all routes, independently of inventory order.
+    let mut retained_revocations = BTreeSet::new();
+    let mut retained_revocation_paths = BTreeSet::new();
     for (trust_id, trust) in &mut records.trusts {
         let scope = &records.trust_scopes[trust_id];
+        if let Some(paths) = revocation_paths_by_scope.get(scope) {
+            retained_revocation_paths.extend(paths.iter().cloned());
+        }
+        if let Some(ids) = revocation_ids_by_scope
+            .get(scope)
+            .filter(|ids| !ids.is_empty())
+        {
+            anyhow::ensure!(
+                ids.len() <= MAX_SOURCE_FILES,
+                "the complete canonical host identity exceeds the phone's 64-revocation-source limit"
+            );
+            anyhow::ensure!(
+                revocation_union_fits(ids, &revocation_resources).is_some(),
+                "the complete canonical host identity exceeds the phone's normalized revocation policy budget; no partial source union was exported"
+            );
+            trust["revocation_source_refs"] = json!(ids);
+            retained_revocations.extend(ids.iter().cloned());
+            let mut required = trust["required_capabilities"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if !required.contains(&json!(HOST_REVOCATION_CAPABILITY)) {
+                required.push(json!(HOST_REVOCATION_CAPABILITY));
+            }
+            trust["required_capabilities"] = json!(required);
+        }
         if let Some(revoked) = revoked_by_scope.get(scope) {
             let fingerprints: BTreeSet<String> =
                 revoked.iter().map(PublicKey::fingerprint).collect();
@@ -3442,16 +3962,43 @@ pub fn export(
             },
         },
     });
+    if !retained_revocations.is_empty() {
+        document["workspace"]["host_revocation_sources"] = json!(
+            retained_revocations
+                .iter()
+                .filter_map(|id| revocation_resources.get(id))
+                .collect::<Vec<_>>()
+        );
+    }
     // Hash exactly the public projection, before adding this self-reference
     // and the fresh per-export bundle identity. Object keys are recursively
     // sorted even if another workspace crate enables serde_json's
     // preserve_order feature; array order carries route/group semantics.
     // Private paths and portability diagnostics stay in the local companion
-    // envelope. Neither they nor raw source comments enter this public witness.
+    // envelope. RevokedHostKeys adds a digest-only witness of each frozen
+    // selected-scope source, including failed reads and malformed data: a
+    // changed denial file must invalidate an earlier export review.
     document.sort_all_objects();
     let mut digest = Sha256::new();
     digest.update(b"frankenterm.mobile-export.public-configuration.v1\0");
     digest.update(serde_json::to_vec(&document)?);
+    if !retained_revocation_paths.is_empty() {
+        digest.update(b"file-scoped-host-revocations/v1\0");
+        for path in retained_revocation_paths {
+            let name = path.to_string_lossy();
+            digest.update((name.len() as u64).to_be_bytes());
+            digest.update(name.as_bytes());
+            match sources.host_revocations.get(&path) {
+                Some(HostRevocationSource::Present(bytes)) => {
+                    digest.update([1]);
+                    digest.update((bytes.len() as u64).to_be_bytes());
+                    digest.update(bytes);
+                }
+                Some(HostRevocationSource::Unavailable) => digest.update([2]),
+                Some(HostRevocationSource::Missing) | None => digest.update([0]),
+            }
+        }
+    }
     let revision = digest
         .finalize()
         .iter()
@@ -3548,6 +4095,238 @@ mod tests {
             "../../../fixtures/ios-airgap/ssh-user-certificates.json"
         ))
         .unwrap()
+    }
+
+    fn revocation_fixtures() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/ios-airgap/ssh-host-revocations.json"
+        ))
+        .unwrap()
+    }
+
+    fn revocation_source_fixture(id: &str) -> Vec<u8> {
+        let fixtures = revocation_fixtures();
+        let source = fixtures["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["id"] == id)
+            .unwrap();
+        STANDARD.decode(source["data"].as_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn revoked_host_sources_match_all_independent_openssh_oracle_decisions() {
+        let fixtures = revocation_fixtures();
+        let targets = fixtures["targets"].as_array().unwrap();
+        let identities: BTreeMap<_, _> = targets
+            .iter()
+            .filter(|target| target["isCertificate"] == false)
+            .map(|target| {
+                (
+                    target["id"].as_str().unwrap(),
+                    PublicKey::parse_line(target["publicKey"].as_str().unwrap()).unwrap(),
+                )
+            })
+            .collect();
+        let mut decisions = 0;
+        for source in fixtures["sources"].as_array().unwrap() {
+            let bytes = STANDARD.decode(source["data"].as_str().unwrap()).unwrap();
+            let parsed = parse_host_revocations(&bytes).unwrap();
+            let policy = &parsed.document;
+            assert_eq!(
+                policy["source_sha256"],
+                format!("SHA256:{}", STANDARD_NO_PAD.encode(Sha256::digest(&bytes)))
+            );
+            assert_eq!(
+                policy["source_kind"],
+                if source["format"] == "krl" {
+                    "openssh_krl_v1"
+                } else {
+                    "openssh_key_list_v1"
+                }
+            );
+            let denies_key = |key: &PublicKey| {
+                policy["revoked_sha256"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(STANDARD.encode(Sha256::digest(&key.blob))))
+                    || policy["revoked_sha1"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(STANDARD.encode(Sha1::digest(&key.blob))))
+            };
+            for target in targets {
+                let subject = &identities[target["subjectID"].as_str().unwrap()];
+                let denied = if target["isCertificate"] == true {
+                    let authority = &identities[target["authorityID"].as_str().unwrap()];
+                    let serial = target["serial"].as_u64().unwrap();
+                    denies_key(subject)
+                        || denies_key(authority)
+                        || policy["certificates"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|rule| {
+                                (rule["authority_sha256"].is_null()
+                                    || rule["authority_sha256"] == authority.fingerprint())
+                                    && (rule["key_ids"]
+                                        .as_array()
+                                        .unwrap()
+                                        .contains(&target["keyID"])
+                                        || (serial != 0
+                                            && rule["serial_ranges"]
+                                                .as_array()
+                                                .unwrap()
+                                                .iter()
+                                                .any(|range| {
+                                                    serial >= range["first"].as_u64().unwrap()
+                                                        && serial <= range["last"].as_u64().unwrap()
+                                                })))
+                            })
+                } else {
+                    denies_key(subject)
+                };
+                let expected = source["expectedDenied"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&target["id"]);
+                assert_eq!(denied, expected, "{} / {}", source["id"], target["id"]);
+                decisions += 1;
+            }
+        }
+        assert_eq!(decisions, 432);
+    }
+
+    fn revocation_string(value: &[u8]) -> Vec<u8> {
+        let mut result = (value.len() as u32).to_be_bytes().to_vec();
+        result.extend_from_slice(value);
+        result
+    }
+
+    fn test_krl(sections: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        let mut bytes = b"SSHKRL\n\0".to_vec();
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&42u64.to_be_bytes());
+        bytes.extend_from_slice(&1_800_000_000u64.to_be_bytes());
+        bytes.extend_from_slice(&0u64.to_be_bytes());
+        bytes.extend(revocation_string(b"ignored reserved"));
+        bytes.extend(revocation_string(b"private source comment"));
+        for (kind, section) in sections {
+            bytes.push(*kind);
+            bytes.extend(revocation_string(section));
+        }
+        bytes
+    }
+
+    fn test_certificate_revocation(kind: u8, bytes: Vec<u8>) -> Vec<u8> {
+        let mut section = revocation_string(b""); // explicit wildcard CA
+        section.extend(revocation_string(b"ignored certificate reserved"));
+        section.push(kind);
+        section.extend(revocation_string(&bytes));
+        test_krl(&[(1, section)])
+    }
+
+    #[test]
+    fn krl_policy_is_compact_canonical_and_rejects_uninterpreted_or_malformed_suffixes() {
+        let mut range = 1u64.to_be_bytes().to_vec();
+        range.extend_from_slice(&u64::MAX.to_be_bytes());
+        let bytes = test_certificate_revocation(0x21, range);
+        let parsed = parse_host_revocations(&bytes).unwrap();
+        assert_eq!(
+            parsed.document["certificates"],
+            json!([{"serial_ranges": [{"first":1,"last":u64::MAX}], "key_ids":[]} ])
+        );
+        assert_eq!(parsed.document["krl_version"], 42);
+        assert!(
+            !parsed
+                .document
+                .to_string()
+                .contains("private source comment")
+        );
+        for kind in [4, 6, 254] {
+            assert!(parse_host_revocations(&test_krl(&[(kind, Vec::new())])).is_none());
+        }
+        for kind in [0x19, 0x24] {
+            assert!(
+                parse_host_revocations(&test_certificate_revocation(kind, Vec::new())).is_none()
+            );
+        }
+        let mut extension = revocation_string(b"optional@example.invalid");
+        extension.push(0);
+        extension.extend(revocation_string(b"opaque"));
+        assert!(parse_host_revocations(&test_krl(&[(255, extension.clone())])).is_some());
+        let flag = revocation_string(b"optional@example.invalid").len();
+        extension[flag] = 1;
+        assert!(parse_host_revocations(&test_krl(&[(255, extension)])).is_none());
+        let mut flags = test_krl(&[]);
+        flags[35] = 1;
+        assert!(parse_host_revocations(&flags).is_none());
+        let mut trailing = bytes.clone();
+        trailing.push(5);
+        assert!(parse_host_revocations(&trailing).is_none());
+        for (offset, encoded) in [
+            (0, vec![1]),
+            (u64::MAX, vec![2]),
+            (1, vec![0]),
+            (1, vec![0, 1]),
+            (1, vec![128]),
+        ] {
+            let mut bitmap = offset.to_be_bytes().to_vec();
+            bitmap.extend(revocation_string(&encoded));
+            assert!(parse_host_revocations(&test_certificate_revocation(0x22, bitmap)).is_none());
+        }
+        let mut empty_bitmap = u64::MAX.to_be_bytes().to_vec();
+        empty_bitmap.extend(revocation_string(&[]));
+        assert!(parse_host_revocations(&test_certificate_revocation(0x22, empty_bitmap)).is_some());
+        let excessive = vec![0; MAX_REVOCATION_SOURCE_BYTES + 1];
+        assert!(parse_host_revocations(&excessive).is_none());
+        assert!(
+            parse_host_revocations(&test_krl(&[(
+                2,
+                revocation_string(b"opaque, not a parsed key")
+            )]))
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn flat_revocation_certificates_deny_verified_subjects_without_importing_a_host_as_user_key() {
+        let fixtures = revocation_fixtures();
+        let host = fixtures["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|target| target["id"] == "serial-100")
+            .unwrap();
+        let text = host["publicKey"].as_str().unwrap();
+        let blob = PublicKey::parse_line(text).unwrap().blob;
+        assert!(UserCertificate::from_blob(blob.clone()).is_none());
+        let mut bad = blob;
+        *bad.last_mut().unwrap() ^= 1;
+        assert!(
+            parse_host_revocations(
+                format!("ssh-ed25519-cert-v01@openssh.com {}", STANDARD.encode(bad)).as_bytes()
+            )
+            .is_none()
+        );
+        let user = certificate_fixtures();
+        for fixture in user["certificates"].as_array().unwrap() {
+            let certificate = fixture["certificate"].as_str().unwrap();
+            let parsed = parse_host_revocations(certificate.as_bytes()).unwrap();
+            let public = PublicKey::parse_line(fixture["publicKey"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                parsed.document["revoked_sha256"],
+                json!([STANDARD.encode(Sha256::digest(public.blob))])
+            );
+        }
+        let valid = format!("ssh-ed25519 {}", ED25519);
+        assert!(
+            parse_host_revocations(format!("{}\nunsupported AAAA", valid).as_bytes()).is_none()
+        );
+        let mut binary_comment = valid.into_bytes();
+        binary_comment.extend_from_slice(b" opaque \xff\n");
+        assert!(parse_host_revocations(&binary_comment).is_some());
     }
 
     fn signed_test_certificate(principals: &[&str], serial: u64, nonce_bytes: usize) -> String {
@@ -3767,6 +4546,7 @@ mod tests {
             public_keys,
             unavailable_public_keys: BTreeSet::new(),
             public_certificates: BTreeMap::new(),
+            host_revocations: BTreeMap::new(),
         }
     }
 
@@ -6348,6 +7128,337 @@ ssh = "right"
         sources
             .known_hosts
             .insert(PathBuf::from(path), KnownHostsSource::Present(text));
+    }
+
+    #[test]
+    fn revoked_host_file_lists_preserve_first_assignment_and_reject_partial_resolution() {
+        let text = "Host left\n RevokedHostKeys \"~/first list\" /trust/second /trust/second\nHost right\n RevokedHostKeys NoNe\nHost *\n RevokedHostKeys /trust/fallback\n";
+        let resolver = alias_resolver(Some(text), &context().home).unwrap();
+        assert_eq!(
+            resolver.revocation_files(&resolver.config.for_host("left")),
+            (
+                vec![
+                    context().home.join("first list"),
+                    PathBuf::from("/trust/second"),
+                    PathBuf::from("/trust/second")
+                ],
+                false
+            )
+        );
+        assert_eq!(
+            resolver.revocation_files(&resolver.config.for_host("right")),
+            (vec![], false)
+        );
+        for paths in [
+            "none /trust/good",
+            "/trust/good %d/revoked",
+            "relative",
+            "~someone/list",
+            "/trust/../list",
+            "/trust/*.krl",
+        ] {
+            let sources = authentication_sources(&format!(" RevokedHostKeys {}", paths));
+            let result = jump_export(&sources).unwrap();
+            assert!(
+                route_trust(&result, "r.app.ssh")["required_capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(UNRESOLVED_POLICY)),
+                "{}",
+                paths
+            );
+            assert!(result.document["workspace"]["host_revocation_sources"].is_null());
+        }
+        let paths = (0..17)
+            .map(|index| format!("/trust/{}", index))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let resolver = alias_resolver(
+            Some(&format!("Host left\n RevokedHostKeys {}\n", paths)),
+            &context().home,
+        )
+        .unwrap();
+        assert_eq!(
+            resolver.revocation_files(&resolver.config.for_host("left")),
+            (vec![], true)
+        );
+    }
+
+    #[test]
+    fn selected_group_keeps_all_same_scope_revocation_sources_and_prunes_other_scopes() {
+        let mut inventory = MachineInventory::parse(TRUST_INVENTORY, &context()).unwrap();
+        let mut group = inventory.groups[0].clone();
+        group.id = "only-left".into();
+        group.machines = vec!["left".into()];
+        inventory.groups.push(group);
+        let list = format!("# private-revocation-comment\nssh-ed25519 {}\n", ED25519).into_bytes();
+        let krl = revocation_source_fixture("serial-range");
+        for same_scope in [true, false] {
+            let text = format!(
+                "IdentityFile none\nUser u\nUserKnownHostsFile none\nGlobalKnownHostsFile none\nHost left\n HostName shared\n RevokedHostKeys /private/left /private/copy\nHost right\n HostName {}\n RevokedHostKeys /private/right\n",
+                if same_scope { "shared" } else { "other" }
+            );
+            let mut sources = sources(Some(&text));
+            sources.host_revocations = BTreeMap::from([
+                (
+                    PathBuf::from("/private/left"),
+                    HostRevocationSource::Present(list.clone()),
+                ),
+                (
+                    PathBuf::from("/private/copy"),
+                    HostRevocationSource::Present(list.clone()),
+                ),
+                (
+                    PathBuf::from("/private/right"),
+                    HostRevocationSource::Present(krl.clone()),
+                ),
+            ]);
+            let selected = export(&inventory, Some("only-left"), &sources, &context()).unwrap();
+            let trust = route_trust(&selected, "r.left.ssh");
+            assert_eq!(
+                trust["required_capabilities"],
+                json!([HOST_REVOCATION_CAPABILITY])
+            );
+            let count = if same_scope { 2 } else { 1 };
+            assert_eq!(
+                trust["revocation_source_refs"].as_array().unwrap().len(),
+                count
+            );
+            assert_eq!(
+                selected.document["workspace"]["host_revocation_sources"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                count
+            );
+            assert_eq!(
+                selected.document["workspace"]["machines"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(!selected.document.to_string().contains("/private/"));
+            assert!(
+                !selected
+                    .document
+                    .to_string()
+                    .contains("private-revocation-comment")
+            );
+            if same_scope {
+                sources.host_revocations.insert(
+                    PathBuf::from("/private/right"),
+                    HostRevocationSource::Missing,
+                );
+                let blocked = export(&inventory, Some("only-left"), &sources, &context()).unwrap();
+                assert!(
+                    route_trust(&blocked, "r.left.ssh")["required_capabilities"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(UNRESOLVED_POLICY))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn revocation_failures_block_the_complete_list_and_all_frozen_states_change_revision() {
+        let mut sources = authentication_sources(" RevokedHostKeys /trust/first /trust/second");
+        sources.host_revocations.insert(
+            PathBuf::from("/trust/first"),
+            HostRevocationSource::Present(format!("ssh-ed25519 {}\n", ED25519).into_bytes()),
+        );
+        let mut revisions = BTreeSet::new();
+        for state in [
+            HostRevocationSource::Missing,
+            HostRevocationSource::Unavailable,
+            HostRevocationSource::Present(Vec::new()),
+            HostRevocationSource::Present(b"# comment only\n".to_vec()),
+            HostRevocationSource::Present(b"malformed one".to_vec()),
+            HostRevocationSource::Present(b"malformed two".to_vec()),
+        ] {
+            let expected_complete = matches!(&state, HostRevocationSource::Present(bytes) if parse_host_revocations(bytes).is_some());
+            sources
+                .host_revocations
+                .insert(PathBuf::from("/trust/second"), state);
+            let result = jump_export(&sources).unwrap();
+            let trust = route_trust(&result, "r.app.ssh");
+            if expected_complete {
+                assert_eq!(
+                    trust["required_capabilities"],
+                    json!([HOST_REVOCATION_CAPABILITY])
+                );
+                assert_eq!(trust["revocation_source_refs"].as_array().unwrap().len(), 2);
+            } else {
+                assert!(
+                    trust["required_capabilities"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(UNRESOLVED_POLICY))
+                );
+                assert!(
+                    trust["revocation_source_refs"].is_null(),
+                    "A usable first file is not a complete source policy"
+                );
+                assert!(result.document["workspace"]["host_revocation_sources"].is_null());
+            }
+            revisions.insert(
+                result.document["source"]["configuration_revision"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert_eq!(revisions.len(), 6);
+        sources.host_revocations = (0..65)
+            .map(|index| {
+                (
+                    PathBuf::from(format!("/source-{}", index)),
+                    HostRevocationSource::Missing,
+                )
+            })
+            .collect();
+        assert!(jump_export(&sources).is_err());
+        sources.host_revocations = (0..9)
+            .map(|index| {
+                (
+                    PathBuf::from(format!("/source-{}", index)),
+                    HostRevocationSource::Present(vec![0; MAX_REVOCATION_SOURCE_BYTES]),
+                )
+            })
+            .collect();
+        assert!(jump_export(&sources).is_err());
+    }
+
+    #[test]
+    fn complete_revocation_union_admits_overlap_but_rejects_cross_file_budget_overflow() {
+        let digests = |first: u64| {
+            let mut section = Vec::new();
+            for value in first..first + 5000 {
+                let mut digest = vec![0; 24];
+                digest.extend_from_slice(&value.to_be_bytes());
+                section.extend(revocation_string(&digest));
+            }
+            test_krl(&[(5, section)])
+        };
+        let first = digests(0);
+        let mut sources = authentication_sources(" RevokedHostKeys /trust/first /trust/second");
+        sources.host_revocations.insert(
+            PathBuf::from("/trust/first"),
+            HostRevocationSource::Present(first),
+        );
+        for (start, expected) in [(0, true), (2000, true), (5000, false)] {
+            let second = digests(start);
+            assert!(
+                parse_host_revocations(&second).is_some(),
+                "Each complete file fits independently."
+            );
+            sources.host_revocations.insert(
+                PathBuf::from("/trust/second"),
+                HostRevocationSource::Present(second),
+            );
+            assert_eq!(
+                jump_export(&sources).is_ok(),
+                expected,
+                "combined hash range starts at {}",
+                start
+            );
+        }
+        let rules = |start: u16, count: u16| {
+            let sections: Vec<_> = (start..start + count)
+                .map(|index| {
+                    let mut public = revocation_string(b"ssh-ed25519");
+                    let mut point = vec![0; 30];
+                    point.extend_from_slice(&index.to_be_bytes());
+                    public.extend(revocation_string(&point));
+                    let mut body = revocation_string(&public);
+                    body.extend(revocation_string(&[]));
+                    body.push(0x23);
+                    body.extend(revocation_string(&revocation_string(b"denied")));
+                    (1, body)
+                })
+                .collect();
+            test_krl(&sections)
+        };
+        sources.host_revocations.insert(
+            PathBuf::from("/trust/first"),
+            HostRevocationSource::Present(rules(0, 129)),
+        );
+        for (start, expected) in [(0, true), (128, false)] {
+            let second = rules(start, 129);
+            assert!(parse_host_revocations(&second).is_some());
+            sources.host_revocations.insert(
+                PathBuf::from("/trust/second"),
+                HostRevocationSource::Present(second),
+            );
+            assert_eq!(
+                jump_export(&sources).is_ok(),
+                expected,
+                "combined CA range starts at {}",
+                start
+            );
+        }
+    }
+
+    #[test]
+    fn disk_revocation_snapshot_preserves_binary_files_and_failed_reads_without_private_siblings() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let krl = revocation_source_fixture("serial-bitmap");
+        write_source(&home.join(".ssh/fleet.krl"), &krl);
+        write_source(
+            &home.join(".ssh/plain list"),
+            format!("ssh-ed25519 {}\n", ED25519),
+        );
+        write_source(
+            &home.join(".ssh/oversized"),
+            vec![0; MAX_REVOCATION_SOURCE_BYTES + 1],
+        );
+        write_source(
+            &home.join(".ssh/config"),
+            "Host left\n User u\n RevokedHostKeys ~/.ssh/fleet.krl \"~/.ssh/plain list\" ~/.ssh/missing ~/.ssh/oversized\nHost right\n RevokedHostKeys none\n",
+        );
+        let context = InventoryContext {
+            directory: directory.path().to_path_buf(),
+            home: home.clone(),
+        };
+        let inventory = MachineInventory::parse(TRUST_INVENTORY, &context).unwrap();
+        let snapshot = SshSources::from_disk(&inventory, &context);
+        assert_eq!(snapshot.host_revocations.len(), 4);
+        assert_eq!(
+            snapshot.host_revocations.get(&home.join(".ssh/fleet.krl")),
+            Some(&HostRevocationSource::Present(krl.clone()))
+        );
+        assert_eq!(
+            snapshot.host_revocations.get(&home.join(".ssh/missing")),
+            Some(&HostRevocationSource::Missing)
+        );
+        assert_eq!(
+            snapshot.host_revocations.get(&home.join(".ssh/oversized")),
+            Some(&HostRevocationSource::Unavailable)
+        );
+        write_source(&home.join(".ssh/fleet.krl"), b"changed");
+        assert_eq!(
+            snapshot.host_revocations.get(&home.join(".ssh/fleet.krl")),
+            Some(&HostRevocationSource::Present(krl))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            let original = home.join(".ssh/plain list");
+            let link = home.join(".ssh/linked");
+            symlink(&original, &link).unwrap();
+            assert_eq!(
+                read_public_source_bytes(&link, MAX_REVOCATION_SOURCE_BYTES),
+                HostRevocationSource::Unavailable
+            );
+            std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o666)).unwrap();
+            assert_eq!(
+                read_public_source_bytes(&original, MAX_REVOCATION_SOURCE_BYTES),
+                HostRevocationSource::Unavailable
+            );
+        }
     }
 
     #[test]

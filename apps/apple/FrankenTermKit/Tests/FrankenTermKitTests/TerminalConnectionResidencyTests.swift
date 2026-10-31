@@ -30,6 +30,38 @@ final class TerminalConnectionResidencyTests: XCTestCase {
         XCTAssertEqual(try policy.decision(for: "a", priority: ["a", "b"], owners: [owner("b")]), .available)
     }
 
+    func testIndependentTabsConsumeSeparateSlotsAndNeverReplaceASibling() throws {
+        let policy = try Policy(limit: 3), first = UUID(), second = UUID()
+        let primary = owner("a", .terminal)
+        let extra = Policy.Owner(machineID: "a", id: UUID(), state: .terminal, terminalSessionID: first)
+        XCTAssertEqual(try policy.decision(for: "a", priority: ["a"], owners: [primary],
+            terminalSessionID: first), .available)
+        XCTAssertEqual(try policy.decision(for: "a", priority: ["a"], owners: [primary, extra],
+            terminalSessionID: first), .alreadyOwned)
+        XCTAssertEqual(try policy.decision(for: "a", priority: ["a"], owners: [primary, extra],
+            terminalSessionID: second), .available)
+        let third = Policy.Owner(machineID: "a", id: UUID(), state: .settling, terminalSessionID: second)
+        XCTAssertEqual(try policy.decision(for: "a", priority: ["a"], owners: [primary, extra, third],
+            terminalSessionID: UUID()), .blocked)
+        XCTAssertThrowsError(try policy.decision(for: "a", priority: ["a"], owners: [extra,
+            .init(machineID: "a", id: UUID(), state: .preparing, terminalSessionID: first)], terminalSessionID: second))
+    }
+
+    func testOnlyAnAutomaticPrimaryCanYieldWhenAMachineOwnsAdditionalTabs() throws {
+        var policy = try Policy(limit: 2)
+        let primary = owner("old"), slot = UUID()
+        let explicit = Policy.Owner(machineID: "old", id: UUID(), state: .automaticPreparation, terminalSessionID: slot)
+        XCTAssertEqual(try policy.decision(for: "wanted", priority: ["wanted", "old"], owners: [explicit, primary]),
+            .release(primary))
+        XCTAssertThrowsError(try policy.willRelease(explicit), "Additional tabs are deliberate, never automatic eviction candidates.")
+        try policy.willRelease(primary)
+        policy.started("old", terminalSessionID: slot)
+        XCTAssertTrue(policy.wasReleased(machineID: "old", ownerID: primary.id))
+        XCTAssertFalse(policy.permitsPreparation("old", selected: "old", explicitlyRequested: false, terminalSessionID: slot))
+        XCTAssertTrue(policy.permitsPreparation("old", selected: nil, explicitlyRequested: true, terminalSessionID: slot))
+        XCTAssertEqual(try policy.decision(for: "wanted", priority: ["wanted", "old"], owners: [explicit, primary]), .blocked)
+    }
+
     func testExistingOwnerWinsOverCapacityAndIsNeverReplaced() throws {
         let policy = try Policy(limit: 1)
         for state: Policy.State in [.preparing, .automaticPreparation, .protectedPreparation, .terminal, .settling] {

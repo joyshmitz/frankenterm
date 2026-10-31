@@ -124,13 +124,18 @@ public final class TerminalUnansweredInput: @unchecked Sendable {
     private let defaults: UserDefaults
     private let key: String
     private let launch: String
-    /// This session's own mark: a later session on the machine may hold it.
+    /// This session's own mark: a replacement connection in its slot may hold it.
     private let mark: String
 
     public init(workspace: String, machine: String, defaults: UserDefaults = .standard,
-                launch: String = TerminalUnansweredInput.thisLaunch) {
+                launch: String = TerminalUnansweredInput.thisLaunch, terminalSessionID: UUID? = nil) {
         self.defaults = defaults
-        key = "frankenterm.input.unanswered.\(workspace).\(machine)"
+        if let terminalSessionID {
+            key = "frankenterm.input.unanswered-session.\(workspace).\(machine).\(terminalSessionID.uuidString)"
+        } else {
+            // Preserve the primary slot's pre-multiple-terminal hint exactly.
+            key = "frankenterm.input.unanswered.\(workspace).\(machine)"
+        }
         self.launch = launch
         mark = "\(launch) \(UUID().uuidString)"
     }
@@ -143,7 +148,7 @@ public final class TerminalUnansweredInput: @unchecked Sendable {
         }
     }
 
-    /// Whether an earlier launch ended with input on this machine unanswered.
+    /// Whether an earlier launch ended with input in this terminal unanswered.
     /// Reading it clears it: the screen tells it once.
     public func takeFromEarlierLaunch() -> Bool {
         lock.withLock {

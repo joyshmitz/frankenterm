@@ -13,6 +13,8 @@ public struct SSHHostCertificate: Equatable, Sendable, CustomDebugStringConverti
 
     public let blob: Data, algorithm: String, fingerprint: String
     public let subject: SSHPublicIdentity, authority: SSHPublicIdentity
+    /// Exact signed bytes, used by certificate revocation rules, never a UI label.
+    public let keyID: Data
     /// The CA's signature envelope algorithm, independent of the host key's
     /// negotiated key-exchange signature algorithm.
     public let signatureAlgorithm: String
@@ -26,6 +28,7 @@ public struct SSHHostCertificate: Equatable, Sendable, CustomDebugStringConverti
         guard parsed.criticalOptions.isEmpty else { throw FTError.unsupported("certificate.critical_options") }
         self.blob = parsed.blob; algorithm = parsed.algorithm; fingerprint = parsed.fingerprint
         subject = parsed.subject; authority = parsed.authority; signatureAlgorithm = parsed.signatureAlgorithm
+        keyID = parsed.keyID
         serial = parsed.serial; validAfter = parsed.validAfter; validBefore = parsed.validBefore
         principals = parsed.principals; criticalOptions = parsed.criticalOptions; extensionOptions = parsed.extensionOptions
     }

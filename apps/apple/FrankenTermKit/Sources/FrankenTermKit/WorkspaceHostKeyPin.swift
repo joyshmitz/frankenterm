@@ -110,14 +110,24 @@ enum WorkspaceHostKeyOverlay {
 
         func witness(trustID: String) throws -> Data {
             guard let trust = trusts[trustID] else { throw WorkspaceStoreError.staleReview }
-            let policy: JSONValue = .object([
+            var fields: [String: JSONValue] = [
                 "exporter": .string(imported.exporterID), "workspace": .string(imported.id),
                 "source_kind": .string(imported.sourceKind ?? ""), "trust": trust,
                 "required_capabilities": root["required_capabilities"] ?? .array([]),
                 "root_extensions": root["extensions"] ?? .object([:]),
                 "workspace_extensions": workspace["extensions"] ?? .object([:])
-            ])
-            return Data(SHA256.hash(data: try StrictJSON.encode(policy)))
+            ]
+            let sources = try imported.hostRevocationSources(forTrustID: trustID)
+            if !sources.isEmpty {
+                // A resource may keep its ID while its contents change. Bind
+                // the complete normalized policy without copying a large KRL
+                // into every local pin witness. Preserve legacy empty-policy
+                // witnesses so unrelated catalog migrations keep valid pins.
+                fields["revocation_sources"] = .array(try sources.map {
+                    .string(Data(SHA256.hash(data: try StrictJSON.encode($0.json))).base64EncodedString())
+                })
+            }
+            return Data(SHA256.hash(data: try StrictJSON.encode(.object(fields))))
         }
     }
 

@@ -895,6 +895,110 @@ final class TerminalSessionControllerTests: XCTestCase {
         for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
     }
 
+    func testDirectTerminalTabsKeepSeparateShellsFocusAndExactCloseOwnership() async throws {
+        let live = try await liveScene(), scene = live.scene
+        let primary = try await connect(scene, "alpha")
+        let primaryView = try shown(primary)
+        var mounted = [primaryView]
+        defer { mounted.forEach { $0.removeFromSuperview() } }
+        let path = live.outPath + ".terminal-tabs"
+        try await type("export FT_TAB=primary; echo TAB-$FT_TAB > \(path)", into: primaryView)
+        let exactRoute = try XCTUnwrap(primary.additionalTerminalTarget).routes
+        var extras: [TerminalSessionController] = []
+        for _ in 0..<3 {
+            for _ in 0..<200 where !scene.canCreateAdditionalTerminal { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertTrue(scene.canCreateAdditionalTerminal)
+            scene.newTerminal()
+            let extra = try XCTUnwrap(scene.additionalSessions["alpha"]?.last?.controller)
+            extras.append(extra)
+            for _ in 0..<600 where extra.terminal == nil && !extra.settled { try await Task.sleep(for: .milliseconds(25)) }
+            XCTAssertTrue(scene.selectedSession === extra)
+            XCTAssertEqual(extra.phase, .live)
+            XCTAssertEqual(extra.target.routes, exactRoute, "A new tab uses the actual destination and every successful hop choice")
+            let view = try shown(extra); mounted.append(view)
+            try await type("export FT_TAB=extra\(extras.count)", into: view)
+        }
+        XCTAssertEqual(scene.terminalControllers("alpha").count, 4)
+        XCTAssertFalse(scene.canCreateAdditionalTerminal)
+        scene.newTerminal()
+        XCTAssertEqual(scene.terminalControllers("alpha").count, 4)
+        let liveConnections = await live.connections.manager.connections()
+        XCTAssertEqual(liveConnections.count, 4)
+        XCTAssertEqual(Set(liveConnections.map(\.scope.transportID)).count, 4)
+        XCTAssertEqual(Set(liveConnections.map(\.scope.channelID)).count, 4)
+        XCTAssertEqual(Set(liveConnections.compactMap(\.terminalSessionID)).count, 3)
+
+        scene.selectTerminal(primary)
+        for _ in 0..<400 where scene.selectedSession !== primary || scene.navigation.phase != .ready {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try await type("echo TAB-$FT_TAB >> \(path)", into: primaryView)
+        XCTAssertFalse(mounted[1].input.isEditable)
+        mounted[1].input.insertText("echo WRONG-TAB >> \(path)\n")
+        let survivor = extras[1], survivorView = mounted[2]
+        scene.selectTerminal(survivor)
+        for _ in 0..<400 where scene.selectedSession !== survivor || scene.navigation.phase != .ready {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try await type("echo TAB-$FT_TAB >> \(path)", into: survivorView)
+        let output = try await hostFile(path, containing: "TAB-extra2")
+        XCTAssertEqual(output.split(separator: "\n"), ["TAB-primary", "TAB-primary", "TAB-extra2"])
+
+        let removed = extras[0]
+        scene.endTerminal(removed)
+        for _ in 0..<400 where !removed.settled { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertTrue(removed.settled)
+        scene.removeTerminal(removed)
+        XCTAssertTrue(scene.selectedSession === survivor, "Removing an ended hidden sibling cannot steal focus")
+        XCTAssertEqual(primary.phase, .live)
+        XCTAssertEqual(survivor.phase, .live)
+        for _ in 0..<200 where scene.earlierTerminals("alpha").isEmpty { try await Task.sleep(for: .milliseconds(10)) }
+        let reviewed = scene.earlierTerminals("alpha")
+        XCTAssertTrue(reviewed.contains { $0.scope.terminalSessionID == removed.terminalSessionID })
+        scene.acknowledgeEarlierTerminals(reviewed, machineID: "alpha")
+        for _ in 0..<200 where scene.reviewingTerminalHistory { try await Task.sleep(for: .milliseconds(10)) }
+        let records = try await live.connections.journal.records()
+        XCTAssertEqual(records.filter { $0.state == .creationStarted }.count, 3, "History review cannot retire live siblings")
+
+        let endedID = survivor.id, slotID = survivor.terminalSessionID
+        try await type("exit", into: survivorView)
+        for _ in 0..<400 where !survivor.settled { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertTrue(survivor.settled)
+        scene.networkPathChanged(.init(usable: true, interfaces: ["new-test-network"]))
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertTrue(scene.displayedSession("alpha") === survivor, "An ended extra tab never respawns automatically")
+        XCTAssertEqual(scene.navigation.navigation.selection?.paneID, .init(id: survivor.id, incarnation: survivor.id))
+        XCTAssertNil(scene.owner.keyboard, "An ended tab is an inert focus placeholder")
+        scene.stepPane(forward: true)
+        for _ in 0..<400 where scene.selectedSession !== extras[2] { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(scene.selectedSession === extras[2], "Pane-next starts from the ended tab's ring position")
+        scene.selectTerminal(survivor)
+        for _ in 0..<400 where scene.selectedSession !== survivor { try await Task.sleep(for: .milliseconds(10)) }
+        scene.select("beta")
+        for _ in 0..<400 where scene.selectedMachineID != "beta" { try await Task.sleep(for: .milliseconds(10)) }
+        scene.select("alpha")
+        for _ in 0..<400 where scene.selectedSession !== survivor { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(scene.selectedSession === survivor, "Machine navigation remembers the exact ended local slot")
+        scene.restartTerminal(survivor)
+        let replacement = try XCTUnwrap(scene.additionalSessions["alpha"]?.first { $0.id == slotID }?.controller)
+        XCTAssertNotEqual(replacement.id, endedID)
+        XCTAssertEqual(replacement.terminalSessionID, slotID)
+        XCTAssertEqual(replacement.target.routes, survivor.target.routes)
+        for _ in 0..<600 where replacement.terminal == nil && !replacement.settled { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertEqual(replacement.phase, .live)
+        XCTAssertTrue(scene.selectedSession === replacement)
+        try await scene.prepareRouteChange(machineID: "alpha", expectedControllerID: primary.id)
+        try scene.installRouteChange(primary.target, expectedControllerID: primary.id)
+        scene.restartTerminal(replacement)
+        XCTAssertTrue(scene.displayedSession("alpha") === replacement)
+        XCTAssertTrue(scene.invalidatedTerminalSlots.contains(try XCTUnwrap(slotID)))
+        let afterRouteChange = await live.connections.manager.connections()
+        XCTAssertTrue(afterRouteChange.isEmpty, "An old additional slot cannot reopen the account retired by Change Route")
+        await scene.close()
+        let remaining = await live.connections.manager.connections()
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
     /// A layout change (the keyboard's bar on iPad, a window resized) redraws
     /// the live screen; keys typed before its caret is drawn again still run.
     func testKeysTypedWhileTheScreenIsRedrawnReachTheShell() async throws {
@@ -3224,6 +3328,74 @@ final class TerminalSessionControllerTests: XCTestCase {
         await scene.close()
     }
 
+    func testEarlierTerminalReviewIncludesJoinedOrphansAndCannotResolveLiveOrUnseenSiblings() async throws {
+        let (connections, scene, target) = try dormantScene()
+        try await appear(scene, selecting: target.machineID)
+        func scope(_ slot: UUID?) throws -> TerminalSessionScope {
+            try .init(workspaceID: target.workspaceID, workspaceRevision: target.revision,
+                machineID: target.machineID, routeID: target.routes[0].id, transportID: UUID(), channelID: UUID(),
+                terminalSessionID: slot)
+        }
+        let primary = try await connections.journal.beginCreation(scope: scope(nil))
+        let activeSibling = try await connections.journal.beginCreation(scope: scope(UUID()))
+        let orphan = try await connections.journal.beginCreation(scope: scope(UUID()))
+        let orphanHint = TerminalUnansweredInput(workspace: target.workspaceID.uuidString, machine: target.machineID,
+            launch: "earlier-test-launch", terminalSessionID: orphan.scope.terminalSessionID)
+        let siblingHint = TerminalUnansweredInput(workspace: target.workspaceID.uuidString, machine: target.machineID,
+            launch: "earlier-test-launch", terminalSessionID: activeSibling.scope.terminalSessionID)
+        orphanHint.set(true); siblingHint.set(true)
+        try await connections.journal.markInterrupted(epoch: orphan)
+        scene.refreshTerminalHistory()
+        for _ in 0..<200 where scene.earlierTerminals(target.machineID).count != 1 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let reviewed = scene.earlierTerminals(target.machineID)
+        XCTAssertEqual(reviewed.map(\.id), [orphan.id])
+        let first = try XCTUnwrap(reviewed.first)
+        XCTAssertTrue(first.blocksNewSession)
+        XCTAssertFalse(first.hasRecoveryNotice, "Ordinary joined tab history must also be releasable before the unresolved limit fills")
+
+        let unseen = try await connections.journal.beginCreation(scope: scope(UUID()))
+        try await connections.journal.markInterrupted(epoch: unseen)
+        scene.acknowledgeEarlierTerminals(reviewed, machineID: target.machineID)
+        for _ in 0..<200 where scene.reviewingTerminalHistory { try await Task.sleep(for: .milliseconds(10)) }
+        let records = try await connections.journal.records()
+        XCTAssertEqual(records.first { $0.id == orphan.id }?.state, .acknowledged)
+        XCTAssertEqual(records.first { $0.id == primary.id }?.state, .creationStarted)
+        XCTAssertEqual(records.first { $0.id == activeSibling.id }?.state, .creationStarted)
+        XCTAssertEqual(scene.earlierTerminals(target.machineID).map(\.id), [unseen.id], "Unseen history stays reviewable after the exact captured batch")
+        XCTAssertFalse(TerminalUnansweredInput(workspace: target.workspaceID.uuidString, machine: target.machineID,
+            terminalSessionID: orphan.scope.terminalSessionID).takeFromEarlierLaunch(), "Resolved orphan hints cannot accumulate after a killed launch")
+        XCTAssertTrue(TerminalUnansweredInput(workspace: target.workspaceID.uuidString, machine: target.machineID,
+            terminalSessionID: activeSibling.scope.terminalSessionID).takeFromEarlierLaunch(), "Review cannot consume a live sibling's hint")
+        XCTAssertTrue(scene.sessions.isEmpty, "Loading or acknowledging old tab metadata never creates a shell")
+        let connected = await connections.manager.connections()
+        XCTAssertTrue(connected.isEmpty)
+        try await connections.journal.markInterrupted(epoch: primary)
+        try await connections.journal.markInterrupted(epoch: activeSibling)
+        await scene.close()
+    }
+
+    func testAnAdditionalSlotCannotConsumeItsSiblingsPasswordHopRetry() async throws {
+        let (connections, scene, original) = try dormantScene()
+        let route = TerminalSessionRoute(id: "route", credentialIDs: ["first", "second"],
+            host: "destination.invalid", port: 22, promptingJump: true, jumpHost: "jump.invalid")
+        let target = TerminalSessionTarget(workspaceID: original.workspaceID, revision: original.revision,
+            machineID: original.machineID, machineName: original.machineName, routes: [route])
+        let slot = UUID()
+        let first = TerminalSessionController(target: target, connections: connections, focus: scene, terminalSessionID: slot)
+        var plan = try first.makeRouteAttemptPlan(candidates: target.routes)
+        XCTAssertTrue(try first.rememberPasswordHopRefusal(XCTUnwrap(plan.current), plan: &plan))
+        let sibling = TerminalSessionController(target: target, connections: connections, focus: scene,
+            retryingAfterPasswordHop: first, terminalSessionID: UUID())
+        XCTAssertEqual(try sibling.makeRouteAttemptPlan(candidates: target.routes).current?.selection.authentication, .publicKey("first"))
+        let rightful = TerminalSessionController(target: target, connections: connections, focus: scene,
+            retryingAfterPasswordHop: first, terminalSessionID: slot)
+        XCTAssertEqual(try rightful.makeRouteAttemptPlan(candidates: target.routes).current?.selection.authentication, .publicKey("second"),
+                       "An unrelated logical slot cannot erase or borrow this tab's explicit retry")
+        await scene.close()
+    }
+
     func testStopBeforeStartPermanentlyRetiresThisController() async throws {
         let (connections, scene, target) = try dormantScene()
         let controller = TerminalSessionController(target: target, connections: connections, focus: scene)
@@ -3439,6 +3611,50 @@ final class TerminalSessionControllerTests: XCTestCase {
         await broker.suspend()
     }
 
+    func testTwoTerminalTabsOnTheSameRouteCannotBorrowPasswordOwnership() async throws {
+        let (broker, selected, seedPrompt) = try await passwordPromptFixture()
+        let seed = Task { try await broker.password(for: selected, transportID: UUID(), prompter: seedPrompt) }
+        let request = try await waitForPasswordPrompt(seedPrompt)
+        seedPrompt.cancel(requestID: request.id)
+        do { _ = try await seed.value; XCTFail("The seed editor should cancel") } catch {}
+        let (connections, scene, _) = try dormantScene()
+        let scope = MobileSSHPasswordPrompt.Scope(workspaceID: selected.authorization.workspaceID,
+            revision: selected.authorization.workspaceRevision, machineID: "machine-alpha",
+            destinationRouteIDs: [selected.authorization.routeID])
+        let target = TerminalSessionTarget(workspaceID: scope.workspaceID, revision: scope.revision,
+            machineID: scope.machineID, machineName: "Same account", routes: [.init(id: selected.authorization.routeID,
+                credentialIDs: [], host: "destination.invalid", port: 22, authenticationChoices: [.password])])
+        let first = TerminalSessionController(target: target, connections: connections, focus: scene)
+        let second = TerminalSessionController(target: target, connections: connections, focus: scene, terminalSessionID: UUID())
+        connections.setAuthenticationForeground(true)
+        connections.setAuthenticationScope(scope)
+        connections.selectTerminalAuthenticationOwner(first)
+        let firstPrompt = try XCTUnwrap(connections.authenticationPrompters(for: first.id).password)
+        let secondPrompt = try XCTUnwrap(connections.authenticationPrompters(for: second.id).password)
+        let pending = Task { try await firstPrompt.password(for: request) }
+        let shown = try await waitForPasswordPrompt(connections.passwordPrompt)
+        connections.passwordPrompt.editSecret("first tab only", requestID: shown.id)
+        connections.selectTerminalAuthenticationOwner(second)
+        do { _ = try await pending.value; XCTFail("Switching exact tabs must retire the old password") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertTrue(connections.passwordPrompt.secret.isEmpty)
+        connections.setAuthenticationScope(scope) // The app repeats the same machine-level route scope.
+        connections.releaseTerminalAuthenticationOwner(first.id) // A hidden scene finishes the old controller's cleanup.
+        do { _ = try await firstPrompt.password(for: request); XCTFail("The hidden same-route tab borrowed the selected owner") }
+        catch { XCTAssertEqual(error as? SSHAuthenticationError, .stale) }
+        let accepted = Task { try await secondPrompt.password(for: request) }
+        let current = try await waitForPasswordPrompt(connections.passwordPrompt)
+        connections.passwordPrompt.editSecret("second tab only", requestID: current.id)
+        connections.passwordPrompt.submit(requestID: current.id)
+        let value = try await accepted.value
+        XCTAssertEqual(value, Data("second tab only".utf8))
+        connections.selectTerminalAuthenticationOwner(nil)
+        do { _ = try await secondPrompt.password(for: request); XCTFail("Leaving the scene must retire exact terminal prompt authority") }
+        catch { XCTAssertEqual(error as? SSHAuthenticationError, .stale) }
+        connections.setAuthenticationForeground(false)
+        await broker.suspend(); await scene.close()
+    }
+
     private func interactivePromptFixture() async throws -> (SSHAuthenticationBroker, WorkspaceSSHKeyboardInteractiveIdentity, MobileSSHKeyboardInteractivePrompt) {
         let crypto = AppleCryptography()
         let point = try crypto.ed25519PublicKey(seed: Data(0..<32))
@@ -3611,6 +3827,52 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(restoredValue, [Data("terminal code".utf8)])
         XCTAssertNil(prompt.request); XCTAssertTrue(prompt.answers.isEmpty)
         await broker.suspend()
+    }
+
+    func testTwoTerminalTabsOnTheSameRouteCannotBorrowInteractiveAnswers() async throws {
+        let (broker, selected, seedPrompt) = try await interactivePromptFixture()
+        let challenge = try SSHKeyboardInteractiveChallenge(round: 1, name: "Second factor", instruction: "",
+            prompts: [.init(text: "Code", echo: false)])
+        let seed = Task {
+            try await broker.keyboardInteractiveResponses(for: selected, transportID: UUID(), attemptID: UUID(),
+                challenge: challenge, prompter: seedPrompt)
+        }
+        let request = try await waitForInteractivePrompt(seedPrompt)
+        seedPrompt.cancel(requestID: request.id)
+        do { _ = try await seed.value; XCTFail("The seed challenge should cancel") } catch {}
+        await broker.finishKeyboardInteractiveAttempt(selected)
+        let (connections, scene, _) = try dormantScene()
+        let scope = MobileSSHPasswordPrompt.Scope(workspaceID: selected.authorization.workspaceID,
+            revision: selected.authorization.workspaceRevision, machineID: "machine-alpha",
+            destinationRouteIDs: [selected.authorization.routeID])
+        let target = TerminalSessionTarget(workspaceID: scope.workspaceID, revision: scope.revision,
+            machineID: scope.machineID, machineName: "Same account", routes: [.init(id: selected.authorization.routeID,
+                credentialIDs: [], host: "destination.invalid", port: 22, authenticationChoices: [.keyboardInteractive])])
+        let first = TerminalSessionController(target: target, connections: connections, focus: scene, terminalSessionID: UUID())
+        let second = TerminalSessionController(target: target, connections: connections, focus: scene, terminalSessionID: UUID())
+        connections.setAuthenticationForeground(true); connections.setAuthenticationScope(scope)
+        connections.selectTerminalAuthenticationOwner(first)
+        let firstPrompt = try XCTUnwrap(connections.authenticationPrompters(for: first.id).keyboardInteractive)
+        let secondPrompt = try XCTUnwrap(connections.authenticationPrompters(for: second.id).keyboardInteractive)
+        let pending = Task { try await firstPrompt.responses(for: request) }
+        let shown = try await waitForInteractivePrompt(connections.keyboardInteractivePrompt)
+        connections.keyboardInteractivePrompt.editAnswer("first code", index: 0, requestID: shown.id)
+        connections.selectTerminalAuthenticationOwner(second)
+        do { _ = try await pending.value; XCTFail("The old tab's MFA editor must retire") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertTrue(connections.keyboardInteractivePrompt.answers.isEmpty)
+        connections.setAuthenticationScope(scope)
+        connections.releaseTerminalAuthenticationOwner(first.id)
+        do { _ = try await firstPrompt.responses(for: request); XCTFail("A delayed sibling MFA round borrowed the new tab") }
+        catch { XCTAssertEqual(error as? SSHAuthenticationError, .stale) }
+        let accepted = Task { try await secondPrompt.responses(for: request) }
+        let current = try await waitForInteractivePrompt(connections.keyboardInteractivePrompt)
+        connections.keyboardInteractivePrompt.editAnswer("second code", index: 0, requestID: current.id)
+        connections.keyboardInteractivePrompt.submit(requestID: current.id)
+        let answers = try await accepted.value
+        XCTAssertEqual(answers, [Data("second code".utf8)])
+        connections.setAuthenticationForeground(false)
+        await broker.suspend(); await scene.close()
     }
 
     func testInteractiveRoutesRequireForegroundPromptOwnership() {

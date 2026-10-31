@@ -147,6 +147,37 @@ public struct SSHWorkspaceSource: Sendable {
         }
     }
 
+    /// Exact public RevokedHostKeys inputs, including binary OpenSSH KRLs.
+    /// Missing and unavailable sources remain distinct witnessed failures;
+    /// neither means an empty revocation list. Paths stay local to the exporter.
+    public struct HostRevocationSnapshot: Sendable {
+        public enum File: Equatable, Sendable {
+            case present(Data), missing, unavailable
+        }
+        public let files: [String: File]
+
+        public init(files: [String: File]) throws {
+            guard files.count <= SSHWorkspaceSource.maximumKnownHostsFiles else {
+                throw FTError.limit("ssh.revocation.files")
+            }
+            var bytes = 0
+            for (reference, file) in files {
+                try Task.checkCancellation()
+                guard SSHWorkspaceSource.knownHostsReference(reference) else {
+                    throw FTError.malformed("ssh.revocation.reference")
+                }
+                if case .present(let data) = file {
+                    guard data.count <= 256 * 1024,
+                          data.count <= SSHWorkspaceSource.maximumSourceBytes - bytes else {
+                        throw FTError.limit("ssh.revocation.bytes")
+                    }
+                    bytes += data.count
+                }
+            }
+            self.files = files
+        }
+    }
+
     public let aliases: [String]
     private let configuration: Data
     private let directives: [Directive]
@@ -689,6 +720,49 @@ public struct SSHWorkspaceSource: Sendable {
         return try KnownHostsSnapshot(files: files)
     }
 
+    /// First matching RevokedHostKeys assignment, including every selected
+    /// destination and expanded jump. A malformed list contributes no prefix.
+    public func hostRevocationFileReferences(for selectedAliases: [String]) throws -> [String] {
+        try validateSelection(selectedAliases)
+        var seen = Set<String>(), result: [String] = [], budget = MatchBudget()
+        for route in try plan(selectedAliases, budget: &budget) {
+            var problems: [Problem] = []
+            for reference in Self.hostRevocationReferences(route.resolution.options, problems: &problems) {
+                if seen.insert(reference).inserted { result.append(reference) }
+            }
+        }
+        guard result.count <= Self.maximumKnownHostsFiles else { throw FTError.limit("ssh.revocation.files") }
+        return result
+    }
+
+    /// Freeze complete, bounded regular files without parsing binary KRLs as
+    /// UTF-8. The same ownership, symlink and mutation checks as public trust
+    /// files apply. No private sibling, command or network source is consulted.
+    public func loadHostRevocationFiles(for selectedAliases: [String],
+        homeDirectory: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)) throws -> HostRevocationSnapshot {
+        guard homeDirectory.isFileURL else { throw FTError.malformed("ssh.revocation.reference") }
+        let home = ConfigurationParser.physicalURL(homeDirectory, isDirectory: true) ?? homeDirectory.standardizedFileURL
+        var files: [String: HostRevocationSnapshot.File] = [:], bytes = 0
+        for reference in try hostRevocationFileReferences(for: selectedAliases) {
+            try Task.checkCancellation()
+            var url = reference.hasPrefix("~/") ? home.appendingPathComponent(String(reference.dropFirst(2)))
+                : URL(fileURLWithPath: reference)
+            #if os(macOS) || os(iOS)
+            if reference.hasPrefix("/etc/") { url = URL(fileURLWithPath: "/private" + reference) }
+            let access = url.startAccessingSecurityScopedResource()
+            defer { if access { url.stopAccessingSecurityScopedResource() } }
+            #endif
+            do {
+                if let data = try Self.readLocalSourceFile(url, remaining: min(256 * 1024, Self.maximumSourceBytes - bytes),
+                                                         site: "ssh.revocation") {
+                    files[reference] = .present(data); bytes += data.count
+                } else { files[reference] = .missing }
+            } catch is CancellationError { throw CancellationError() }
+            catch { files[reference] = .unavailable }
+        }
+        return try HostRevocationSnapshot(files: files)
+    }
+
     private static func readLocalSourceFile(_ url: URL, remaining: Int, site: String) throws -> Data? {
         guard let descriptor = try ConfigurationParser.openLocal(url, directory: false) else { return nil }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
@@ -730,6 +804,7 @@ public struct SSHWorkspaceSource: Sendable {
                                               publicIdentityFiles: PublicIdentitySnapshot? = nil,
                                               publicCertificateFiles: PublicCertificateSnapshot? = nil,
                                               knownHosts: Data? = nil, knownHostFiles: KnownHostsSnapshot? = nil,
+                                              hostRevocationFiles: HostRevocationSnapshot? = nil,
                                               registry: inout SSHWorkspaceRegistry,
                                               using crypto: C) throws -> SSHWorkspaceExport {
         try validateSelection(selectedAliases)
@@ -767,6 +842,23 @@ public struct SSHWorkspaceSource: Sendable {
             guard Set(knownHostFiles.files.keys).isSubset(of: expected) else { throw FTError.malformed("ssh.known_hosts.unselected_source") }
             for (reference, file) in knownHostFiles.files {
                 if case .present(let data) = file { knownByFile[reference] = try Self.knownHosts(data) }
+            }
+        }
+        var revocationsByFile: [String: WorkspaceHostRevocationSource] = [:]
+        if let hostRevocationFiles {
+            let expected = Set(try hostRevocationFileReferences(for: selectedAliases))
+            guard Set(hostRevocationFiles.files.keys).isSubset(of: expected) else {
+                throw FTError.malformed("ssh.revocation.unselected_source")
+            }
+            for (reference, file) in hostRevocationFiles.files {
+                try Task.checkCancellation()
+                if case .present(let data) = file {
+                    // A malformed configured source blocks its exact routes;
+                    // it cannot turn a valid sibling file into a partial list.
+                    do { revocationsByFile[reference] = try SSHRevokedHostKeys.parse(data: data) }
+                    catch is CancellationError { throw CancellationError() }
+                    catch { continue }
+                }
             }
         }
         var sourceBytes = Data("FrankenTerm/SSHWorkspaceSource/v1\0".utf8)
@@ -826,6 +918,21 @@ public struct SSHWorkspaceSource: Sendable {
                 guard sourceBytes.count <= FTLimit.archive else { throw FTError.limit("ssh.source_snapshot") }
             }
         }
+        if let hostRevocationFiles {
+            sourceBytes += Data("file-scoped-host-revocations/v1\0".utf8)
+            sourceBytes.appendBE(UInt64(hostRevocationFiles.files.count), bytes: 4)
+            for reference in hostRevocationFiles.files.keys.sorted() {
+                guard let file = hostRevocationFiles.files[reference] else { throw FTError.stale }
+                sourceBytes.appendBE(UInt64(reference.utf8.count), bytes: 4); sourceBytes += Data(reference.utf8)
+                switch file {
+                case .present(let data):
+                    sourceBytes.append(1); sourceBytes.appendBE(UInt64(data.count), bytes: 4); sourceBytes += data
+                case .missing: sourceBytes.append(2)
+                case .unavailable: sourceBytes.append(3)
+                }
+                guard sourceBytes.count <= FTLimit.archive else { throw FTError.limit("ssh.source_snapshot") }
+            }
+        }
         guard sourceBytes.count <= FTLimit.archive else { throw FTError.limit("ssh.source_snapshot") }
         let revision = crypto.sha256(sourceBytes).ftHex.lowercased()
         let legacyKnown = try Self.knownHosts(knownHosts)
@@ -835,9 +942,10 @@ public struct SSHWorkspaceSource: Sendable {
         for item in planned { routeIDs[item.key] = try workingRegistry.id(item.key.registryKind, item.key.target.registrySource) }
         var routes: [JSONValue] = [], machines: [JSONValue] = [], trusts: [JSONValue] = []
         var credentials: [JSONValue] = [], order: [JSONValue] = []
+        var revocationSources: [String: WorkspaceHostRevocationSource] = [:]
         var emittedCredentials = Set<String>(), emittedTrusts = Set<String>(), references: [String: String] = [:]
         var portability = [AirGapArchive.Portability(entityID: registry.workspaceID, setting: "ssh_config.source_scope", disposition: 0,
-            reason: "Created from the selected SSH configuration and supplied public identities, explicit user certificates, and known-hosts data. System configuration, agent inventory, live terminal themes, and implicit certificate files were not captured. Review this explicit route configuration before connecting.")]
+            reason: "Created from the selected SSH configuration and supplied public identities, explicit user certificates, known-hosts data, and frozen RevokedHostKeys sources. System configuration, agent inventory, live terminal themes, and implicit certificate files were not captured. Review this explicit route configuration before connecting.")]
 
         for item in planned {
             let alias = item.key.target.alias
@@ -847,6 +955,17 @@ public struct SSHWorkspaceSource: Sendable {
             let trustID = try workingRegistry.id(item.key.target.port == nil ? "trust" : "trust_port",
                                                  item.key.target.trustRegistrySource)
             var resolved = item.resolution
+            let revocationReferences = Self.hostRevocationReferences(resolved.options, problems: &resolved.problems)
+            var routeRevocations: [WorkspaceHostRevocationSource] = []
+            var revocationFilesComplete = true
+            for reference in revocationReferences {
+                if let source = revocationsByFile[reference] { routeRevocations.append(source) }
+                else { revocationFilesComplete = false }
+            }
+            if !revocationFilesComplete {
+                routeRevocations = []
+                resolved.problems.append(Problem("revokedhostkeys", "An effective RevokedHostKeys source is missing, unavailable, malformed or unsupported. The complete revocation policy remains required; this route cannot authenticate."))
+            }
             var known = (entries: [KnownHost](), problems: [Problem]())
             if let knownHostFiles {
                 let references = Self.knownHostsReferences(resolved.options, problems: &resolved.problems)
@@ -1020,6 +1139,15 @@ public struct SSHWorkspaceSource: Sendable {
             var trust: [String: JSONValue] = ["id": .string(trustID), "host": .string(sourceHost), "port": .number(String(port)),
                 "claimed_source": .string("selected_known_hosts"), "pins": .array(pins), "revoked_keys": .array(revoked)]
             var trustCapabilities: [JSONValue] = []
+            if !routeRevocations.isEmpty {
+                var seen = Set<String>()
+                let ids = routeRevocations.filter { seen.insert($0.id).inserted }.map { source -> JSONValue in
+                    revocationSources[source.id] = source
+                    return .string(source.id)
+                }
+                trust["revocation_source_refs"] = .array(ids)
+                trustCapabilities.append(.string(WorkspaceDocument.hostRevocationCapability))
+            }
             if !authorities.isEmpty {
                 trust["certificate_authorities"] = .array(authorities)
                 trustCapabilities.append(.string(WorkspaceDocument.hostCertificateCapability))
@@ -1032,6 +1160,12 @@ public struct SSHWorkspaceSource: Sendable {
                     let capability = JSONValue.string(WorkspaceDocument.hostAlgorithmPolicyCapability)
                     if !trustCapabilities.contains(capability) { trustCapabilities.append(capability) }
                 }
+            }
+            if problems.contains(where: { $0.setting == "revokedhostkeys" && $0.required }) {
+                // This incomplete negative policy belongs to the canonical
+                // host identity. Dropping its route or selecting another alias
+                // must not make the same endpoint eligible for authentication.
+                trustCapabilities.append(.string("ssh_config.unresolved_policy"))
             }
             if !trustCapabilities.isEmpty { trust["required_capabilities"] = .array(trustCapabilities) }
             if let sourceKeyAlias { trust["host_key_alias"] = .string(sourceKeyAlias) }
@@ -1047,7 +1181,7 @@ public struct SSHWorkspaceSource: Sendable {
             }
         }
         guard let first = order.first else { throw FTError.malformed("ssh.selection") }
-        let root = JSONValue.object(["format": .string("ftworkspace"), "version": .number("1"), "bundle_id": .string(UUID().uuidString),
+        var root = JSONValue.object(["format": .string("ftworkspace"), "version": .number("1"), "bundle_id": .string(UUID().uuidString),
             "source": .object(["exporter_id": .string(registry.exporterID), "kind": .string("ssh_config"), "configuration_revision": .string(revision)]),
             "required_capabilities": .array([]), "workspace": .object([
                 "id": .string(registry.workspaceID), "name": .string(workspaceName),
@@ -1055,6 +1189,11 @@ public struct SSHWorkspaceSource: Sendable {
                 "machines": .array(machines), "routes": .array(routes), "credentials": .array(credentials), "host_trust": .array(trusts),
                 "themes": .array([Self.theme(id: registry.themeID)]),
                 "preferences": .object(["initial_group_ref": .string(registry.groupID), "initial_machine_ref": first, "connect_on_open": .boolean(false)])])])
+        if !revocationSources.isEmpty {
+            var fields = try root.object(), workspace = try fields.required("workspace").object()
+            workspace["host_revocation_sources"] = .array(revocationSources.keys.sorted().compactMap { revocationSources[$0]?.json })
+            fields["workspace"] = .object(workspace); root = .object(fields)
+        }
         let workspace = try WorkspaceDocument(data: StrictJSON.encode(root))
         // This also checks reference validity, duplicate findings, and the exact
         // archive metadata profile before the caller receives a usable snapshot.
@@ -1216,7 +1355,7 @@ public struct SSHWorkspaceSource: Sendable {
             switch key {
             case "hostname", "port", "user", "hostkeyalias", "preferredauthentications", "pubkeyauthentication", "passwordauthentication", "kbdinteractiveauthentication", "identitiesonly":
                 if arguments.count != 1 { problems.append(Problem(key, "This SSH setting requires exactly one value; its semantics remain unresolved.")) }
-            case "userknownhostsfile", "globalknownhostsfile":
+            case "userknownhostsfile", "globalknownhostsfile", "revokedhostkeys":
                 // The whole first matching list is resolved against a frozen
                 // file inventory at export, separately for every route and hop.
                 break
@@ -1357,6 +1496,18 @@ public struct SSHWorkspaceSource: Sendable {
             for reference in references where seen.insert(reference).inserted { result.append(reference) }
         }
         return result
+    }
+    private static func hostRevocationReferences(_ options: [String: [String]], problems: inout [Problem]) -> [String] {
+        guard let references = options["revokedhostkeys"] else { return [] }
+        if references.count == 1, references[0].lowercased() == "none" { return [] }
+        guard !references.isEmpty, references.count <= maximumKnownHostsFilesPerSetting,
+              !references.contains(where: { $0.lowercased() == "none" }),
+              references.allSatisfy({ knownHostsReference($0) && !$0.contains(where: { "*?[]".contains($0) }) }) else {
+            problems.append(Problem("revokedhostkeys", "The complete revocation-file list needs unsupported relative-path, token, environment, glob, named-user or parent-directory resolution, mixes none with paths, or exceeds the sixteen-file limit. No partial policy was substituted."))
+            return []
+        }
+        var seen = Set<String>()
+        return references.filter { seen.insert($0).inserted }
     }
     private static func validUser(_ user: String) -> Bool {
         !user.isEmpty && user.utf8.count <= 256 && !user.unicodeScalars.contains(where: { $0.value <= 32 || $0.value == 127 })

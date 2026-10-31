@@ -2,12 +2,84 @@
 
 This directory contains the shared Swift 6 `FrankenTermKit` package and the native Xcode project for the first offline workspace-transfer slice. It is implementation source, not a signed or device-qualified terminal release.
 
+## Imported OpenSSH host revocations
+
+The native SSH and air-gapped workspace paths now carry `RevokedHostKeys` public
+key lists and unsigned OpenSSH KRL v1 files from both desktop exporters to the
+phone's verifier. The passive source resolver captures every path in the first
+effective assignment, including a complete list of up to sixteen literal
+absolute or `~/` paths. Missing, unreadable, unsafe, malformed or unsupported
+sources block their canonical host scope, including when another alias is
+selected and the original route is omitted from the transfer.
+
+Public revocation resources are deduplicated in the manifest and referenced by
+trust records. The verifier checks raw subject and issuer key hashes, exact
+certificate key IDs, serial lists, intervals and bitmaps. Intervals stay compact
+even through `UInt64.max`; key hashes and IDs use cached sets, and serial checks
+use binary search. Fleet endpoints with the same source set share the compiled
+immutable policy. SHA-1 here identifies revoked keys; it does not enable SHA-1
+SSH signatures.
+
+Catalog version eleven preserves each accepted source once and retains its
+canonical scope references. A later export, an older recording, a renamed trust
+record or a lower KRL version cannot remove a previously accepted denial.
+Public-key, password and interactive authentication all retain the actual peer
+identity and recheck that policy, independently for every jump and destination.
+A first-use probe reports a revoked peer without exposing a candidate that the
+phone could approve as a new pin.
+
+Import details, route and jump-account review, and the Keys screen show source
+digests, KRL versions, source timestamps and retained history. Source version
+and time are descriptive; they do not establish freshness. Unsupported freshness
+requirements and signed or unknown critical KRL sections remain blocked.
+See [the SSH package's profile and validation](FrankenTermSSH/README.md#imported-host-revocation-lists-and-krls)
+for exact bounds, interoperability evidence and remaining native qualification.
+
+## Independent SSH terminal tabs
+
+A connected direct-SSH machine can open additional terminals with **New
+Terminal**, up to four terminal connections per machine. Each tab owns its own
+SSH transport, PTY, screen, scrollback, authentication prompts and input history.
+The pane strip and pane-navigation shortcuts select the exact tab. Closing one
+terminal leaves its siblings running; ending a session and removing its tab are
+separate actions.
+
+Connecting and ended tabs remain selectable through the ordinary keyboard
+handoff. They receive no input authority. Changing tabs commits composition and
+held-key cleanup to the previous source before enabling the selected terminal,
+and off-screen output identifies the tab that produced it. Additional tabs use
+the selected direct route and sign-in choices without trying a mux attachment.
+They require deliberate creation and never reconnect or recreate a shell
+automatically. The primary connection retains the existing group, mux and
+reconnection behavior.
+
+Each additional tab has a stable local slot UUID. Retrying that tab preserves
+its history while creating fresh transport and channel identities. Input
+uncertainty, review and dismissal stay with that slot. **Earlier Terminals** also
+exposes records left by removed tabs or an earlier launch, including settled
+records that still need review before their history capacity can be reclaimed.
+No command content or output is persisted in that journal.
+
+All tabs share the existing limit of sixteen retained connections and three
+pending attempts. Explicit tabs cannot be evicted by background preparation of
+another machine. Scene deactivation fences terminal input; workspace replacement,
+connection-manager suspension and local key or host revocation settle every
+affected tab. A dropped additional terminal waits for an explicit new session.
+
+The Linux Swift 6.4.1 run passed 142 core tests, 64 native regressions, six
+multi-terminal scenarios using 13 real SSH connections, and four SFTP ownership
+and prompt-isolation scenarios. A subsequent native rebuild passed three focused
+route-inheritance scenarios across 14 real SSH key exchanges, including implicit
+hop-key fallback and a mixed password/MFA chain. The new SwiftUI scene, Metal
+presentation and five hosted app regressions still require an Apple SDK run.
+Earlier simulator evidence below does not qualify these new tab interactions.
+
 ## Remote files over verified SSH
 
 The native SSH backend supports a dedicated SFTP owner using the same exact
 workspace revision, selected destination and jump-host sign-ins, host-key checks,
 local revocation policy and foreground authority as terminal connections. A
-machine can retain one terminal and one file connection independently. The app
+machine can retain up to four terminals and one file connection independently. The app
 admits at most two file owners inside its existing connection and attempt limits.
 File owners create no shell, PTY, exec request, terminal input source or session
 creation journal, and workspace invalidation and suspension close both kinds.
@@ -734,7 +806,7 @@ Release distribution must use the repository's DSR system after its native iOS l
 
 ## Critical continuation
 
-The linked Rust artifact and the native scene hookup exist. `TerminalSessionController` (TerminalSessionScreen.swift) binds the connection manager, journal, model runtime, `TerminalViewportResize` and Metal/input surfaces to one attachment. `WorkspaceTerminalScene` keeps one of those per connected machine under Kit's navigation focus owner. The UI journeys and hosted tests above exercise them on the simulator, including the machine theme as the terminal's base palette. Still open for M0: physical-device qualification.
+The linked Rust artifact and the native scene hookup exist. `TerminalSessionController` (TerminalSessionScreen.swift) binds the connection manager, journal, model runtime, `TerminalViewportResize` and Metal/input surfaces to one attachment. `WorkspaceTerminalScene` keeps a primary controller per connected machine and up to three explicitly added direct-SSH controllers under Kit's navigation focus owner. The earlier UI journeys and hosted tests exercise the primary connection on the simulator, including the machine theme as the terminal's base palette. The additional-tab UI and physical-device qualification remain outstanding.
 
 The phone attaches to existing panes through exported `frankenterm_mux` routes or the default mux socket of a plain SSH route. A dropped connection retries three times, 1, 2 and 4 seconds apart. A network change grants dropped or retrying machines three more attempts and replenishes a connected machine's next retry budget. Automatic pane return requires the complete fresh identity described above; restart, replacement and legacy/unavailable identity require explicit selection. If the mux is gone, no shell opens in its place. A direct shell reconnects signed in and waits for **New Session**. Refused credentials and changed host keys never retry; transport failures do, with host verification before each authentication.
 

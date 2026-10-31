@@ -875,6 +875,7 @@ final class WorkspaceHostKeyPinTests: XCTestCase {
         var legacy = try catalog(f.disk), workspaces = try XCTUnwrap(legacy["workspaces"] as? [[String: Any]])
         legacy["version"] = 7
         legacy.removeValue(forKey: "hostAlgorithmPolicies")
+        legacy.removeValue(forKey: "hostRevocationSources"); legacy.removeValue(forKey: "hostRevocationSourceScopes")
         workspaces[0].removeValue(forKey: "hostKeyPins"); legacy["workspaces"] = workspaces
         let history = try JSONSerialization.data(withJSONObject: XCTUnwrap(legacy["acceptedImports"]), options: [.sortedKeys])
         f.disk.seed(try JSONSerialization.data(withJSONObject: legacy, options: [.sortedKeys]), slot: .catalog)
@@ -886,7 +887,7 @@ final class WorkspaceHostKeyPinTests: XCTestCase {
         XCTAssertTrue(saved.hostKeyPins.isEmpty)
         XCTAssertTrue(try saved.document().hostTrust[0].pins.isEmpty)
         let migrated = try catalog(f.disk)
-        XCTAssertEqual(migrated["version"] as? Int, 10)
+        XCTAssertEqual(migrated["version"] as? Int, 11)
         XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(migrated["acceptedImports"]), options: [.sortedKeys]), history)
         let stable = f.disk.bytes(.catalog)
         _ = try await WorkspaceStore(persistence: f.disk, vault: f.vault).load()
@@ -908,7 +909,10 @@ final class WorkspaceHostKeyPinTests: XCTestCase {
             case "witness": pins[0]["sourceWitness"] = Data(repeating: 0, count: 31).base64EncodedString()
             case "fingerprint": pins[0]["key"] = ["algorithm": "ssh-ed25519", "fingerprint": "not-a-fingerprint"]
             case "identifier": pins[0]["trustID"] = "invalid\nidentifier"
-            default: fields["version"] = 7
+            default:
+                fields["version"] = 7
+                fields.removeValue(forKey: "hostAlgorithmPolicies")
+                fields.removeValue(forKey: "hostRevocationSources"); fields.removeValue(forKey: "hostRevocationSourceScopes")
             }
             workspaces[0]["hostKeyPins"] = pins; fields["workspaces"] = workspaces
             let corrupt = try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])

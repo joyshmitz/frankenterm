@@ -106,7 +106,8 @@ public struct WorkspaceExportSelection: Sendable {
         let projected = try projectionBundleID.map { try selection.reissuingBundle(id: $0) } ?? selection
         workspace = projected
         let retainedEntities = Set([projected.id] + projected.groups.map(\.id) + projected.machines.map(\.id)
-            + projected.routes.map(\.id) + projected.credentials.map(\.id) + projected.hostTrust.map(\.id) + projected.themes.map(\.id))
+            + projected.routes.map(\.id) + projected.credentials.map(\.id) + projected.hostTrust.map(\.id)
+            + projected.hostRevocationSources.map(\.id) + projected.themes.map(\.id))
         sourceFindings = metadata.portability.filter { retainedEntities.contains($0.entityID) }
         var orderedFingerprints: [String] = [], references: [String: [String]] = [:]
         var algorithms: [String: String] = [:]
@@ -170,9 +171,11 @@ public struct WorkspaceExportSelection: Sendable {
             requiredEntityIDs: Set(sourceFindings.filter { $0.disposition == 1 }.map(\.entityID)))
         var revocations: [String: Set<String>] = [:]
         var requirements: [String: Set<String>] = [:]
+        var sourceRevocations: [String: WorkspaceHostRevocationPolicy] = [:]
         for trust in workspace.hostTrust {
             revocations[trust.canonicalTrustScope, default: []].formUnion(trust.revokedKeys.map(\.fingerprint))
             requirements[trust.canonicalTrustScope, default: []].formUnion(trust.requiredPolicyRequirements)
+            sourceRevocations[trust.id] = try workspace.hostRevocationPolicy(forTrustID: trust.id)
         }
         var blocked: [String] = [], missingIdentity: [String] = []
         let certificateTime = Date()
@@ -187,7 +190,10 @@ public struct WorkspaceExportSelection: Sendable {
                     required.formUnion(requirements[trust.canonicalTrustScope] ?? [])
                     let identities = trust.pins + trust.certificateAuthorities
                     if identities.isEmpty { lacksPins = true }
-                    else if identities.allSatisfy({ (revocations[trust.canonicalTrustScope] ?? []).contains($0.fingerprint) }) { deniesPins = true }
+                    else if identities.allSatisfy({
+                        (revocations[trust.canonicalTrustScope] ?? []).contains($0.fingerprint)
+                            || sourceRevocations[trust.id]?.denies(presented: $0) == true
+                    }) { deniesPins = true }
                 }
                 if candidate.authenticationMethods == [.publicKey] {
                     let candidates = candidate.credentialIDs.compactMap { credentials[$0] }
@@ -208,10 +214,12 @@ public struct WorkspaceExportSelection: Sendable {
                 for id in candidate.jumpRoutes { if let hop = routeMap[id] { inspect(hop, transit: true) } }
             }
             inspect(route, transit: !destinations.contains(route.id))
-            // Certificate transport is checked again against the receiving
-            // build. An offline export must not persist its absence as an
-            // immutable source-policy blocker; the manifest keeps the marker.
+            // The receiving build checks qualified certificate transport and
+            // policy support again. Do not turn these understood, preserved
+            // policies into immutable source blockers during offline export.
             required.remove(WorkspaceDocument.hostCertificateCapability)
+            required.remove(WorkspaceDocument.hostAlgorithmPolicyCapability)
+            required.remove(WorkspaceDocument.hostRevocationCapability)
             var reasons: [String] = []
             let lacksSessionPolicy = destinations.contains(route.id)
                 && ((route.mode == "direct_ssh" && route.sessionCreation == nil)
@@ -365,6 +373,7 @@ public struct WorkspaceExportSelection: Sendable {
         // Retaining only directly referenced pins could erase an applicable
         // negative record or mandatory policy stored under another trust alias.
         let retainedTrustIDs = Set(source.hostTrust.filter { trustScopes.contains($0.canonicalTrustScope) }.map(\.id))
+        let revocationSourceIDs = Set(source.hostTrust.filter { retainedTrustIDs.contains($0.id) }.flatMap(\.revocationSourceIDs))
         let themeIDs = Set(machines.map(\.themeID))
         var root = try StrictJSON.decode(source.raw).object()
         var document = try root.required("workspace").object()
@@ -374,6 +383,7 @@ public struct WorkspaceExportSelection: Sendable {
         }
         try retain("groups", groupIDs); try retain("machines", machineIDs); try retain("routes", routeIDs)
         try retain("credentials", credentialIDs); try retain("host_trust", retainedTrustIDs); try retain("themes", themeIDs)
+        if document["host_revocation_sources"] != nil { try retain("host_revocation_sources", revocationSourceIDs) }
         // Prune only membership. Group identity, order, auto-connect and any
         // required policy stay intact, including a deliberately retained empty
         // group. No unselected machine can survive through another group.

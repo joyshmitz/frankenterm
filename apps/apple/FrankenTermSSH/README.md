@@ -54,9 +54,10 @@ raw `pins`. CA identities include their algorithm and SHA-256 fingerprint. Expor
 uses the effective OpenSSH hostname or HostKeyAlias spelling, including trailing
 dots, and preserves the original lookup scope for positive CA matching. Canonical
 endpoint aliases may combine denials but cannot introduce a new positive CA.
-Literal `CASignatureAlgorithms` and `HostKeyAlgorithms` allowlists are preserved
-and enforced as described below. KRL inputs, unresolved source policy, and
-unsupported freshness requirements continue to block the affected routes.
+Literal `CASignatureAlgorithms` and `HostKeyAlgorithms` allowlists and the
+supported `RevokedHostKeys` profile are preserved and enforced as described
+below. Unresolved source policy and unsupported freshness requirements continue
+to block the affected routes.
 
 Before any public-key offer, protected signing, password prompt, or interactive
 MFA round, the store and broker bind the exact exchanged certificate to the
@@ -144,8 +145,8 @@ The passive exporter has no authoritative snapshot of the source OpenSSH
 version's default algorithm list. Default-dependent `+`/`-` expressions and
 wildcard restrictions therefore remain required unresolved findings. Valid `^`
 preference-only expressions are explicitly retained as inactive preferences;
-the exporter does not invent a source default list. KRL and freshness policy
-remain outside this capability.
+the exporter does not invent a source default list. Revocation sources use the
+separate capability below; unsupported freshness policy remains blocked.
 
 Portable qualification rebuilt the actual Kit, native SSH and integration
 modules with Swift 6.4.1 warnings treated as errors, and rebuilt the C adapter
@@ -177,6 +178,104 @@ test passed frontend parsing; Apple SDK compilation and device execution are
 still required. The Rust exporter passes pinned rustfmt parsing/format checks
 and eight independent OpenSSH source-configuration checks, but its Cargo tests
 have not run because the required RCH runner is unavailable.
+
+### Imported host revocation lists and KRLs
+
+Both passive desktop exporters support `RevokedHostKeys` public-key lists and
+unsigned OpenSSH KRL format version one. The first effective setting may name
+one to sixteen literal absolute or `~/` files; case-insensitive `none` must stand
+alone. Every referenced file must be captured successfully. Dynamic or relative
+paths, unreadable files, unsafe ownership/permissions, symlinks, mutation during
+capture, malformed tails and unsupported mandatory semantics produce required
+blockers. Captured binary bytes and failure states participate in the frozen
+source revision. Neither exporter executes SSH or reads private keys to obtain
+revocation policy.
+
+The optional manifest table `workspace.host_revocation_sources` stores normalized
+public resources. `host_trust.revocation_source_refs` references their IDs and
+implicitly requires `ssh_host_revocation_v1`. Each source retains its kind,
+SHA-256 digest and, for a KRL, its version and generation timestamp. The accepted
+negative policy includes:
+
+- Explicit key blobs and SHA-256/SHA-1 hashes of raw public identities.
+- Certificate serial lists, inclusive ranges and bitmaps, scoped to an exact CA
+  or the KRL's wildcard CA.
+- Exact opaque certificate key IDs, including empty and non-UTF-8 IDs. Embedded
+  NUL bytes are refused; Unicode normalization never changes identity.
+- Noncritical extensions that add no understood mandatory policy. Unknown
+  sections, critical extensions and signature sections are refused as a whole.
+
+An ordinary key-list certificate revokes its raw subject. A KRL hash is checked
+against both the raw subject and its CA; it is not a hash of the complete signed
+certificate. Serial zero is never a serial revocation rule, but a serial-zero
+certificate can still be denied by its key ID, subject or authority. Signature
+verification and all positive host-name, validity and CA checks remain required.
+Using SHA-1 for a negative hash comparison does not permit SHA-1 key-exchange or
+issuer signatures. These semantics follow the
+[OpenSSH KRL format](https://github.com/openssh/openssh-portable/blob/HEAD/PROTOCOL.krl)
+and [RevokedHostKeys](https://man.openbsd.org/ssh_config#RevokedHostKeys).
+
+| Bound | Limit |
+| --- | ---: |
+| Captured source file | 256 KiB |
+| Frozen revocation-source inventory | 2 MiB |
+| Source resources / references per trust | 64 / 64 |
+| Hashes, merged serial intervals and key IDs per normalized policy | 8,192 |
+| CA rule groups per policy | 256 |
+| Revocation key-ID bytes | 1,024 |
+| Historical sources per canonical trust scope | 256 |
+
+Hashes and key IDs use cached sets, serial intervals use binary search, and
+large ranges are never expanded into individual serials. Document validation
+compiles each distinct complete source set once and shares it across fleet
+endpoints. Exceeding any combined scope budget rejects the policy rather than
+dropping a file or accepting a valid prefix.
+
+Catalog version eleven migrates older stores and retains a deduplicated source
+pool with per-workspace, per-scope references. Current aliases and all previously
+accepted sources form a monotonic denial union. Removing a resource, replacing
+the workspace, rolling back a recording or lowering its KRL version cannot
+weaken that union. Conflicting contents under the same claimed source digest,
+missing retained references and malformed catalog records are refused. Version
+and generation time are provenance, not authority to expire or clear denials;
+unsupported freshness requirements remain unavailable.
+
+Each authentication grant retains the exact raw public identity or verified
+certificate. SHA-1 rules require the raw exchanged blob and reject a substituted
+or absent witness. The store and broker recheck denials before a public-key
+offer, protected signing, password or MFA response, and later session access.
+Every jump is checked independently. First-use probes read the public policy
+without touching private-key storage, validate the exact peer, recheck revision
+and source history at completion, and expose no approvable identity for a
+revoked peer. Resource changes also enter security review and invalidate
+source-bound phone-pin and device-key choices.
+
+Portable qualification uses the actual Kit, SSH and Integration sources with
+Swift 6.4.1 warnings treated as errors. The unchanged C adapter was reused only
+after matching its source hashes to its prior successful native build:
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Shared Swift | 307 passed, zero failures or skips | 14 parser/oracle, 14 new policy, 109 exporter, 143 catalog/store/migration and 27 existing algorithm/CA methods |
+| Independent OpenSSH oracle | 432 matching decisions | 27 public identities/certificates against 16 key-list/KRL sources generated and queried with `ssh-keygen` |
+| Native Swift regressions | 32 passed, zero failures or skips | Actual authentication, certificates, revocation and negotiation adapters |
+| Live interoperability | 11 scenarios passed through 12 real key exchanges | Raw SHA-1 checks for all three authentication methods; denied jump with zero destination contacts; separately denied destination; retained first-use denial; valid and revoked host certificates |
+
+Denied live peers observed no username exchange, authentication-method probe,
+key offer, password, MFA response, shell or PTY. The public fixture is
+`fixtures/ios-airgap/ssh-host-revocations.json`; private fixture keys are not
+repository assets. Run the live harness from this package with:
+
+```sh
+python3 Tests/Interop/test_host_revocations.py /path/to/libftssh.so /path/to/native-tests.xctest
+```
+
+The Rust exporter has eight new regression methods, including the same 432
+oracle decisions, source capture, alias retention and aggregate union bounds.
+Its final source passes pinned rustfmt parsing and format checks. Cargo
+execution remains unverified because the required RCH runner is unavailable.
+The iOS presentation and hosted regression pass frontend parsing; Apple SDK
+compilation and physical-device execution remain required.
 
 Public-key authentication supports Ed25519, ECDSA P-256/P-384/P-521, and RSA
 with 2048–8192-bit moduli and a positive odd exponent of at most 64 bits. The callback
@@ -408,11 +507,11 @@ terminal consumption, scene lifecycle, and retained input-outcome reconciliation
 protected persistence directory, separate from the workspace catalog and import
 journal. `beginCreation(scope:)` returns an opaque epoch only after its atomic
 write and durability confirmation succeed. The record binds the installed
-workspace, saved revision, machine, route, transport and channel. It contains no
+workspace, saved revision, machine, logical terminal slot, route, transport and channel. It contains no
 terminal input/output, private keys, hostnames or content-derived hashes.
 
-An unresolved record blocks another creation for the same installed workspace and
-machine, even after a route or revision changes. Passing the journal to the native
+An unresolved record blocks another creation for the same installed workspace,
+machine and terminal slot, even after a route or revision changes. Passing the journal to the native
 connection factory checks that record before DNS. Before the pump is published,
 the journal binds its exact input source to the creation epoch. `recordInput`
 persists only a bounded union of transport observations, never commands, paste
@@ -427,13 +526,50 @@ acknowledged history is pruned. File-backed journals anchor their identity outsi
 the catalog (device-only Keychain on Apple), so missing history cannot silently
 authorize a replacement shell.
 
+Journal version four stores an optional `terminal_session_id`. Versions one
+through three migrate to the original primary slot (`nil`); their existing
+uncertainty and continuity anchor remain intact. A deliberately added terminal
+uses its own UUID, while a replacement connection in that tab retains it.
+`belongsTo(workspaceID:machineID:terminalSessionID:)` selects only that slot's
+history across route and revision changes. Continuing or dismissing one tab's
+record never acknowledges a sibling. Removing a tab does not remove its records;
+machine-wide recovery review must display and acknowledge exact journal-issued
+snapshots. All slots share the existing unresolved and recovery-history bounds.
+
 `WorkspaceSSHConnectionManager` is the app-owned entry point shared by scenes.
 Construct it with the workspace store, foreground broker, dedicated journal,
 input coordinator and shared `WorkspaceNetworkActivity`. It starts with networking
 disabled. `resume()` enables foreground admission, and each `connect` separately
 requires `confirmedByUser: true`. Admission is bounded to three attempts and at
-most sixteen retained connection/settlement owners, with one owner per installed
-workspace and machine. There is no waiting queue or automatic reconnect.
+most sixteen retained connection/settlement owners. Each installed workspace and
+machine may retain four terminal owners and one independent Files owner, with at
+most two Files owners across the app. There is no waiting queue or automatic
+reconnect in the manager.
+
+The primary terminal keeps `terminalSessionID: nil`. To open another direct-SSH
+terminal, pass a new UUID with `purpose: .terminal`, `attachMux: false` and
+`requiresExistingMux: false`. The selected route must be `direct_ssh`; additional
+slot identifiers cannot authorize Files or mux connections. A duplicate live or
+pending slot is refused, and pending attempts count toward the per-machine cap.
+Each successful attempt still receives fresh transport and channel identities;
+the logical slot is local history metadata, never remote PTY recovery authority.
+Closing one owner leaves its siblings active. Suspension, workspace invalidation
+and credential or host revocation continue to settle every affected owner.
+
+`successfulConnectionSelection` exposes the actual authenticated destination
+method/key and every successful ordered jump choice. Implicit key fallback
+records the final accepted choices; failed chain reconstructions contribute no
+entries. This contains only public route and credential identifiers. A new tab
+can retain the exact account path without choosing the first configured key
+again, while the factory still revalidates the complete selection and performs
+fresh host verification and authentication.
+
+`TerminalKeyboardNavigationOwner` accepts explicitly listed inactive selections
+for connecting and ended tabs. Switching to one uses the same composition and
+held-key handoff barrier as a live source, but publishes no keyboard authority.
+An authenticated replacement needs a fresh handoff. Residency counts each slot
+separately and may release only an unopened, automatically prepared primary
+connection; an explicitly created tab is never evicted to warm another machine.
 
 The returned `WorkspaceSSHConnection` is a facade over the existing native owner;
 it exposes neither the session nor an alternative authentication/transport path.

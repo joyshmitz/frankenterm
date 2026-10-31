@@ -15,7 +15,8 @@ func workspaceTestCertificate(serial: UInt64 = 1, principals: [String] = ["opera
                               extensions: [String] = ["permit-port-forwarding", "permit-pty"],
                               subjectSeed: Data = Data(0..<32), authoritySeed: Data = Data(32..<64),
                               criticalOptions: [String: Data] = [:], extensionValues: [String: Data] = [:],
-                              certificateType: UInt32 = 1, reserved: Data = Data()) throws -> Data {
+                              certificateType: UInt32 = 1, reserved: Data = Data(),
+                              keyID: Data = Data("workspace-fixture".utf8)) throws -> Data {
     func field(_ bytes: Data) -> Data {
         var value = Data(); value.appendBE(UInt64(bytes.count), bytes: 4); value.append(bytes); return value
     }
@@ -25,7 +26,7 @@ func workspaceTestCertificate(serial: UInt64 = 1, principals: [String] = ["opera
     result.append(field(Data(repeating: 19, count: 32)))
     result.append(field(subject.publicKey.rawRepresentation))
     result.appendBE(serial, bytes: 8); result.appendBE(UInt64(certificateType), bytes: 4)
-    result.append(field(Data("workspace-fixture".utf8)))
+    result.append(field(keyID))
     result.append(field(principals.reduce(into: Data()) { $0.append(field(Data($1.utf8))) }))
     result.appendBE(validAfter, bytes: 8); result.appendBE(validBefore, bytes: 8)
     result.append(field(criticalOptions.keys.sorted().reduce(into: Data()) {
@@ -382,13 +383,14 @@ final class WorkspaceUserCertificateTests: XCTestCase {
         var workspaces = try XCTUnwrap(legacy["workspaces"] as? [[String: Any]])
         legacy["version"] = 8; workspaces[0].removeValue(forKey: "certificateRenewals"); legacy["workspaces"] = workspaces
         legacy.removeValue(forKey: "hostAlgorithmPolicies")
+        legacy.removeValue(forKey: "hostRevocationSources"); legacy.removeValue(forKey: "hostRevocationSourceScopes")
         let history = try JSONSerialization.data(withJSONObject: XCTUnwrap(legacy["acceptedImports"]), options: [.sortedKeys])
         disk.seed(try JSONSerialization.data(withJSONObject: legacy, options: [.sortedKeys]), slot: .catalog)
         let loaded = try await WorkspaceStore(persistence: disk, vault: vault).load(), migrated = try XCTUnwrap(loaded.first)
         XCTAssertTrue(migrated.certificateRenewals.isEmpty); XCTAssertEqual(migrated.revision, saved.revision)
         XCTAssertEqual(migrated.manifest, saved.manifest); XCTAssertEqual(migrated.bindings, saved.bindings)
         let upgraded = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(disk.bytes(.catalog))) as? [String: Any])
-        XCTAssertEqual(upgraded["version"] as? Int, 10)
+        XCTAssertEqual(upgraded["version"] as? Int, 11)
         XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(upgraded["acceptedImports"]), options: [.sortedKeys]), history)
         let review = try await store.reviewCertificateRenewal(workspaceID: saved.id, expectedRevision: saved.revision,
             credentialID: "key", certificateFile: certificateFile(workspaceTestCertificate(serial: 2)))
@@ -401,7 +403,9 @@ final class WorkspaceUserCertificateTests: XCTestCase {
             case "duplicate": entries.append(entries[0])
             case "witness": entries[0]["sourceWitness"] = Data(repeating: 0, count: 32).base64EncodedString()
             case "signature": entries[0]["certificate"] = Data([1, 2, 3]).base64EncodedString()
-            default: catalog["version"] = 8
+            default:
+                catalog["version"] = 8; catalog.removeValue(forKey: "hostAlgorithmPolicies")
+                catalog.removeValue(forKey: "hostRevocationSources"); catalog.removeValue(forKey: "hostRevocationSourceScopes")
             }
             workspaces[0]["certificateRenewals"] = entries; catalog["workspaces"] = workspaces
             disk.seed(try JSONSerialization.data(withJSONObject: catalog, options: [.sortedKeys]), slot: .catalog)
