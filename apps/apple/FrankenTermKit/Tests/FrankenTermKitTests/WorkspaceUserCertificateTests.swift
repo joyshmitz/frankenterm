@@ -381,13 +381,14 @@ final class WorkspaceUserCertificateTests: XCTestCase {
         var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(disk.bytes(.catalog))) as? [String: Any])
         var workspaces = try XCTUnwrap(legacy["workspaces"] as? [[String: Any]])
         legacy["version"] = 8; workspaces[0].removeValue(forKey: "certificateRenewals"); legacy["workspaces"] = workspaces
+        legacy.removeValue(forKey: "hostAlgorithmPolicies")
         let history = try JSONSerialization.data(withJSONObject: XCTUnwrap(legacy["acceptedImports"]), options: [.sortedKeys])
         disk.seed(try JSONSerialization.data(withJSONObject: legacy, options: [.sortedKeys]), slot: .catalog)
         let loaded = try await WorkspaceStore(persistence: disk, vault: vault).load(), migrated = try XCTUnwrap(loaded.first)
         XCTAssertTrue(migrated.certificateRenewals.isEmpty); XCTAssertEqual(migrated.revision, saved.revision)
         XCTAssertEqual(migrated.manifest, saved.manifest); XCTAssertEqual(migrated.bindings, saved.bindings)
         let upgraded = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(disk.bytes(.catalog))) as? [String: Any])
-        XCTAssertEqual(upgraded["version"] as? Int, 9)
+        XCTAssertEqual(upgraded["version"] as? Int, 10)
         XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(upgraded["acceptedImports"]), options: [.sortedKeys]), history)
         let review = try await store.reviewCertificateRenewal(workspaceID: saved.id, expectedRevision: saved.revision,
             credentialID: "key", certificateFile: certificateFile(workspaceTestCertificate(serial: 2)))

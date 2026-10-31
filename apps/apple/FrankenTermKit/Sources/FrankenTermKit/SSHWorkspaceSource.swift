@@ -1019,10 +1019,21 @@ public struct SSHWorkspaceSource: Sendable {
             routes.append(.object(route))
             var trust: [String: JSONValue] = ["id": .string(trustID), "host": .string(sourceHost), "port": .number(String(port)),
                 "claimed_source": .string("selected_known_hosts"), "pins": .array(pins), "revoked_keys": .array(revoked)]
+            var trustCapabilities: [JSONValue] = []
             if !authorities.isEmpty {
                 trust["certificate_authorities"] = .array(authorities)
-                trust["required_capabilities"] = .array([.string(WorkspaceDocument.hostCertificateCapability)])
+                trustCapabilities.append(.string(WorkspaceDocument.hostCertificateCapability))
             }
+            for (keyword, field) in [("hostkeyalgorithms", "host_key_algorithms"),
+                                     ("casignaturealgorithms", "ca_signature_algorithms")] {
+                if let arguments = resolved.options[keyword],
+                   case let .allowlist(algorithms) = Self.hostAlgorithmSelection(arguments, certificateAuthority: keyword == "casignaturealgorithms") {
+                    trust[field] = .array(algorithms.map(JSONValue.string))
+                    let capability = JSONValue.string(WorkspaceDocument.hostAlgorithmPolicyCapability)
+                    if !trustCapabilities.contains(capability) { trustCapabilities.append(capability) }
+                }
+            }
+            if !trustCapabilities.isEmpty { trust["required_capabilities"] = .array(trustCapabilities) }
             if let sourceKeyAlias { trust["host_key_alias"] = .string(sourceKeyAlias) }
             if emittedTrusts.insert(trustID).inserted { trusts.append(.object(trust)) }
             if item.key.context == .destination {
@@ -1219,6 +1230,14 @@ public struct SSHWorkspaceSource: Sendable {
                 if arguments != ["no"] { problems.append(Problem(key, "This enabled SSH behavior is not represented by the mobile route and must be resolved explicitly.")) }
             case "stricthostkeychecking":
                 if arguments.count != 1 || !["yes", "ask"].contains(value) { problems.append(Problem(key, "Automatic or disabled host verification is not a portable trust policy. Review the route's host identity explicitly.")) }
+            case "hostkeyalgorithms", "casignaturealgorithms":
+                switch Self.hostAlgorithmSelection(arguments, certificateAuthority: key == "casignaturealgorithms") {
+                case .allowlist: break
+                case .preferenceOnly:
+                    problems.append(Problem(key, "The source's prepended algorithm preference is inactive on the phone. The phone keeps its qualified modern algorithms and does not enable additional or weaker algorithms from this preference.", required: false))
+                case .unresolved:
+                    problems.append(Problem(key, "This algorithm expression is not a qualified literal allowlist. Default-dependent additions/removals, patterns, unknown names and malformed lists remain unresolved; no source defaults were guessed."))
+                }
             case "sessiontype":
                 if arguments != ["default"] { problems.append(Problem(key, "This non-shell session type is not implemented by the mobile route.")) }
             case "loglevel", "hashknownhosts", "addkeystoagent", "usekeychain", "visualhostkey":
@@ -1246,6 +1265,45 @@ public struct SSHWorkspaceSource: Sendable {
             problems.append(Problem("identitiesonly", "The identity restriction is invalid or unresolved."))
         }
         return Resolution(options: options, identities: identities, certificates: certificates, problems: problems)
+    }
+
+    private enum HostAlgorithmSelection {
+        case allowlist([String]), preferenceOnly, unresolved
+    }
+
+    /// Literal OpenSSH signature names, not public-key blob names. The finite
+    /// source vocabulary includes known unsupported families so a restrictive
+    /// source remains restrictive on import; it never makes those families
+    /// usable by the mobile backend. An unknown name invalidates the whole
+    /// source list, as OpenSSH does, rather than silently admitting its suffix.
+    ///
+    /// OpenSSH kex_assemble_names expands +, - and ^ using runtime defaults.
+    /// This passive snapshot cannot reconstruct those defaults. Add/remove
+    /// expressions remain blocked. A qualified ^ list stays explicitly inert
+    /// (as in the desktop exporter); it creates no guessed effective allowlist
+    /// and cannot add a weaker algorithm to the phone's baseline.
+    private static func hostAlgorithmSelection(_ arguments: [String], certificateAuthority: Bool) -> HostAlgorithmSelection {
+        guard arguments.count == 1, let expression = arguments.first, !expression.isEmpty,
+              expression.utf8.count <= 64 * 129 else { return .unresolved }
+        let preference = expression.first == "^"
+        let text = preference ? String(expression.dropFirst()) : expression
+        let names = text.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+        guard (1...64).contains(names.count) else { return .unresolved }
+        let raw: Set<String> = ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
+            "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com",
+            "webauthn-sk-ecdsa-sha2-nistp256@openssh.com", "rsa-sha2-512", "rsa-sha2-256",
+            "ssh-rsa", "ssh-dss", "ssh-mldsa44-ed25519"]
+        let certificates: Set<String> = ["ssh-ed25519-cert-v01@openssh.com", "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+            "ecdsa-sha2-nistp384-cert-v01@openssh.com", "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+            "sk-ssh-ed25519-cert-v01@openssh.com", "sk-ecdsa-sha2-nistp256-cert-v01@openssh.com",
+            "webauthn-sk-ecdsa-sha2-nistp256-cert-v01@openssh.com", "rsa-sha2-512-cert-v01@openssh.com",
+            "rsa-sha2-256-cert-v01@openssh.com", "ssh-rsa-cert-v01@openssh.com", "ssh-dss-cert-v01@openssh.com",
+            "ssh-mldsa44-ed25519-cert"]
+        let allowed = certificateAuthority ? raw : raw.union(certificates)
+        guard names.allSatisfy({ allowed.contains($0) }) else { return .unresolved }
+        if preference { return .preferenceOnly }
+        var seen = Set<String>()
+        return .allowlist(names.filter { seen.insert($0).inserted })
     }
 
     private static func authentication(_ options: [String: [String]], problems: inout [Problem]) -> [String] {

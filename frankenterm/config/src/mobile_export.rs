@@ -43,6 +43,7 @@ const MAX_CERTIFICATE_BLOB_BYTES: usize = 32 * 1024;
 const MAX_EXPORTED_CERTIFICATE_BYTES: usize = 1024 * 1024;
 const USER_CERTIFICATE_CAPABILITY: &str = "ssh_user_certificate_v1";
 const HOST_CERTIFICATE_CAPABILITY: &str = "ssh_host_certificate_v1";
+const HOST_ALGORITHM_POLICY_CAPABILITY: &str = "ssh_host_algorithm_policy_v1";
 const MAX_JUMP_HOPS: usize = 3;
 const MAX_EXPORTED_ROUTES: usize = 256;
 const MAX_EXPORT_FINDINGS: usize = 1024;
@@ -2191,8 +2192,83 @@ struct Endpoint {
     certificates: Vec<UserCertificate>,
     identity_policy_complete: bool,
     host_key_alias: Option<String>,
+    host_key_algorithms: Option<Vec<String>>,
+    ca_signature_algorithms: Option<Vec<String>>,
     known_hosts: Vec<PathBuf>,
     unresolved_policy: bool,
+}
+
+enum HostAlgorithmSelection {
+    Allowlist(Vec<String>),
+    PreferenceOnly,
+    Unresolved,
+}
+
+/// This finite source vocabulary includes known unsupported OpenSSH families;
+/// keeping their names never enables them in the mobile backend. An unknown
+/// name invalidates the entire source list instead of silently admitting a
+/// supported suffix that OpenSSH itself would not have accepted.
+///
+/// `kex_assemble_names` resolves +, - and ^ using runtime defaults. A passive
+/// source snapshot cannot guess those defaults. Add/remove expressions remain
+/// blocked. A qualified ^ list remains an explicitly inactive preference, with
+/// no guessed effective allowlist and no added mobile algorithms.
+fn host_algorithm_selection(value: &str, certificate_authority: bool) -> HostAlgorithmSelection {
+    if value.is_empty() || value.len() > 64 * 129 {
+        return HostAlgorithmSelection::Unresolved;
+    }
+    let preference = value.starts_with('^');
+    let list = value.strip_prefix('^').unwrap_or(value);
+    let names: Vec<&str> = list.split(',').collect();
+    if names.is_empty() || names.len() > 64 {
+        return HostAlgorithmSelection::Unresolved;
+    }
+    let known = |name: &str| {
+        matches!(
+            name,
+            "ssh-ed25519"
+                | "ecdsa-sha2-nistp256"
+                | "ecdsa-sha2-nistp384"
+                | "ecdsa-sha2-nistp521"
+                | "sk-ssh-ed25519@openssh.com"
+                | "sk-ecdsa-sha2-nistp256@openssh.com"
+                | "webauthn-sk-ecdsa-sha2-nistp256@openssh.com"
+                | "rsa-sha2-512"
+                | "rsa-sha2-256"
+                | "ssh-rsa"
+                | "ssh-dss"
+                | "ssh-mldsa44-ed25519"
+        ) || (!certificate_authority
+            && matches!(
+                name,
+                "ssh-ed25519-cert-v01@openssh.com"
+                    | "ecdsa-sha2-nistp256-cert-v01@openssh.com"
+                    | "ecdsa-sha2-nistp384-cert-v01@openssh.com"
+                    | "ecdsa-sha2-nistp521-cert-v01@openssh.com"
+                    | "sk-ssh-ed25519-cert-v01@openssh.com"
+                    | "sk-ecdsa-sha2-nistp256-cert-v01@openssh.com"
+                    | "webauthn-sk-ecdsa-sha2-nistp256-cert-v01@openssh.com"
+                    | "rsa-sha2-512-cert-v01@openssh.com"
+                    | "rsa-sha2-256-cert-v01@openssh.com"
+                    | "ssh-rsa-cert-v01@openssh.com"
+                    | "ssh-dss-cert-v01@openssh.com"
+                    | "ssh-mldsa44-ed25519-cert"
+            ))
+    };
+    if !names.iter().all(|name| known(name)) {
+        return HostAlgorithmSelection::Unresolved;
+    }
+    if preference {
+        return HostAlgorithmSelection::PreferenceOnly;
+    }
+    let mut seen = BTreeSet::new();
+    HostAlgorithmSelection::Allowlist(
+        names
+            .into_iter()
+            .filter(|name| seen.insert(*name))
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 struct EndpointSources<'a> {
@@ -2328,6 +2404,8 @@ fn resolve_endpoint(
             certificates: Vec::new(),
             identity_policy_complete: true,
             host_key_alias: None,
+            host_key_algorithms: None,
+            ca_signature_algorithms: None,
             known_hosts: sources.default_known_hosts.clone(),
             unresolved_policy: false,
         }),
@@ -2467,14 +2545,41 @@ fn resolve_endpoint(
                     unresolved_policy = true;
                 }
             }
+            let mut host_key_algorithms = None;
+            let mut ca_signature_algorithms = None;
+            for (keyword, target) in [
+                ("hostkeyalgorithms", &mut host_key_algorithms),
+                ("casignaturealgorithms", &mut ca_signature_algorithms),
+            ] {
+                if let Some(value) = options.get(keyword) {
+                    match host_algorithm_selection(value, keyword == "casignaturealgorithms") {
+                        HostAlgorithmSelection::Allowlist(algorithms) => {
+                            *target = Some(algorithms);
+                        }
+                        HostAlgorithmSelection::PreferenceOnly => note(
+                            notes,
+                            format!(
+                                "{keyword}: the source's prepended algorithm preference is inactive on the phone; the phone keeps its qualified modern algorithms and does not enable additional or weaker algorithms from this preference"
+                            ),
+                        ),
+                        HostAlgorithmSelection::Unresolved => {
+                            unresolved_policy = true;
+                            note(
+                                notes,
+                                format!(
+                                    "{keyword} is not a qualified literal allowlist; default-dependent additions/removals, patterns, unknown names and malformed lists remain unresolved and this route remains blocked"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
             // Do not silently substitute the phone's defaults for mandatory
             // source trust, revocation, or algorithm constraints. These are
             // preserved by a required-capability marker in the document itself.
             for keyword in [
                 "revokedhostkeys",
                 "knownhostscommand",
-                "hostkeyalgorithms",
-                "casignaturealgorithms",
                 "required_rsasize",
                 "requiredrsasize",
                 "pubkeyacceptedalgorithms",
@@ -2501,9 +2606,7 @@ fn resolve_endpoint(
                         // phone to enforce. macOS sets Ciphers, KexAlgorithms
                         // and MACs this way in /etc/ssh/crypto.conf
                         // (ft-5qgrk). `+`, `-` and a full list still block.
-                        "hostkeyalgorithms"
-                        | "casignaturealgorithms"
-                        | "pubkeyacceptedalgorithms"
+                        "pubkeyacceptedalgorithms"
                         | "pubkeyacceptedkeytypes"
                         | "kexalgorithms"
                         | "ciphers"
@@ -2539,6 +2642,8 @@ fn resolve_endpoint(
                 host_key_alias: options
                     .get("hostkeyalias")
                     .map(|alias| alias.to_ascii_lowercase()),
+                host_key_algorithms,
+                ca_signature_algorithms,
                 known_hosts,
                 unresolved_policy,
             })
@@ -2814,6 +2919,7 @@ impl EndpointRecords {
             "pins": resolved.keys.pins.iter().map(pin).collect::<Vec<_>>(),
             "revoked_keys": [],
         });
+        let mut trust_capabilities = Vec::new();
         if !resolved.keys.certificate_authorities.is_empty() {
             trust["certificate_authorities"] = json!(
                 resolved
@@ -2823,7 +2929,21 @@ impl EndpointRecords {
                     .map(pin)
                     .collect::<Vec<_>>()
             );
-            trust["required_capabilities"] = json!([HOST_CERTIFICATE_CAPABILITY]);
+            trust_capabilities.push(HOST_CERTIFICATE_CAPABILITY);
+        }
+        for (field, algorithms) in [
+            ("host_key_algorithms", &endpoint.host_key_algorithms),
+            ("ca_signature_algorithms", &endpoint.ca_signature_algorithms),
+        ] {
+            if let Some(algorithms) = algorithms {
+                trust[field] = json!(algorithms);
+                if !trust_capabilities.contains(&HOST_ALGORITHM_POLICY_CAPABILITY) {
+                    trust_capabilities.push(HOST_ALGORITHM_POLICY_CAPABILITY);
+                }
+            }
+        }
+        if !trust_capabilities.is_empty() {
+            trust["required_capabilities"] = json!(trust_capabilities);
         }
         if let Some(alias) = &endpoint.host_key_alias {
             trust["host_key_alias"] = json!(alias);
@@ -5569,7 +5689,7 @@ socket = "/run/frankenterm.sock"
     fn a_transit_hosts_required_policy_and_revocations_survive_in_the_workspace() {
         for qualified in [false, true] {
             for policy in [
-                "HostKeyAlgorithms ssh-ed25519",
+                "HostKeyAlgorithms -ssh-ed25519",
                 "RevokedHostKeys /must-not-read",
                 "KnownHostsCommand touch /must-not-execute",
                 "CertificateFile ~/.ssh/second-cert.pub",
@@ -6375,9 +6495,9 @@ ssh = "right"
     fn certificate_authority_requirements_cannot_erase_explicit_policy_blockers() {
         let base = "Host *\n HostName box\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n";
         for policy in [
-            "CASignatureAlgorithms ssh-ed25519",
+            "CASignatureAlgorithms +ssh-rsa",
             "CASignatureAlgorithms -ssh-rsa",
-            "HostKeyAlgorithms ssh-ed25519-cert-v01@openssh.com",
+            "HostKeyAlgorithms -ssh-rsa",
             "RevokedHostKeys /trust/host-revocations.krl",
             "KnownHostsCommand /bin/false",
         ] {
@@ -6835,7 +6955,7 @@ ssh = "right"
         for policy in [
             "RevokedHostKeys /trust/revoked",
             "KnownHostsCommand /bin/false",
-            "HostKeyAlgorithms ssh-ed25519",
+            "HostKeyAlgorithms -ssh-ed25519",
             "CheckHostIP yes",
             "VerifyHostKeyDNS yes",
             "PubkeyAuthentication host-bound",
@@ -7469,6 +7589,198 @@ ssh = "right"
                 "{constraint}"
             );
         }
+    }
+
+    #[test]
+    fn literal_host_algorithm_lists_preserve_order_and_certificate_capabilities() {
+        let config = "Host *\n HostName box\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n HostKeyAlgorithms rsa-sha2-256-cert-v01@openssh.com,ssh-ed25519-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com\n CASignatureAlgorithms rsa-sha2-256,ssh-ed25519,rsa-sha2-256\n";
+        let mut sources = sources(Some(config));
+        supply(
+            &mut sources,
+            "/trust/keys",
+            format!("@cert-authority box {}\n", fake_key(51)),
+        );
+        let exported = trust_export(&sources);
+        for route in ["r.left.ssh", "r.right.ssh"] {
+            let trust = route_trust(&exported, route);
+            assert_eq!(
+                trust["host_key_algorithms"],
+                json!([
+                    "rsa-sha2-256-cert-v01@openssh.com",
+                    "ssh-ed25519-cert-v01@openssh.com"
+                ])
+            );
+            assert_eq!(
+                trust["ca_signature_algorithms"],
+                json!(["rsa-sha2-256", "ssh-ed25519"])
+            );
+            assert_eq!(
+                trust["required_capabilities"],
+                json!([
+                    HOST_CERTIFICATE_CAPABILITY,
+                    HOST_ALGORITHM_POLICY_CAPABILITY
+                ])
+            );
+            assert!(exported_route(&exported, route)["required_capabilities"].is_null());
+        }
+    }
+
+    #[test]
+    fn host_algorithm_allowlists_belong_to_the_exact_destination_and_jump() {
+        let mut sources = sources(Some(
+            "Host left\n HostName app.corp\n ProxyJump gate\n HostKeyAlgorithms rsa-sha2-256,ssh-ed25519\n CASignatureAlgorithms rsa-sha2-512\nHost gate\n HostName gate.corp\n HostKeyAlgorithms ssh-ed25519\n CASignatureAlgorithms ecdsa-sha2-nistp256\nHost right\n HostName plain.corp\nHost *\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/keys",
+            format!(
+                "app.corp {}\ngate.corp {}\nplain.corp {}\n",
+                fake_key(50),
+                fake_key(51),
+                fake_key(52)
+            ),
+        );
+        let exported = trust_export(&sources);
+        let app = route_trust(&exported, "r.left.ssh");
+        let hop_id = exported_route(&exported, "r.left.ssh")["jump_routes"][0]
+            .as_str()
+            .unwrap();
+        let gate = route_trust(&exported, hop_id);
+        assert_eq!(
+            app["host_key_algorithms"],
+            json!(["rsa-sha2-256", "ssh-ed25519"])
+        );
+        assert_eq!(app["ca_signature_algorithms"], json!(["rsa-sha2-512"]));
+        assert_eq!(gate["host_key_algorithms"], json!(["ssh-ed25519"]));
+        assert_eq!(
+            gate["ca_signature_algorithms"],
+            json!(["ecdsa-sha2-nistp256"])
+        );
+        for trust in [&app, &gate] {
+            assert_eq!(
+                trust["required_capabilities"],
+                json!([HOST_ALGORITHM_POLICY_CAPABILITY])
+            );
+        }
+        let ordinary = route_trust(&exported, "r.right.ssh");
+        assert!(ordinary["host_key_algorithms"].is_null());
+        assert!(ordinary["ca_signature_algorithms"].is_null());
+        assert!(ordinary["required_capabilities"].is_null());
+    }
+
+    #[test]
+    fn unsupported_host_algorithm_expressions_cannot_become_partial_allowlists() {
+        let base = "Host *\n HostName box\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n";
+        let oversized = std::iter::repeat_n("ssh-ed25519", 65)
+            .collect::<Vec<_>>()
+            .join(",");
+        for keyword in ["HostKeyAlgorithms", "CASignatureAlgorithms"] {
+            for expression in [
+                "+ssh-rsa",
+                "-ssh-rsa",
+                "-*",
+                "-*rsa*,!rsa-sha2-512",
+                "rsa-sha2-*",
+                "!ssh-rsa",
+                "ssh-ed25519,",
+                ",ssh-ed25519",
+                "ssh-ed25519,,rsa-sha2-256",
+                "unknown,ssh-ed25519",
+                "ssh-ed25519 unknown",
+                "^unknown,ssh-ed25519",
+                "^",
+                "^ssh-ed25519,",
+                "++ssh-ed25519",
+                &oversized,
+            ] {
+                let mut sources = sources(Some(&format!("{base}{keyword} {expression}\n")));
+                supply(
+                    &mut sources,
+                    "/trust/keys",
+                    format!("box {}\n", fake_key(50)),
+                );
+                let exported = trust_export(&sources);
+                let trust = route_trust(&exported, "r.left.ssh");
+                assert!(
+                    trust["host_key_algorithms"].is_null(),
+                    "{keyword} {expression}"
+                );
+                assert!(
+                    trust["ca_signature_algorithms"].is_null(),
+                    "{keyword} {expression}"
+                );
+                assert_eq!(
+                    trust["required_capabilities"],
+                    json!([UNRESOLVED_POLICY]),
+                    "{keyword} {expression}"
+                );
+            }
+        }
+        let mut sources = sources(Some(&format!(
+            "{base}CASignatureAlgorithms ssh-ed25519-cert-v01@openssh.com\n"
+        )));
+        supply(
+            &mut sources,
+            "/trust/keys",
+            format!("box {}\n", fake_key(50)),
+        );
+        assert_eq!(
+            route_trust(&trust_export(&sources), "r.left.ssh")["required_capabilities"],
+            json!([UNRESOLVED_POLICY])
+        );
+    }
+
+    #[test]
+    fn prepended_host_algorithm_preferences_are_visible_without_guessed_defaults() {
+        let mut sources = sources(Some(
+            "Host *\n HostName box\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n HostKeyAlgorithms ^ssh-rsa,ssh-ed25519\n CASignatureAlgorithms ^rsa-sha2-256,ssh-rsa\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/keys",
+            format!("box {}\n", fake_key(50)),
+        );
+        let exported = trust_export(&sources);
+        let trust = route_trust(&exported, "r.left.ssh");
+        assert!(trust["host_key_algorithms"].is_null());
+        assert!(trust["ca_signature_algorithms"].is_null());
+        assert!(trust["required_capabilities"].is_null());
+        for keyword in ["hostkeyalgorithms", "casignaturealgorithms"] {
+            assert!(
+                exported
+                    .portability
+                    .iter()
+                    .any(|finding| finding.disposition == 0
+                        && finding.reason.contains(keyword)
+                        && finding.reason.contains("inactive"))
+            );
+        }
+    }
+
+    #[test]
+    fn known_unsupported_algorithm_names_survive_without_native_default_fallback() {
+        let mut sources = sources(Some(
+            "Host *\n HostName box\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n HostKeyAlgorithms ssh-rsa,ssh-dss,sk-ssh-ed25519@openssh.com\n CASignatureAlgorithms ssh-rsa,ssh-mldsa44-ed25519\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/keys",
+            format!("box {}\n", fake_key(50)),
+        );
+        let exported = trust_export(&sources);
+        let trust = route_trust(&exported, "r.left.ssh");
+        assert_eq!(
+            trust["host_key_algorithms"],
+            json!(["ssh-rsa", "ssh-dss", "sk-ssh-ed25519@openssh.com"])
+        );
+        assert_eq!(
+            trust["ca_signature_algorithms"],
+            json!(["ssh-rsa", "ssh-mldsa44-ed25519"])
+        );
+        assert_eq!(
+            trust["required_capabilities"],
+            json!([HOST_ALGORITHM_POLICY_CAPABILITY])
+        );
     }
 
     #[cfg(unix)]

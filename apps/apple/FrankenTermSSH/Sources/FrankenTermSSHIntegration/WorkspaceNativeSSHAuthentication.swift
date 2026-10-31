@@ -56,6 +56,7 @@ public actor WorkspaceNativeSSHPasswordAuthentication: NativeSSHPasswordAuthenti
             let host = try validatePeer(peer)
             let selected = try await broker.passwordIdentity(workspaceID: workspaceID, expectedRevision: revision,
                 routeID: routeID, presentedHostKey: host.key, hostCertificate: host.certificate,
+                negotiatedHostSignature: peer.hostSignature,
                 transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
             try checkCurrent()
             try validateRoute(selected.authorization)
@@ -201,6 +202,7 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
             try await validatePrerequisite(peer: peer)
             let selected = try await broker.keyboardInteractiveIdentity(workspaceID: workspaceID,
                 expectedRevision: revision, routeID: routeID, presentedHostKey: host.key, hostCertificate: host.certificate,
+                negotiatedHostSignature: peer.hostSignature,
                 transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
             do {
                 try checkCurrent()
@@ -363,15 +365,17 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
     /// requires a patched native backend, actual server partial success, and
     /// explicit keyboard-interactive policy. Each supported method permits three jumps. A mux route
     /// authenticates like a direct one; only the destination channel differs.
-    public static let routeSupport = WorkspaceDocument.RouteSupport(
-        routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey, .password, .keyboardInteractive],
-        credentialAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"],
-        hostKeyAlgorithms: SSHHostCertificate.supportedAuthorityAlgorithms.union(
-            NativeSSHSession.supportsHostCertificates ? SSHHostCertificate.supportedAlgorithms : []),
-        capabilities: NativeSSHSession.supportsHostCertificates
-            ? [WorkspaceDocument.userCertificateCapability, WorkspaceDocument.hostCertificateCapability]
-            : [WorkspaceDocument.userCertificateCapability],
-        maximumJumpHops: 3)
+    public static let routeSupport: WorkspaceDocument.RouteSupport = {
+        var capabilities: Set<String> = [WorkspaceDocument.userCertificateCapability]
+        if NativeSSHSession.supportsHostCertificates { capabilities.insert(WorkspaceDocument.hostCertificateCapability) }
+        if NativeSSHSession.supportsHostAlgorithmPolicy { capabilities.insert(WorkspaceDocument.hostAlgorithmPolicyCapability) }
+        let profile: NativeSSHHostKeyPolicy = NativeSSHSession.supportsHostCertificates ? .certificatesAndRawKeys : .rawKeys
+        return .init(routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey, .password, .keyboardInteractive],
+            credentialAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"],
+            hostKeyAlgorithms: SSHHostCertificate.supportedAuthorityAlgorithms.union(
+                NativeSSHSession.supportsHostCertificates ? SSHHostCertificate.supportedAlgorithms : []),
+            capabilities: capabilities, maximumJumpHops: 3, hostSignatureAlgorithms: Set(profile.algorithms))
+    }()
 
     fileprivate final class Retirement: @unchecked Sendable {
         private let lock = NSLock()
@@ -449,12 +453,14 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
             try checkCurrent()
             let authorization = try await broker.authorization(workspaceID: workspaceID, expectedRevision: revision,
                 routeID: routeID, credentialID: credentialID, presentedHostKey: host.key, hostCertificate: host.certificate,
+                negotiatedHostSignature: peer.hostSignature,
                 transitForRouteID: transitForRouteID,
                 hostKeyProbe: hostKeyProbe)
             try await broker.validateForeground(foreground)
             try checkCurrent(); try validateRoute(authorization)
             let value = try await broker.publicIdentity(workspaceID: workspaceID, expectedRevision: revision,
                 routeID: routeID, credentialID: credentialID, presentedHostKey: host.key, hostCertificate: host.certificate,
+                negotiatedHostSignature: peer.hostSignature,
                 transportID: transportID,
                 transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
             try await broker.validateForeground(foreground)
@@ -500,6 +506,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
             let request = try await broker.prepare(workspaceID: workspaceID, expectedRevision: revision,
                 routeID: routeID, credentialID: credentialID, presentedHostKey: selected.authorization.presentedHostKey,
                 hostCertificate: selected.authorization.hostCertificate,
+                negotiatedHostSignature: selected.authorization.negotiatedHostSignature,
                 transportID: transportID, sessionIdentifier: challenge.sessionIdentifier, publicBlob: selected.authenticationBlob,
                 signatureAlgorithm: challenge.algorithm,
                 transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
@@ -618,6 +625,31 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
         guard !trust.certificateAuthorities.isEmpty else { return .rawKeys }
         guard NativeSSHSession.supportsHostCertificates else { throw SSHAuthenticationError.unavailable }
         return trust.pins.isEmpty ? .certificates : .certificatesAndRawKeys
+    }
+
+    /// Exact negotiated names are selected before KEX. Historical constraints
+    /// come from WorkspaceStore; a route's current JSON alone cannot relax them.
+    static func hostKeyNegotiation(for route: WorkspaceDocument.Route, document: WorkspaceDocument,
+                                   algorithmPolicy: WorkspaceHostAlgorithmPolicy)
+        throws -> (profile: NativeSSHHostKeyPolicy, algorithms: [String]) {
+        guard let trust = document.hostTrust.first(where: { $0.id == route.trustID }) else {
+            throw SSHAuthenticationError.denied
+        }
+        let profile: NativeSSHHostKeyPolicy
+        if trust.certificateAuthorities.contains(where: { algorithmPolicy.permitsCertificateAuthorityFamily($0.algorithm) }) {
+            profile = try hostKeyPolicy(for: route, document: document)
+        } else {
+            // A CA restriction which admits no configured issuer cannot yield
+            // an acceptable certificate. Keep an eligible raw pin usable by
+            // selecting its profile before KEX, without a failed-login retry.
+            guard trust.certificateAuthorities.isEmpty || !trust.pins.isEmpty else {
+                throw SSHAuthenticationError.denied
+            }
+            profile = .rawKeys
+        }
+        let allowed = algorithmPolicy.filterHostKeyAlgorithms(profile.algorithms)
+        guard !allowed.isEmpty else { throw SSHAuthenticationError.denied }
+        return (profile, allowed)
     }
 
     /// Authentication and read-only route diagnosis apply the same negotiated

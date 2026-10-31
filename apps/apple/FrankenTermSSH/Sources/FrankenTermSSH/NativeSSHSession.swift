@@ -329,6 +329,19 @@ public enum NativeSSHKeepalive: Sendable, Equatable { case sent, deferred, unava
 /// peer. It never substitutes for certificate or pin verification after KEX.
 public enum NativeSSHHostKeyPolicy: Sendable, Equatable {
     case rawKeys, certificates, certificatesAndRawKeys
+
+    /// Negotiated signature names differ from the public-key blob family for
+    /// RSA. Keep both SHA-2 variants explicit, including certificate offers.
+    public var algorithms: [String] {
+        let raw = ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
+                   "rsa-sha2-512", "rsa-sha2-256"]
+        let certificates = raw.map { $0 + "-cert-v01@openssh.com" }
+        switch self {
+        case .rawKeys: return raw
+        case .certificates: return certificates
+        case .certificatesAndRawKeys: return certificates + raw
+        }
+    }
 }
 public enum NativeSSHRemoteExit: Sendable, Equatable {
     case exitStatus(UInt32)
@@ -455,6 +468,9 @@ public actor NativeSSHSession {
     /// with the source-verified, versioned backend extension.
     public nonisolated static var supportsHostCertificates: Bool {
         ftssh_supports_host_certificates() != 0
+    }
+    public nonisolated static var supportsHostAlgorithmPolicy: Bool {
+        ftssh_supports_host_algorithm_policy() == 1
     }
     public nonisolated let transportID: UUID
     /// This session creates at most one shell/command or dedicated SFTP channel.
@@ -607,9 +623,21 @@ public actor NativeSSHSession {
 
     /// Must run before any authentication or host-probe handshake. A new
     /// forwarded child has its own fresh policy; its parent is unaffected.
-    public func setHostKeyPolicy(_ policy: NativeSSHHostKeyPolicy) throws {
+    public func setHostKeyPolicy(_ policy: NativeSSHHostKeyPolicy, allowedAlgorithms: [String]? = nil) throws {
         try Task.checkCancellation()
         guard phase == .fresh, operation == nil else { throw NativeSSHError.invalidInput }
+        if let allowedAlgorithms {
+            let qualified = Set(policy.algorithms)
+            guard !allowedAlgorithms.isEmpty, allowedAlgorithms.count <= qualified.count,
+                  Set(allowedAlgorithms).count == allowedAlgorithms.count,
+                  allowedAlgorithms.allSatisfy({ qualified.contains($0) }) else { throw NativeSSHError.invalidInput }
+            let bytes = Data(allowedAlgorithms.joined(separator: ",").utf8)
+            try bytes.withUnsafeBytes {
+                try requireOK(ftssh_set_host_key_algorithms(native.pointer,
+                    $0.bindMemory(to: UInt8.self).baseAddress, $0.count))
+            }
+            return
+        }
         let value: Int32
         switch policy {
         case .rawKeys: value = Int32(FTSSH_HOST_RAW)

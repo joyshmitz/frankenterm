@@ -2183,6 +2183,7 @@ final class MobileWorkspaceModel {
                         reviewedTrustIDs: Set(document.hostTrust.map(\.id)), revokedCredentialFingerprints: locallyRevokedFingerprints,
                         support: support, revokedHostKeysByTrustScope: local.revokedHostKeysByTrustScope,
                         requiredHostCapabilitiesByTrustScope: local.requiredHostCapabilitiesByTrustScope,
+                        hostAlgorithmPoliciesByTrustScope: local.hostAlgorithmPoliciesByTrustScope,
                         transitForRouteID: route.id) else { return false }
                 return transit.isLocallyReady
             }
@@ -3672,6 +3673,76 @@ private struct WorkspaceReplacementReview: View {
     }
 }
 
+/// Display the policy the same verifier will enforce. In particular, a saved
+/// empty intersection must remain visibly denied rather than looking unset.
+struct WorkspaceHostAlgorithmPresentation: Sendable {
+    let trustID: String
+    let imported: WorkspaceHostAlgorithmPolicy
+    let effective: WorkspaceHostAlgorithmPolicy
+    let aliasesRestrict: Bool
+    let historicalRestrictionsApply: Bool
+    var isVisible: Bool { imported.isConstrained || effective.isConstrained }
+    var showsEffective: Bool { imported != effective }
+
+    init(document: WorkspaceDocument, trustID: String,
+         historicalPolicies: [String: WorkspaceHostAlgorithmPolicy] = [:]) throws {
+        guard let trust = document.hostTrust.first(where: { $0.id == trustID }) else { throw FTError.stale }
+        self.trustID = trustID; imported = trust.algorithmPolicy
+        let current = try document.hostAlgorithmPolicy(forTrustID: trustID)
+        effective = try document.hostAlgorithmPolicy(forTrustID: trustID, additional: historicalPolicies)
+        aliasesRestrict = current != imported
+        historicalRestrictionsApply = effective != current
+    }
+
+    static func description(_ algorithms: [String]?) -> String {
+        guard let algorithms else { return "No additional restriction" }
+        return algorithms.isEmpty ? "None allowed" : algorithms.joined(separator: ", ")
+    }
+}
+
+@MainActor
+private struct WorkspaceHostAlgorithmPolicyView: View {
+    let policy: WorkspaceHostAlgorithmPresentation
+
+    var body: some View {
+        if policy.isVisible {
+            VStack(alignment: .leading, spacing: 6) {
+                if policy.showsEffective { Text("Imported restrictions").font(.caption.bold()) }
+                dimensions(policy.imported, prefix: "imported")
+                if policy.showsEffective {
+                    Text("Effective restrictions").font(.caption.bold())
+                    dimensions(policy.effective, prefix: "effective")
+                }
+                if policy.historicalRestrictionsApply {
+                    Text("Earlier approved restrictions on this phone still apply.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if policy.aliasesRestrict {
+                    Text("Other trust records for this host also restrict the algorithms.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Text("CA signature restrictions apply to host certificates. Only algorithms supported by this phone can be used.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder private func dimensions(_ value: WorkspaceHostAlgorithmPolicy, prefix: String) -> some View {
+        dimension("Host signature algorithms", algorithms: value.hostKeyAlgorithms, id: prefix + ".host")
+        dimension("CA signature algorithms", algorithms: value.caSignatureAlgorithms, id: prefix + ".ca")
+    }
+
+    private func dimension(_ title: String, algorithms: [String]?, id: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            Text(verbatim: WorkspaceHostAlgorithmPresentation.description(algorithms))
+                .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                .foregroundStyle(algorithms?.isEmpty == true ? Color.red : Color.primary)
+                .accessibilityIdentifier("host.policy.\(policy.trustID).\(id)")
+        }
+    }
+}
+
 @MainActor
 private struct ImportHostPolicyReview: View {
     let document: WorkspaceDocument
@@ -3695,10 +3766,14 @@ private struct ImportHostPolicyReview: View {
                             Text(verbatim: "Host certificates must be signed by a listed authority, be currently valid, and name \(trust.certificatePrincipal). Revoked certificates, host keys, and authorities remain blocked.")
                                 .font(.caption)
                         }
+                        if let policy = try? WorkspaceHostAlgorithmPresentation(document: document, trustID: trust.id) {
+                            WorkspaceHostAlgorithmPolicyView(policy: policy)
+                        }
                         if !trust.revokedKeys.isEmpty {
                             Text("\(trust.revokedKeys.count) explicitly revoked host identities remain blocked.").font(.caption)
                         }
-                        ForEach(trust.requiredPolicyRequirements.subtracting([WorkspaceDocument.hostCertificateCapability]).sorted(), id: \.self) { requirement in
+                        ForEach(trust.requiredPolicyRequirements.subtracting([WorkspaceDocument.hostCertificateCapability,
+                            WorkspaceDocument.hostAlgorithmPolicyCapability]).sorted(), id: \.self) { requirement in
                             Text(verbatim: "Required policy: \(requirement)").font(.caption)
                         }
                     }
@@ -5347,6 +5422,10 @@ private struct WorkspaceRouteChoiceScreen: View {
                 Text(verbatim: "Trusted host certificate authority · \(authority.algorithm) · \(authority.fingerprint)")
                     .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
             }
+            if let policy = try? WorkspaceHostAlgorithmPresentation(document: context.document, trustID: trust.id,
+                historicalPolicies: context.local.hostAlgorithmPoliciesByTrustScope) {
+                WorkspaceHostAlgorithmPolicyView(policy: policy)
+            }
         }
     }
 
@@ -5823,10 +5902,37 @@ private struct MachineWorkspaceView: View {
                     .lineLimit(2).truncationMode(.middle).textSelection(.enabled)
                     .accessibilityLabel("Runs \(route.remoteCommand ?? WorkspaceNativeSSHConnection.defaultMuxCommand)")
             }
+            let policies = algorithmPolicies(for: route)
+            if !policies.isEmpty {
+                DisclosureGroup("SSH signature restrictions") {
+                    ForEach(Array(policies.enumerated()), id: \.offset) { _, entry in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(verbatim: entry.endpoint).font(.caption.bold())
+                            WorkspaceHostAlgorithmPolicyView(policy: entry.policy)
+                        }.padding(.vertical, 4)
+                    }
+                }.font(.caption)
+            }
             ForEach(Array((model.localPolicies[workspaceID]?.routes.first { $0.routeID == route.id }?.issues ?? []).enumerated()),
                     id: \.offset) { _, issue in
                 Label(issue.message, systemImage: "exclamationmark.circle").font(.caption)
             }
+        }
+    }
+
+    private struct RouteAlgorithmPolicy {
+        let routeID: String, endpoint: String
+        let policy: WorkspaceHostAlgorithmPresentation
+    }
+
+    private func algorithmPolicies(for route: WorkspaceDocument.Route) -> [RouteAlgorithmPolicy] {
+        let peers = ((try? document.orderedJumpRoutes(forRouteID: route.id)) ?? []) + [route]
+        let historical = model.localPolicies[workspaceID]?.hostAlgorithmPoliciesByTrustScope ?? [:]
+        return peers.compactMap { peer in
+            guard let policy = try? WorkspaceHostAlgorithmPresentation(document: document, trustID: peer.trustID,
+                historicalPolicies: historical), policy.isVisible else { return nil }
+            return .init(routeID: peer.id,
+                endpoint: LocalHostKeyCheckReview.endpoint(host: peer.host, port: peer.port, user: peer.user), policy: policy)
         }
     }
 

@@ -203,6 +203,10 @@ public enum WorkspaceRouteProbe {
             let document = try await store.validateHostKeyVerification(probe, support: support)
             guard let route = document.routes.first(where: { $0.id == routeID }) else { throw SSHAuthenticationError.stale }
             network = WorkspaceRouteNetwork(host: route.host)
+            let algorithms = try await store.hostAlgorithmPolicy(workspaceID: workspaceID,
+                expectedRevision: expectedRevision, routeID: routeID, support: support)
+            let negotiation = try WorkspaceNativeSSHAuthentication.hostKeyNegotiation(
+                for: route, document: document, algorithmPolicy: algorithms)
             let hops = try document.orderedJumpRoutes(forRouteID: routeID)
             let destination = try NativeSSHEndpoint(host: route.host, port: route.port)
             try await broker.validateForeground(foreground)
@@ -239,11 +243,16 @@ public enum WorkspaceRouteProbe {
             _ = try await store.validateHostKeyVerification(probe, support: support)
             try await owner.validateForwardingPath()
             try Task.checkCancellation()
-            let result = await exchangeAndClose(owner, route: route, document: document, timeout: timeout)
+            let result = await exchangeAndClose(owner, route: route, document: document,
+                algorithmPolicy: algorithms, negotiation: negotiation, timeout: timeout)
             session = nil
             try Task.checkCancellation()
             try await broker.validateForeground(foreground)
             _ = try await store.validateHostKeyVerification(probe, support: support)
+            guard try await store.hostAlgorithmPolicy(workspaceID: workspaceID,
+                expectedRevision: expectedRevision, routeID: routeID, support: support) == algorithms else {
+                throw SSHAuthenticationError.stale
+            }
             await store.endHostKeyVerification(probe)
             withExtendedLifetime(lease) {}
             return result
@@ -263,33 +272,47 @@ public enum WorkspaceRouteProbe {
             return .init(network: network, hostKey: nil, peer: nil, failure: NativeSSHError.jumpAuthenticationRequired)
         }
         let session: NativeSSHSession, lease: WorkspaceNetworkLease
+        let algorithms: WorkspaceHostAlgorithmPolicy
+        let negotiation: (profile: NativeSSHHostKeyPolicy, algorithms: [String])
         do {
+            algorithms = try document.hostAlgorithmPolicy(forTrustID: route.trustID)
+            negotiation = try WorkspaceNativeSSHAuthentication.hostKeyNegotiation(
+                for: route, document: document, algorithmPolicy: algorithms)
             lease = try networkActivity.beginConnection()
             session = try await NativeSSHConnector.connect(to: NativeSSHEndpoint(host: route.host, port: route.port),
                                                            timeout: timeout, networkLifetime: lease)
         } catch { return .init(network: network, hostKey: nil, peer: nil, failure: error) }
-        let result = await exchangeAndClose(session, route: route, document: document, timeout: timeout)
+        let result = await exchangeAndClose(session, route: route, document: document,
+            algorithmPolicy: algorithms, negotiation: negotiation, timeout: timeout)
         withExtendedLifetime(lease) {}
         return result
     }
 
     private static func exchangeAndClose(_ session: NativeSSHSession, route: WorkspaceDocument.Route,
-                                        document: WorkspaceDocument, timeout: Duration) async -> Result {
+                                        document: WorkspaceDocument,
+                                        algorithmPolicy: WorkspaceHostAlgorithmPolicy,
+                                        negotiation: (profile: NativeSSHHostKeyPolicy, algorithms: [String]),
+                                        timeout: Duration) async -> Result {
         let network = WorkspaceRouteNetwork(host: route.host)
         let witness = PeerWitness(transportID: session.transportID)
         var failure: (any Error)?
         do {
-            try await session.setHostKeyPolicy(WorkspaceNativeSSHAuthentication.hostKeyPolicy(for: route, document: document))
+            try await session.setHostKeyPolicy(negotiation.profile, allowedAlgorithms: negotiation.algorithms)
             _ = try await session.authenticate(using: witness, timeout: timeout)
         } catch { failure = error }
         await session.close()
         guard let peer = await witness.peer else { return .init(network: network, hostKey: nil, peer: nil, failure: failure) }
         do {
             let identity = try WorkspaceNativeSSHAuthentication.hostIdentity(for: peer)
+            guard let trust = document.hostTrust.first(where: { $0.id == route.trustID }) else {
+                throw SSHAuthenticationError.denied
+            }
             let decision = try document.verifyHostKey(forRouteID: route.id,
                 presented: identity.key, hostCertificate: identity.certificate,
+                negotiatedHostSignature: peer.hostSignature,
                 reviewedTrustIDs: Set(document.hostTrust.map(\.id)),
-                support: WorkspaceNativeSSHAuthentication.routeSupport)
+                support: WorkspaceNativeSSHAuthentication.routeSupport,
+                hostAlgorithmPoliciesByTrustScope: [trust.canonicalTrustScope: algorithmPolicy])
             return .init(network: network, hostKey: decision, peer: peer, failure: nil)
         } catch { return .init(network: network, hostKey: nil, peer: peer, failure: error) }
     }

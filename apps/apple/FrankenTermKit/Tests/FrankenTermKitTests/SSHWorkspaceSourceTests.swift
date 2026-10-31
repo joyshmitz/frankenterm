@@ -954,7 +954,8 @@ final class SSHWorkspaceSourceTests: XCTestCase {
         XCTAssertNil(routes[0]["required_capabilities"])
         XCTAssertNotNil(routes[1]["required_capabilities"])
         XCTAssertFalse(result.portability.contains { $0.entityID == result.workspace.routes[0].id && $0.disposition == 1 })
-        XCTAssertTrue(result.portability.contains { $0.entityID == result.workspace.routes[1].id && $0.setting == "ssh_config.hostkeyalgorithms" })
+        XCTAssertTrue(result.portability.contains { $0.entityID == result.workspace.routes[1].id && $0.setting == "ssh_config.kexalgorithms" })
+        XCTAssertEqual(try trust("restricted", in: result.workspace).algorithmPolicy.hostKeyAlgorithms, ["ssh-ed25519"])
     }
 
     func testMalformedHashedTrustAndHostCAsNeverBecomePositivePins() throws {
@@ -1142,8 +1143,8 @@ final class SSHWorkspaceSourceTests: XCTestCase {
 
     func testCertificateAuthoritiesDoNotSatisfyUnsupportedIssuerOrRevocationPolicy() throws {
         let known = try hostLine("build", seed: 8, marker: "@cert-authority") + hostLine("build", seed: 16)
-        for policy in ["CASignatureAlgorithms ssh-ed25519", "CASignatureAlgorithms -ssh-rsa",
-                       "HostKeyAlgorithms ssh-ed25519-cert-v01@openssh.com", "RevokedHostKeys /selected/revocations.krl"] {
+        for policy in ["CASignatureAlgorithms +ssh-rsa", "CASignatureAlgorithms -ssh-rsa",
+                       "HostKeyAlgorithms -ssh-rsa", "RevokedHostKeys /selected/revocations.krl"] {
             let result = try exported("Host build\nIdentityFile none\n\(policy)\n", known: Data(known.utf8))
             XCTAssertEqual(result.workspace.hostTrust[0].certificateAuthorities.count, 1, policy)
             XCTAssertEqual(result.workspace.hostTrust[0].pins.count, 1)
@@ -1151,6 +1152,122 @@ final class SSHWorkspaceSourceTests: XCTestCase {
             XCTAssertFalse(result.workspace.routes[0].requiredCapabilities.isEmpty, policy)
             XCTAssertTrue(result.portability.contains { $0.disposition == 1 }, policy)
         }
+    }
+
+    func testLiteralHostAlgorithmListsPreserveSignatureOrderAndEncryptedRoundTrip() throws {
+        let result = try exported("""
+        Host build
+          IdentityFile none
+          PubkeyAuthentication no
+          PreferredAuthentications password
+          HostKeyAlgorithms rsa-sha2-256-cert-v01@openssh.com,ssh-ed25519-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com
+          CASignatureAlgorithms rsa-sha2-256,ssh-ed25519,rsa-sha2-256
+        """, known: Data(try hostLine("build", marker: "@cert-authority").utf8))
+        let trust = try XCTUnwrap(result.workspace.hostTrust.first)
+        XCTAssertEqual(trust.algorithmPolicy.hostKeyAlgorithms,
+            ["rsa-sha2-256-cert-v01@openssh.com", "ssh-ed25519-cert-v01@openssh.com"])
+        XCTAssertEqual(trust.algorithmPolicy.caSignatureAlgorithms, ["rsa-sha2-256", "ssh-ed25519"])
+        XCTAssertEqual(trust.requiredCapabilities,
+            [WorkspaceDocument.hostCertificateCapability, WorkspaceDocument.hostAlgorithmPolicyCapability])
+        XCTAssertTrue(result.workspace.routes[0].requiredCapabilities.isEmpty)
+        XCTAssertFalse(result.portability.contains { $0.disposition == 1 })
+        let archive = try AirGapArchive(workspace: result.workspace, keys: [], portability: result.portability, using: crypto)
+        let encrypted = try FTAG.seal(archive, using: crypto)
+        let restored = try FTAG.open(encrypted.envelope, code: encrypted.code, using: crypto)
+        XCTAssertEqual(restored.workspace.raw, result.workspace.raw)
+        XCTAssertEqual(restored.workspace.hostTrust[0].algorithmPolicy, trust.algorithmPolicy)
+    }
+
+    func testLiteralHostAlgorithmPoliciesRemainScopedToTheirDestinationAndJump() throws {
+        let result = try exported("""
+        Host build
+          HostName app.example.invalid
+          ProxyJump gate
+          HostKeyAlgorithms rsa-sha2-256,ssh-ed25519
+          CASignatureAlgorithms rsa-sha2-512
+        Host gate
+          HostName gate.example.invalid
+          HostKeyAlgorithms ssh-ed25519
+          CASignatureAlgorithms ecdsa-sha2-nistp256
+        Host ordinary
+          HostName plain.example.invalid
+        Host *
+          IdentityFile none
+          PubkeyAuthentication no
+          PreferredAuthentications password
+        """, aliases: ["build", "ordinary"], known: Data(try (
+            hostLine("app.example.invalid") + hostLine("gate.example.invalid", seed: 8)
+                + hostLine("plain.example.invalid", seed: 16)).utf8))
+        let build = try destination("build", in: result.workspace)
+        let gate = try XCTUnwrap(hops(build, in: result.workspace).first)
+        let appTrust = try trust("build", in: result.workspace)
+        let gateTrust = try XCTUnwrap(result.workspace.hostTrust.first { $0.id == gate.trustID })
+        XCTAssertEqual(appTrust.algorithmPolicy.hostKeyAlgorithms, ["rsa-sha2-256", "ssh-ed25519"])
+        XCTAssertEqual(appTrust.algorithmPolicy.caSignatureAlgorithms, ["rsa-sha2-512"])
+        XCTAssertEqual(gateTrust.algorithmPolicy.hostKeyAlgorithms, ["ssh-ed25519"])
+        XCTAssertEqual(gateTrust.algorithmPolicy.caSignatureAlgorithms, ["ecdsa-sha2-nistp256"])
+        XCTAssertEqual(appTrust.requiredCapabilities, [WorkspaceDocument.hostAlgorithmPolicyCapability])
+        XCTAssertEqual(gateTrust.requiredCapabilities, [WorkspaceDocument.hostAlgorithmPolicyCapability])
+        let ordinary = try trust("ordinary", in: result.workspace)
+        XCTAssertNil(ordinary.algorithmPolicy.hostKeyAlgorithms)
+        XCTAssertNil(ordinary.algorithmPolicy.caSignatureAlgorithms)
+        XCTAssertTrue(ordinary.requiredCapabilities.isEmpty)
+        XCTAssertTrue(result.workspace.routes.allSatisfy { $0.requiredCapabilities.isEmpty })
+    }
+
+    func testDefaultDependentUnknownAndMalformedHostAlgorithmExpressionsStayBlocked() throws {
+        let bad = ["+ssh-rsa", "-ssh-rsa", "-*", "-*rsa*,!rsa-sha2-512", "rsa-sha2-*", "!ssh-rsa",
+            "ssh-ed25519,", ",ssh-ed25519", "ssh-ed25519,,rsa-sha2-256", "unknown,ssh-ed25519",
+            "ssh-ed25519 unknown", "^unknown,ssh-ed25519", "^", "^ssh-ed25519,", "++ssh-ed25519",
+            Array(repeating: "ssh-ed25519", count: 65).joined(separator: ",")]
+        for keyword in ["HostKeyAlgorithms", "CASignatureAlgorithms"] {
+            for expression in bad {
+                let result = try exported("Host build\nIdentityFile none\n\(keyword) \(expression)\n",
+                    known: Data(try hostLine("build").utf8))
+                let trust = try XCTUnwrap(result.workspace.hostTrust.first)
+                XCTAssertNil(trust.algorithmPolicy.hostKeyAlgorithms, expression)
+                XCTAssertNil(trust.algorithmPolicy.caSignatureAlgorithms, expression)
+                XCTAssertEqual(result.workspace.routes[0].requiredCapabilities, ["ssh_config.unresolved_policy"], expression)
+                XCTAssertTrue(result.portability.contains {
+                    $0.setting == "ssh_config." + keyword.lowercased() && $0.disposition == 1
+                }, expression)
+            }
+        }
+        let certificateIssuer = try exported("Host build\nIdentityFile none\nCASignatureAlgorithms ssh-ed25519-cert-v01@openssh.com\n")
+        XCTAssertTrue(certificateIssuer.portability.contains { $0.setting == "ssh_config.casignaturealgorithms" && $0.disposition == 1 })
+    }
+
+    func testPrependedHostAlgorithmPreferencesStayVisibleWithoutInventingDefaultLists() throws {
+        let result = try exported("""
+        Host build
+          IdentityFile none
+          HostKeyAlgorithms ^ssh-rsa,ssh-ed25519
+          CASignatureAlgorithms ^rsa-sha2-256,ssh-rsa
+        """, known: Data(try hostLine("build").utf8))
+        let trust = try XCTUnwrap(result.workspace.hostTrust.first)
+        XCTAssertNil(trust.algorithmPolicy.hostKeyAlgorithms)
+        XCTAssertNil(trust.algorithmPolicy.caSignatureAlgorithms)
+        XCTAssertTrue(trust.requiredCapabilities.isEmpty)
+        XCTAssertTrue(result.workspace.routes[0].requiredCapabilities.isEmpty)
+        for keyword in ["hostkeyalgorithms", "casignaturealgorithms"] {
+            XCTAssertTrue(result.portability.contains {
+                $0.setting == "ssh_config." + keyword && $0.disposition == 0 && $0.reason.contains("inactive")
+            })
+        }
+    }
+
+    func testKnownUnsupportedLiteralAlgorithmsAreRetainedWithoutSilentFallback() throws {
+        let result = try exported("""
+        Host build
+          IdentityFile none
+          HostKeyAlgorithms ssh-rsa,ssh-dss,sk-ssh-ed25519@openssh.com
+          CASignatureAlgorithms ssh-rsa,ssh-mldsa44-ed25519
+        """, known: Data(try hostLine("build").utf8))
+        let trust = try XCTUnwrap(result.workspace.hostTrust.first)
+        XCTAssertEqual(trust.algorithmPolicy.hostKeyAlgorithms, ["ssh-rsa", "ssh-dss", "sk-ssh-ed25519@openssh.com"])
+        XCTAssertEqual(trust.algorithmPolicy.caSignatureAlgorithms, ["ssh-rsa", "ssh-mldsa44-ed25519"])
+        XCTAssertEqual(trust.requiredCapabilities, [WorkspaceDocument.hostAlgorithmPolicyCapability])
+        XCTAssertFalse(trust.algorithmPolicy.hostKeyAlgorithms?.contains("ssh-ed25519") ?? true)
     }
 
     func testHashedCertificateAuthoritiesNeedOriginalLookupAndRetainCanonicalRevocations() throws {

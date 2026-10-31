@@ -482,6 +482,55 @@ int ftssh_set_host_key_policy(ftssh_session *s, int policy) {
     return libssh2_session_method_pref(s->ssh, LIBSSH2_METHOD_HOSTKEY, allowed) ? FTSSH_UNSUPPORTED : FTSSH_OK;
 }
 
+int ftssh_supports_host_algorithm_policy(void) { return 1; }
+
+int ftssh_set_host_key_algorithms(ftssh_session *s, const uint8_t *algorithms, size_t length) {
+    int rc = check(s, HANDSHAKE); if(rc) return rc;
+    if(s->handshake_started) return FTSSH_STATE;
+    if(!algorithms || !length || length >= 1024 || memchr(algorithms, 0, length)) return FTSSH_INVALID;
+    static const char *const qualified[] = {
+        "ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
+        "rsa-sha2-512", "rsa-sha2-256",
+        "ssh-ed25519-cert-v01@openssh.com", "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp384-cert-v01@openssh.com", "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+        "rsa-sha2-512-cert-v01@openssh.com", "rsa-sha2-256-cert-v01@openssh.com"
+    };
+    unsigned int seen = 0;
+    for(size_t start = 0; start < length;) {
+        size_t end = start;
+        while(end < length && algorithms[end] != ',') ++end;
+        if(end == start || (end < length && end + 1 == length)) return FTSSH_INVALID;
+        size_t method;
+        for(method = 0; method < sizeof(qualified) / sizeof(qualified[0]); ++method) {
+            if(strlen(qualified[method]) == end - start &&
+               !memcmp(algorithms + start, qualified[method], end - start)) break;
+        }
+        if(method == sizeof(qualified) / sizeof(qualified[0])) return FTSSH_UNSUPPORTED;
+        unsigned int bit = 1u << method;
+        if(seen & bit) return FTSSH_INVALID;
+        if(method >= 6 && !ftssh_supports_host_certificates()) return FTSSH_UNSUPPORTED;
+        seen |= bit;
+        start = end + 1;
+    }
+    const char **supported = NULL;
+    int supported_count = libssh2_session_supported_algs(s->ssh, LIBSSH2_METHOD_HOSTKEY, &supported);
+    if(supported_count <= 0) return FTSSH_UNSUPPORTED;
+    unsigned int available = 0;
+    for(size_t method = 0; method < sizeof(qualified) / sizeof(qualified[0]); ++method) {
+        if(!(seen & (1u << method))) continue;
+        for(int index = 0; index < supported_count; ++index) {
+            if(!strcmp(qualified[method], supported[index])) { available |= 1u << method; break; }
+        }
+    }
+    libssh2_free(s->ssh, supported);
+    if(available != seen) return FTSSH_UNSUPPORTED;
+    char allowed[1024];
+    memcpy(allowed, algorithms, length); allowed[length] = 0;
+    /* Prevalidation prevents libssh2's silent removal of unsupported names.
+     * It owns its copy, and its failure path preserves the previous list. */
+    return libssh2_session_method_pref(s->ssh, LIBSSH2_METHOD_HOSTKEY, allowed) ? FTSSH_UNSUPPORTED : FTSSH_OK;
+}
+
 int ftssh_create(int fd, size_t maximum, ftssh_session **out) {
     if(!out) return FTSSH_INVALID;
     *out = NULL;

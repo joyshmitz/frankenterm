@@ -54,9 +54,9 @@ raw `pins`. CA identities include their algorithm and SHA-256 fingerprint. Expor
 uses the effective OpenSSH hostname or HostKeyAlias spelling, including trailing
 dots, and preserves the original lookup scope for positive CA matching. Canonical
 endpoint aliases may combine denials but cannot introduce a new positive CA.
-Explicit restrictive `CASignatureAlgorithms`/`HostKeyAlgorithms`, KRL inputs,
-unresolved source policy, and unsupported freshness requirements continue to
-block the affected routes rather than being silently approximated.
+Literal `CASignatureAlgorithms` and `HostKeyAlgorithms` allowlists are preserved
+and enforced as described below. KRL inputs, unresolved source policy, and
+unsupported freshness requirements continue to block the affected routes.
 
 Before any public-key offer, protected signing, password prompt, or interactive
 MFA round, the store and broker bind the exact exchanged certificate to the
@@ -101,6 +101,82 @@ The CA fixtures carry their requirement on `host_trust`, exactly as the real
 exporters do; v1 rejects unsupported global requirements. These are targeted
 portable runs, not a complete package-test or Apple application qualification.
 Apple-only conditional code still requires Apple SDK and device verification.
+
+### Mandatory host-signature algorithms
+
+Both passive SSH exporters preserve ordered literal `HostKeyAlgorithms` and
+`CASignatureAlgorithms` lists as `host_key_algorithms` and
+`ca_signature_algorithms` on the selected `host_trust` record. The typed fields
+require `ssh_host_algorithm_policy_v1`, including when an import omits the
+explicit capability marker. A marker without its policy payload is invalid.
+An omitted dimension is unconstrained; an empty array denies every algorithm in
+that dimension. The bounded parser rejects duplicate manifest names, while the
+source exporters deduplicate equivalent repeated OpenSSH names in first-use
+order. Unsupported literal families never add capabilities to the native build.
+
+Before the first handshake, each destination, jump host, and first-use probe
+intersects its raw/certificate trust profile with the current effective
+host-signature allowlist. `ftssh_set_host_key_algorithms` accepts only an exact
+ordered subset of the twelve qualified modern methods, checks linked-library
+support, and refuses malformed, duplicate, unknown or unavailable names as a
+whole. Neither setter can change policy after the first handshake call,
+including an EAGAIN suspension. The default raw/certificate profiles remain
+available to unconstrained callers.
+
+The exchanged public key and its actual signature algorithm are separate
+evidence. An `ssh-rsa` blob cannot satisfy a `rsa-sha2-512` restriction merely
+because the same key could also sign with SHA-256. RSA certificate exchange
+names similarly retain their `-cert-v01@openssh.com` suffix. Certificate issuer
+policy independently checks the verified certificate's CA signature algorithm,
+not its issuer key's family. All three authentication grants retain the exact
+negotiated method and revalidate it before public-key offers, protected signing,
+password prompts, interactive responses, and later established-session access.
+
+Catalog version ten stores one bounded intersection per workspace and canonical
+trust scope. All current aliases and retained historical restrictions apply;
+reimporting an older or wider list, renaming trust records, or removing the
+fields cannot weaken the saved policy. Readiness and route choices use that
+same effective policy. An untrusted first-use probe can obtain it without
+reading protected-key metadata or requiring an existing positive pin, and
+rechecks its revision and policy before publishing a diagnosis.
+
+The passive exporter has no authoritative snapshot of the source OpenSSH
+version's default algorithm list. Default-dependent `+`/`-` expressions and
+wildcard restrictions therefore remain required unresolved findings. Valid `^`
+preference-only expressions are explicitly retained as inactive preferences;
+the exporter does not invent a source default list. KRL and freshness policy
+remain outside this capability.
+
+Portable qualification rebuilt the actual Kit, native SSH and integration
+modules with Swift 6.4.1 warnings treated as errors, and rebuilt the C adapter
+against the prepared libssh2 with `-Wall -Wextra -Werror`. Final source hashes
+remained unchanged through these successful runs:
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Shared Swift policy and export | 270 passed, zero failures or skips | 100 exporter, 143 affected store/migration/selection, 12 new algorithm-policy and 15 existing CA-policy tests |
+| Native Swift regressions | 32 passed, zero failures or skips | Existing authentication/certificate/revocation behavior and mixed raw/CA profile selection |
+| Complete workspace connections and probes | 12 live scenarios passed | RSA SHA-256/SHA-512 acceptance and cross-denial, password/MFA refusal before prompts, allowed/denied jumps, independent RSA CA signatures, and first-use policy retained after field-removing reimport |
+| C policy boundary | 4 tests passed, including 6 real OpenSSH exchanges | Ordered raw/certificate methods, atomic invalid-list refusal, no digest fallback, and frozen setters after handshake/EAGAIN |
+
+The independent peers verify that denied connections send no account probe,
+public-key offer, password or interactive response. A denied hop never contacts
+its destination. Successful CA-SHA512 authentication uses a real isolated
+OpenSSH server; the same issuer key with a CA-SHA256 signature is refused.
+Managed first-use probes never authenticate or install a pin.
+
+Run the live harness with the built native adapter and XCTest product:
+
+```sh
+python3 Tests/Interop/test_host_algorithms.py /path/to/libftssh.so /path/to/native-tests.xctest
+python3 Tests/Interop/test_host_algorithms.py /path/to/libftssh.so --native-only
+```
+
+These are portable Linux proofs. The iOS policy presentation and its hosted
+test passed frontend parsing; Apple SDK compilation and device execution are
+still required. The Rust exporter passes pinned rustfmt parsing/format checks
+and eight independent OpenSSH source-configuration checks, but its Cargo tests
+have not run because the required RCH runner is unavailable.
 
 Public-key authentication supports Ed25519, ECDSA P-256/P-384/P-521, and RSA
 with 2048–8192-bit moduli and a positive odd exponent of at most 64 bits. The callback
