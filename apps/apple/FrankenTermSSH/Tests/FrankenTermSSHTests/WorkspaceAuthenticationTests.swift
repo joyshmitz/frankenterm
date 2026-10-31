@@ -985,7 +985,8 @@ final class WorkspaceAuthenticationTests: XCTestCase {
         }
         if ["jump-success", "jump-auth-only", "jump-hop-key-fallback"].contains(mode) {
             try await exerciseLiveOwner(f, mode: mode == "jump-success" ? "owner-success" : "owner-connect-only",
-                                        expectedAuthentications: 2, expectedIdentityReads: mode == "jump-hop-key-fallback" ? 3 : 2)
+                expectedAuthentications: 2, expectedIdentityReads: mode == "jump-hop-key-fallback" ? 3 : 2,
+                expectedHops: [.init(routeID: "hop", authentication: .publicKey("hop-key"))])
             return
         }
         if mode == "jump-revoked" { try await f.store.revokeLocally(fingerprint: hopIdentity.fingerprint) }
@@ -1107,7 +1108,8 @@ final class WorkspaceAuthenticationTests: XCTestCase {
         if ["jump-chain-success", "jump-chain-auth-only", "jump-chain-hop-key-fallback"].contains(mode) {
             let authentications = repeats ? 2 * hops.count : hops.count + 1
             try await exerciseLiveOwner(f, mode: mode == "jump-chain-success" ? "owner-success" : "owner-connect-only",
-                expectedAuthentications: authentications, expectedIdentityReads: authentications + (repeats ? 1 : 0))
+                expectedAuthentications: authentications, expectedIdentityReads: authentications + (repeats ? 1 : 0),
+                expectedHops: hops.indices.map { .init(routeID: "hop-\($0)", authentication: .publicKey("hop-key-\($0)")) })
             return
         }
         let activity = WorkspaceNetworkActivity()
@@ -1214,7 +1216,8 @@ final class WorkspaceAuthenticationTests: XCTestCase {
     }
 
     private func exerciseLiveOwner(_ f: SSHWorkspaceTestFixture, mode: String, expectedAuthentications: Int = 1,
-                                   expectedIdentityReads: Int? = nil) async throws {
+                                   expectedIdentityReads: Int? = nil,
+                                   expectedHops: [WorkspaceSSHConnectionSelection.Hop]? = nil) async throws {
         let activity = WorkspaceNetworkActivity()
         let owner = try await WorkspaceNativeSSHConnection.connect(workspaceID: f.installed.id,
             expectedRevision: f.installed.revision, machineID: "machine", routeID: "route", credentialID: "key",
@@ -1226,6 +1229,12 @@ final class WorkspaceAuthenticationTests: XCTestCase {
                 XCTAssertEqual($0 as? WorkspaceNetworkError, .connectionsActive)
             }
             XCTAssertEqual(owner.workspaceRevision, f.installed.revision)
+            if let expectedHops {
+                XCTAssertEqual(owner.successfulConnectionSelection,
+                    .init(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                        machineID: "machine", routeID: "route", authentication: .publicKey("key"), hops: expectedHops),
+                    "Retain only the keys that succeeded on the final chain, without failed candidates or duplicate prefixes")
+            }
             XCTAssertEqual(f.vault.counts.reads, expectedIdentityReads ?? expectedAuthentications)
             XCTAssertEqual(f.vault.counts.signatures, expectedAuthentications)
             if mode == "owner-connect-only" {

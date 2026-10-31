@@ -17,6 +17,10 @@ public actor WorkspaceNativeSSHConnection {
     public nonisolated let scope: TerminalSessionScope
     public nonisolated var terminalSessionID: UUID? { scope.terminalSessionID }
     public nonisolated let purpose: WorkspaceSSHConnectionPurpose
+    /// Public metadata for the actual successful path, including implicit
+    /// per-hop key fallback. Reusing it requires fresh route/policy validation
+    /// and authentication; it carries no credential material or authority.
+    public nonisolated let successfulConnectionSelection: WorkspaceSSHConnectionSelection
     public nonisolated let host: String, port: UInt16, user: String
     /// Present when this connection attaches to the machine's existing mux
     /// panes (like the desktop app) instead of starting a shell.
@@ -39,11 +43,13 @@ public actor WorkspaceNativeSSHConnection {
 
     private init(transport: WorkspaceNativeSSHTransport, peer: NativeSSHPeer, scope: TerminalSessionScope,
                  purpose: WorkspaceSSHConnectionPurpose, host: String, port: UInt16, user: String,
+                 successfulConnectionSelection: WorkspaceSSHConnectionSelection,
                  mux: (command: String, factory: @Sendable () throws -> any TerminalMuxClient)?) {
         self.transport = transport; self.peer = peer; identity = transport.identity
         self.scope = scope; workspaceRevision = scope.workspaceRevision
         self.mux = mux; muxControl = transport.muxControl
         self.purpose = purpose; self.host = host; self.port = port; self.user = user
+        self.successfulConnectionSelection = successfulConnectionSelection
     }
     public var isClosed: Bool { closed }
 
@@ -188,6 +194,7 @@ public actor WorkspaceNativeSSHConnection {
         try Task.checkCancellation()
         let session: NativeSSHSession
         let promptedHop: Bool
+        let successfulHops: [WorkspaceSSHConnectionSelection.Hop]
         if !hops.isEmpty {
             let path = try await connectThroughHops(hops, authenticationChoices: hopChoices,
                 destination: endpoint, destinationRouteID: routeID, workspaceID: workspaceID,
@@ -195,10 +202,11 @@ public actor WorkspaceNativeSSHConnection {
                 passwordPrompter: passwordPrompter, keyboardInteractivePrompter: keyboardInteractivePrompter, lease: lease,
                 connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout,
                 selection: selection, machineID: machineID)
-            session = path.session; promptedHop = path.usedPrompt
+            session = path.session; promptedHop = path.usedPrompt; successfulHops = path.successfulHops
         } else {
             session = try await NativeSSHConnector.connect(to: endpoint, timeout: connectionTimeout, networkLifetime: lease)
             promptedHop = false
+            successfulHops = []
         }
         do {
             try await broker.validateForeground(foreground)
@@ -224,7 +232,9 @@ public actor WorkspaceNativeSSHConnection {
                 muxControl: muxCommand == nil ? nil : TerminalMuxControl(accessMode: muxAccessMode))
             let mux = muxCommand.flatMap { command in muxClientFactory.map { (command: command, factory: $0) } }
             return WorkspaceNativeSSHConnection(transport: transport, peer: authenticated.peer, scope: scope,
-                purpose: purpose, host: route.host, port: route.port, user: route.user, mux: mux)
+                purpose: purpose, host: route.host, port: route.port, user: route.user,
+                successfulConnectionSelection: .init(workspaceID: workspaceID, expectedRevision: expectedRevision,
+                    machineID: machineID, routeID: routeID, authentication: authentication, hops: successfulHops), mux: mux)
         } catch {
             await session.close()
             // Keep exclusion until cancellation/readiness teardown has joined.
@@ -260,7 +270,8 @@ public actor WorkspaceNativeSSHConnection {
         lease: WorkspaceNetworkLease, connectionTimeout: Duration, authenticationTimeout: Duration,
         hostKeyProbe: WorkspaceHostKeyProbe? = nil, selection: WorkspaceSSHConnectionSelection? = nil,
         machineID: String? = nil)
-        async throws -> (session: NativeSSHSession, usedPrompt: Bool) {
+        async throws -> (session: NativeSSHSession, usedPrompt: Bool,
+                         successfulHops: [WorkspaceSSHConnectionSelection.Hop]) {
         var hadCredentialRefusal = false
         var usedPrompt = false
         do {
@@ -286,6 +297,7 @@ public actor WorkspaceNativeSSHConnection {
             while true {
                 var session: NativeSSHSession?
                 var pending: (index: Int, plan: TerminalRouteAttemptPlan, attempt: TerminalRouteAttemptPlan.Attempt)?
+                var successfulHops: [WorkspaceSSHConnectionSelection.Hop] = []
                 do {
                     for index in hops.indices {
                         let hop = hops[index]
@@ -343,6 +355,7 @@ public actor WorkspaceNativeSSHConnection {
                             timeout: authenticationTimeout, hostKeyProbe: hostKeyProbe)
                         usedPrompt = usedPrompt || authenticated.usedForegroundPrompt
                         _ = try plan.connected(attempt)
+                        successfulHops.append(.init(routeID: hop.id, authentication: attempt.selection.authentication))
                         pending = nil
                         try await broker.validateForeground(foreground)
                         try await owner.validateForwardingPath()
@@ -356,7 +369,7 @@ public actor WorkspaceNativeSSHConnection {
                     try await broker.validateForeground(foreground)
                     try await child.validateForwardingPath()
                     try Task.checkCancellation()
-                    return (child, usedPrompt)
+                    return (child, usedPrompt, successfulHops)
                 } catch {
                     await session?.close()
                     try Task.checkCancellation()

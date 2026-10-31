@@ -172,6 +172,8 @@ final class WorkspaceExplicitSelectionTests: XCTestCase {
             let owner = try await connect()
             do {
                 XCTAssertEqual(owner.peer.hostKey, hostKey)
+                XCTAssertEqual(owner.successfulConnectionSelection, reviewed,
+                    "A new terminal must inherit the actual reviewed methods for every successful hop")
                 try await owner.validateForPublication()
                 let coordinator = try TerminalInputCoordinator()
                 let sink = ExplicitSelectionTerminal(identity: owner.identity)

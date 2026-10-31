@@ -556,6 +556,9 @@ public final class WorkspaceSSHConnection: Sendable {
     /// Stable local tab identity across deliberate retries. It is not a
     /// transport/channel identity and never authorizes recovery of a remote PTY.
     public var terminalSessionID: UUID? { scope.terminalSessionID }
+    /// The destination and every ordered jump account's actual successful
+    /// method/key. This metadata grants no networking or sign-in authority.
+    public var successfulConnectionSelection: WorkspaceSSHConnectionSelection { native.successfulConnectionSelection }
     /// The account and endpoint selected by the validated route, including its
     /// final destination when the transport traverses jump hosts.
     public var host: String { native.host }

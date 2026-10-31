@@ -556,6 +556,14 @@ the logical slot is local history metadata, never remote PTY recovery authority.
 Closing one owner leaves its siblings active. Suspension, workspace invalidation
 and credential or host revocation continue to settle every affected owner.
 
+`successfulConnectionSelection` exposes the actual authenticated destination
+method/key and every successful ordered jump choice. Implicit key fallback
+records the final accepted choices; failed chain reconstructions contribute no
+entries. This contains only public route and credential identifiers. A new tab
+can retain the exact account path without choosing the first configured key
+again, while the factory still revalidates the complete selection and performs
+fresh host verification and authentication.
+
 `TerminalKeyboardNavigationOwner` accepts explicitly listed inactive selections
 for connecting and ended tabs. Switching to one uses the same composition and
 held-key handoff barrier as a live source, but publishes no keyboard authority.

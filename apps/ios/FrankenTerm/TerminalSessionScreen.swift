@@ -331,6 +331,7 @@ final class MobileConnections {
     private let store: WorkspaceStore
     private var passwordLifecycle: Task<Void, Never>?
     private var terminalAuthenticationScope: MobileSSHPasswordPrompt.Scope?
+    private var terminalAuthenticationOwner: (id: UUID, workspaceID: UUID, revision: UUID, machineID: String)?
     private var hostKeyScope: (id: UUID, cancel: () -> Void)?
     private enum FileAuthenticationTarget: Equatable {
         case terminal(TerminalRemoteFilesTarget)
@@ -375,7 +376,39 @@ final class MobileConnections {
     func setAuthenticationScope(_ scope: MobileSSHPasswordPrompt.Scope?) {
         guard scope?.hostKeyVerification != true else { return }
         terminalAuthenticationScope = scope
-        if hostKeyScope == nil, fileAuthenticationScope == nil { applyAuthenticationScope(scope) }
+        if hostKeyScope == nil, fileAuthenticationScope == nil { applyTerminalAuthenticationScope() }
+    }
+
+    /// Every terminal attempt carries its exact controller owner, even when
+    /// two tabs use the same account and route. Machine-level navigation still
+    /// supplies the reviewed route scope; it cannot redirect a delayed prompt.
+    func selectTerminalAuthenticationOwner(_ controller: TerminalSessionController?) {
+        terminalAuthenticationOwner = controller.map {
+            ($0.id, $0.target.workspaceID, $0.target.revision, $0.target.machineID)
+        }
+        if hostKeyScope == nil, fileAuthenticationScope == nil { applyTerminalAuthenticationScope() }
+    }
+
+    /// A retained hidden scene may finish cleanup after another scene took
+    /// ownership. It can retire only its own previously installed controller.
+    func releaseTerminalAuthenticationOwner(_ expectedControllerID: UUID) {
+        guard terminalAuthenticationOwner?.id == expectedControllerID else { return }
+        terminalAuthenticationOwner = nil
+        if hostKeyScope == nil, fileAuthenticationScope == nil { applyTerminalAuthenticationScope() }
+    }
+
+    private func applyTerminalAuthenticationScope() {
+        let owner = terminalAuthenticationOwner.flatMap { owner -> UUID? in
+            guard let scope = terminalAuthenticationScope, scope.workspaceID == owner.workspaceID,
+                  scope.revision == owner.revision, scope.machineID == owner.machineID else { return nil }
+            return owner.id
+        }
+        applyAuthenticationScope(terminalAuthenticationScope, ownerID: owner)
+    }
+
+    func authenticationPrompters(for controllerID: UUID) -> WorkspaceSSHAuthenticationPrompters {
+        .init(password: MobileFilesPasswordPrompt(prompt: passwordPrompt, ownerID: controllerID),
+              keyboardInteractive: MobileFilesInteractivePrompt(prompt: keyboardInteractivePrompt, ownerID: controllerID))
     }
 
     private func applyAuthenticationScope(_ scope: MobileSSHPasswordPrompt.Scope?, ownerID: UUID? = nil) {
@@ -398,7 +431,7 @@ final class MobileConnections {
         defer {
             if hostKeyScope?.id == id {
                 hostKeyScope = nil
-                applyAuthenticationScope(terminalAuthenticationScope)
+                applyTerminalAuthenticationScope()
             }
         }
         let value = try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
@@ -493,7 +526,7 @@ final class MobileConnections {
         defer {
             if fileAuthenticationScope?.id == id {
                 fileAuthenticationScope = nil
-                applyAuthenticationScope(terminalAuthenticationScope)
+                applyTerminalAuthenticationScope()
             }
         }
         // A late successful return is retained by the file owner before its
@@ -506,8 +539,8 @@ final class MobileConnections {
 }
 
 /// The owner token travels with this exact connection attempt, including jump
-/// hosts. A queued terminal prompt for the same account has no token and cannot
-/// borrow the Files sheet's visible destination or receive its answers.
+/// hosts. A queued request for another owner cannot borrow the same account's
+/// visible terminal or Files editor, or receive its answers.
 private struct MobileFilesPasswordPrompt: WorkspaceSSHPasswordPrompting {
     let prompt: MobileSSHPasswordPrompt
     let ownerID: UUID
@@ -580,6 +613,16 @@ struct TerminalSessionTarget: Hashable, Sendable {
     func wearing(_ theme: WorkspaceDocument.Theme) -> TerminalSessionTarget {
         .init(workspaceID: workspaceID, revision: revision, machineID: machineID, machineName: machineName,
               routes: routes, theme: theme)
+    }
+
+    func restricted(to route: TerminalSessionRoute) -> TerminalSessionTarget {
+        .init(copying: self, route: route)
+    }
+
+    private init(copying source: TerminalSessionTarget, route: TerminalSessionRoute) {
+        workspaceID = source.workspaceID; revision = source.revision
+        machineID = source.machineID; machineName = source.machineName; routes = [route]
+        basePalette = source.basePalette; background = source.background; font = source.font
     }
 
     /// The order to try the routes in: first hops this device can reach now first
@@ -675,13 +718,17 @@ protocol TerminalSessionFocus: AnyObject {
     /// Whether this machine is the one on screen now; a session connecting in
     /// the background waits to attach its view until it is.
     func shows(machineID: String) -> Bool
+    func shows(controllerID: UUID, machineID: String) -> Bool
     /// A terminal on this machine ended or was lost: only New Session may
     /// start another shell there.
     func requiresNewSession(_ machineID: String) -> Bool
     func attach(machineID: String, source: TerminalSource,
                 encoder: any TerminalKeyboardEncoding) async throws -> TerminalKeyboardSession
+    func attach(controllerID: UUID, machineID: String, source: TerminalSource,
+                encoder: any TerminalKeyboardEncoding) async throws -> TerminalKeyboardSession
     func detach(machineID: String, source: TerminalSource) async throws
     func inputRetired(machineID: String)
+    func inputRetired(controllerID: UUID, machineID: String)
     /// A tap on the terminal asked for the keyboard back.
     func activateKeyboard(showKeyboard: Bool, source: TerminalSource?) async
     /// The user picked a text size on one terminal; every terminal follows.
@@ -690,6 +737,12 @@ protocol TerminalSessionFocus: AnyObject {
 
 extension TerminalSessionFocus {
     func activateKeyboard() async { await activateKeyboard(showKeyboard: true, source: nil) }
+    func shows(controllerID: UUID, machineID: String) -> Bool { shows(machineID: machineID) }
+    func attach(controllerID: UUID, machineID: String, source: TerminalSource,
+                encoder: any TerminalKeyboardEncoding) async throws -> TerminalKeyboardSession {
+        try await attach(machineID: machineID, source: source, encoder: encoder)
+    }
+    func inputRetired(controllerID: UUID, machineID: String) { inputRetired(machineID: machineID) }
 }
 
 /// Owns one direct-SSH connection, PTY, model and native display. Keyboard
@@ -706,6 +759,9 @@ final class TerminalSessionController {
         case failed(String)
     }
     let id = UUID()
+    /// Nil is the legacy machine-owned primary. An explicit UUID is a stable
+    /// local tab slot, independent of this controller and its SSH incarnation.
+    let terminalSessionID: UUID?
     private(set) var phase: Phase = .idle { didSet { if phase != oldValue { onChange?() } } }
     /// The route being tried, then the one connected.
     private(set) var route: TerminalSessionRoute
@@ -730,6 +786,19 @@ final class TerminalSessionController {
             revision: target.revision, machineID: target.machineID, machineName: target.machineName,
             host: connection.host, user: connection.user, port: connection.port,
             route: route, authentication: authenticatedSelection.authentication)
+    }
+    /// Public route/sign-in metadata from this exact live connection. An extra
+    /// terminal never retries another account or silently chooses another hop.
+    var additionalTerminalTarget: TerminalSessionTarget? {
+        guard !stopped, phase == .live, !attachedToMux, !route.mux,
+              let authenticatedSelection, authenticatedSelection.routeID == route.id,
+              let connection else { return nil }
+        var selected = route
+        selected.authenticationChoices = [authenticatedSelection.authentication]
+        selected.selectedConnection = connection.successfulConnectionSelection
+        selected.mux = false
+        selected.sessionCreation = .manual
+        return target.restricted(to: selected)
     }
 
     func makeRemoteFiles(scene: WorkspaceTerminalScene) throws -> TerminalRemoteFilesController {
@@ -833,7 +902,7 @@ final class TerminalSessionController {
     @ObservationIgnored private var presentation: TerminalPresentationVisibility<TerminalSource>?
     @ObservationIgnored private var presentationVisible = true
     private var hasFocusedPresentation: Bool {
-        presentationVisible && focus?.shows(machineID: target.machineID) == true
+        presentationVisible && focus?.shows(controllerID: id, machineID: target.machineID) == true
     }
     @ObservationIgnored private var overviewBlocking = false
     @ObservationIgnored private var resize: TerminalViewportResize<TerminalSource>?
@@ -872,28 +941,36 @@ final class TerminalSessionController {
          reconnectingFrom previous: TerminalSessionController? = nil,
          retryingAfterPasswordHop retried: TerminalSessionController? = nil,
          inputDelivery: TerminalInputDelivery = .init(),
-         muxAccessMode: TerminalMuxAccessMode = .interactive, requiresExistingMux: Bool = false) {
+         muxAccessMode: TerminalMuxAccessMode = .interactive, requiresExistingMux: Bool = false,
+         terminalSessionID: UUID? = nil) {
         self.target = target; self.connections = connections; self.focus = focus
+        self.terminalSessionID = terminalSessionID
         requestedFont = target.font
         self.muxAccessMode = muxAccessMode; self.requiresExistingMux = requiresExistingMux
         self.inputDelivery = inputDelivery
-        unansweredInput = TerminalUnansweredInput(workspace: target.workspaceID.uuidString, machine: target.machineID)
+        unansweredInput = TerminalUnansweredInput(workspace: target.workspaceID.uuidString, machine: target.machineID,
+            terminalSessionID: terminalSessionID)
+        shellOnly = terminalSessionID != nil
         basePalette = target.basePalette
         route = target.routes[0]
-        retriesDrop = previous?.dropped == true
+        retriesDrop = previous?.dropped == true && previous?.target.workspaceID == target.workspaceID
+            && previous?.target.revision == target.revision && previous?.target.machineID == target.machineID
+            && previous?.terminalSessionID == terminalSessionID
         if let previous, previous.target.workspaceID == target.workspaceID,
            previous.target.revision == target.revision, previous.target.machineID == target.machineID,
+           previous.terminalSessionID == terminalSessionID,
            let selected = previous.authenticatedSelection ?? previous.reconnectSelection,
            target.routes.contains(where: { $0.id == selected.routeID && $0.choices.contains(selected.authentication) }) {
             reconnectSelection = selected
             shellOnly = previous.shellOnly
         }
-        if let retried {
+        if let retried, retried.target.workspaceID == target.workspaceID,
+           retried.target.machineID == target.machineID,
+           retried.terminalSessionID == terminalSessionID {
             let pending = retried.passwordHopRetryPlan
             let direct = retried.passwordMuxRetry
             retried.passwordHopRetryPlan = nil; retried.passwordMuxRetry = false
-            if retried.target.workspaceID == target.workspaceID, retried.target.revision == target.revision,
-               retried.target.machineID == target.machineID, retried.target.routes == target.routes,
+            if retried.target.revision == target.revision, retried.target.routes == target.routes,
                pending != nil || direct {
                 passwordHopRetryPlan = pending; passwordMuxRetry = direct
                 shellOnly = retried.shellOnly
@@ -994,7 +1071,7 @@ final class TerminalSessionController {
                   terminal === view, pump?.source == source, displayedMuxDestination == destination,
                   clipboard?.isPresenting == true, clipboard?.blocksKeyboardActivation == false,
                   paneHandoff == nil, requestedMuxPane == nil,
-                  focus?.shows(machineID: target.machineID) == true,
+                  focus?.shows(controllerID: id, machineID: target.machineID) == true,
                   connection?.muxControl?.inputRouting.current.destination == destination,
                   connection?.muxControl?.inputRouting.current.ready != false else {
                 throw CancellationError()
@@ -1077,8 +1154,8 @@ final class TerminalSessionController {
                 // the earlier write may have committed before reporting failure.
                 try await connections.journal.acknowledgeRecovery(reviewed)
                 let current = try await connections.journal.records().filter {
-                    $0.hasRecoveryNotice && $0.scope.workspaceID == target.workspaceID
-                        && $0.scope.machineID == target.machineID
+                    $0.hasRecoveryNotice && $0.belongsTo(workspaceID: target.workspaceID,
+                        machineID: target.machineID, terminalSessionID: terminalSessionID)
                 }
                 // A replacement controller can inherit the visible notice
                 // before it has loaded the exact journal snapshots. Present
@@ -1094,8 +1171,8 @@ final class TerminalSessionController {
                 // a fresh snapshot lets that retry cope with ambiguous writes.
                 if let current = try? await connections.journal.records() {
                     inputRecoveryRecords = current.filter {
-                        $0.hasRecoveryNotice && $0.scope.workspaceID == target.workspaceID
-                            && $0.scope.machineID == target.machineID
+                        $0.hasRecoveryNotice && $0.belongsTo(workspaceID: target.workspaceID,
+                            machineID: target.machineID, terminalSessionID: terminalSessionID)
                     }
                 }
                 inputNoticeFailure = "The earlier session notice could not be dismissed: \(Self.describe(error)) Try Dismiss again."
@@ -1170,7 +1247,7 @@ final class TerminalSessionController {
         guard !stopped, phase == .live, presentationVisible, !overviewBlocking,
               !clipboardIsPresenting, !resolvingLocalInput, localInputReset == nil,
               paneHandoff == nil, viewAttachment == nil, requestedMuxPane == nil,
-              focus?.shows(machineID: target.machineID) == true,
+              focus?.shows(controllerID: id, machineID: target.machineID) == true,
               let keyboard, let view = terminal, view.input.session === keyboard,
               keyboard.id == recovery.keyboardID, keyboard.originalFocus == recovery.focus,
               keyboard.recovery == recovery, pump?.source == recovery.focus.source,
@@ -1214,7 +1291,7 @@ final class TerminalSessionController {
                       self.pump?.source == source, self.displayedMuxDestination == mux,
                       self.connection?.muxControl.map({ $0.inputRouting.current.ready
                           && $0.inputRouting.current.destination == mux }) ?? true,
-                      self.focus?.shows(machineID: self.target.machineID) == true else { return }
+                      self.focus?.shows(controllerID: self.id, machineID: self.target.machineID) == true else { return }
                 // A new keyboard is created only for this still-visible source.
                 // No text, terminal opening, connection or route is retried here.
                 await self.focus?.activateKeyboard()
@@ -1254,7 +1331,7 @@ final class TerminalSessionController {
         guard !localInputNeedsDecision else { throw TerminalKeyboardError.blocked }
         guard !stopped, phase == .live, paneHandoff == nil, viewAttachment == nil,
               presentationVisible, !clipboardIsPresenting,
-              focus?.shows(machineID: target.machineID) == true,
+              focus?.shows(controllerID: id, machineID: target.machineID) == true,
               let control = connection?.muxControl else { throw TerminalInputError.unavailable }
         try control.inputRouting.validateNavigation(plan)
         guard paneID != control.current.shown || requestedMuxPane != nil else { return nil }
@@ -1354,7 +1431,7 @@ final class TerminalSessionController {
         }
         if let requestedMuxPane, requestedMuxPane != selected.paneID { return }
         requestedMuxPane = nil; requestedMuxNavigation = nil
-        guard paneHandoff == nil, focus?.shows(machineID: target.machineID) == true else { return }
+        guard paneHandoff == nil, focus?.shows(controllerID: id, machineID: target.machineID) == true else { return }
         showView()
     }
 
@@ -1422,7 +1499,7 @@ final class TerminalSessionController {
 
     func setPresentationVisible(_ visible: Bool) {
         let visible = visible && !stopped
-        let focused = visible && focus?.shows(machineID: target.machineID) == true
+        let focused = visible && focus?.shows(controllerID: id, machineID: target.machineID) == true
         // A selected mux needs its first output before its view can attach. A
         // companion whose connection was replaced waits for explicit focus;
         // an empty tile must not consume or mark unseen pane output as read.
@@ -1491,12 +1568,12 @@ final class TerminalSessionController {
         // An activation may have started before a read-only sheet opened and
         // completed its handoff afterwards. Seal that newly published responder
         // before it can acquire hardware input behind the inspection surface.
-        guard focus?.shows(machineID: target.machineID) == true,
+        guard focus?.shows(controllerID: id, machineID: target.machineID) == true,
               !overviewBlocking, !keyboardActivationBlocked, paneHandoff == nil, requestedMuxPane == nil,
               connection?.muxControl.map({ $0.inputRouting.current.ready
                   && $0.inputRouting.current.destination == displayedMuxDestination }) ?? true else {
             keyboard.suspend()
-            focus?.inputRetired(machineID: target.machineID)
+            focus?.inputRetired(controllerID: id, machineID: target.machineID)
             return
         }
         do {
@@ -1549,7 +1626,7 @@ final class TerminalSessionController {
         // New Session.
         guard route.mux || connection?.muxControl != nil
                 || focus?.requiresNewSession(target.machineID) == false else { return false }
-        return focus?.shows(machineID: target.machineID) == true
+        return focus?.shows(controllerID: id, machineID: target.machineID) == true
     }
 
     /// Each operation retains all partially constructed resources. Teardown
@@ -1713,7 +1790,7 @@ final class TerminalSessionController {
             // The shell runs and its output arrives from here on. The machine on
             // screen gets its view now; one connecting in the background gets
             // it when the user switches to it (showView).
-            if focus?.shows(machineID: target.machineID) == true {
+            if focus?.shows(controllerID: id, machineID: target.machineID) == true {
                 showView()
                 await viewAttachment?.value
             }
@@ -1730,7 +1807,7 @@ final class TerminalSessionController {
     /// what follows the view. Idempotent; teardown joins it.
     func showView() {
         guard !stopped, !overviewBlocking, phase == .live, presentationVisible, !clipboardIsPresenting,
-              focus?.shows(machineID: target.machineID) == true,
+              focus?.shows(controllerID: id, machineID: target.machineID) == true,
               terminal == nil, viewAttachment == nil,
               paneHandoff == nil, requestedMuxPane == nil,
               connection?.muxControl?.inputRouting.current.ready != false else { return }
@@ -1749,7 +1826,7 @@ final class TerminalSessionController {
         func checkLive() throws {
             try Task.checkCancellation()
             guard !stopped, !overviewBlocking, phase == .live, presentationVisible, !clipboardIsPresenting,
-                  focus?.shows(machineID: target.machineID) == true,
+                  focus?.shows(controllerID: id, machineID: target.machineID) == true,
                   requestedMuxPane == nil,
                   connection?.muxControl?.inputRouting.current.destination == expectedMux,
                   connection?.muxControl?.inputRouting.current.ready != false else { throw CancellationError() }
@@ -1758,7 +1835,7 @@ final class TerminalSessionController {
             try checkLive()
             guard let focus else { throw TerminalKeyboardError.unavailable }
             attached = true
-            let keyboard = try await focus.attach(machineID: target.machineID, source: pump.source, encoder: runtime)
+            let keyboard = try await focus.attach(controllerID: id, machineID: target.machineID, source: pump.source, encoder: runtime)
             self.keyboard = keyboard
             try observeKeyboardRecovery(keyboard)
             try checkLive()
@@ -1838,7 +1915,7 @@ final class TerminalSessionController {
                 guard let self else { return }
                 self.connection?.muxControl?.inputRouting.discardPointers()
                 self.clipboard?.inputRetired()
-                self.focus?.inputRetired(machineID: self.target.machineID)
+                self.focus?.inputRetired(controllerID: self.id, machineID: self.target.machineID)
             }
             view.onKeyboardDismissed = { [weak self, weak view] in
                 guard let self, let view else { return }
@@ -1852,11 +1929,11 @@ final class TerminalSessionController {
             view.requestKeyboard(presentationVisible)
         } catch {
             let superseded = Task.isCancelled || stopped || overviewBlocking || !presentationVisible || clipboardIsPresenting
-                || focus?.shows(machineID: target.machineID) != true
+                || focus?.shows(controllerID: id, machineID: target.machineID) != true
                 || connection?.muxControl?.inputRouting.current.destination != expectedMux
             if superseded || error is CancellationError {
                 terminal?.retire(); terminal = nil; presenter.view = nil
-                keyboard?.suspend(); focus?.inputRetired(machineID: target.machineID)
+                keyboard?.suspend(); focus?.inputRetired(controllerID: id, machineID: target.machineID)
             } else { fail(Self.describe(error)) }
         }
     }
@@ -1865,7 +1942,7 @@ final class TerminalSessionController {
                                destination: TerminalMuxInputRouting.Destination,
                                control: TerminalMuxControl, view: NativeTerminalView) {
         guard !stopped, !overviewBlocking, phase == .live, presentationVisible, !clipboardIsPresenting,
-              focus?.shows(machineID: target.machineID) == true,
+              focus?.shows(controllerID: id, machineID: target.machineID) == true,
               paneHandoff == nil, terminal === view, connection?.muxControl === control,
               displayedMuxDestination == destination else { return }
         do {
@@ -1887,7 +1964,7 @@ final class TerminalSessionController {
         guard !stopped, !overviewBlocking, phase == .live, presentationVisible,
               !clipboardIsPresenting, !localInputNeedsDecision, terminal === view,
               view.isSceneActive, connection?.muxControl == nil,
-              focus?.shows(machineID: target.machineID) == true,
+              focus?.shows(controllerID: id, machineID: target.machineID) == true,
               let projection = view.renderer.pointerProjection else { return }
         do {
             let event = try TerminalPointerEvent(action: action, column: column, row: row, frame: projection.frame)
@@ -1906,7 +1983,7 @@ final class TerminalSessionController {
         guard pointerFocusActivation == nil, !stopped, phase == .live,
               terminal === view, presentationVisible, view.isSceneActive,
               !overviewBlocking, !keyboardActivationBlocked,
-              focus?.shows(machineID: target.machineID) == true else { return }
+              focus?.shows(controllerID: id, machineID: target.machineID) == true else { return }
         let source = view.source, activity = view.sceneActivityGeneration
         pointerFocusActivation = Task { [weak self, weak view] in
             guard let self else { return }
@@ -1927,13 +2004,14 @@ final class TerminalSessionController {
         for attempt in 0..<20 {
             let records = try await connections.journal.records()
             inputRecoveryRecords = records.filter {
-                $0.hasRecoveryNotice && $0.scope.workspaceID == target.workspaceID
-                    && $0.scope.machineID == target.machineID
+                $0.hasRecoveryNotice && $0.belongsTo(workspaceID: target.workspaceID,
+                    machineID: target.machineID, terminalSessionID: terminalSessionID)
             }
             if !inputRecoveryRecords.isEmpty { inputDelivery.setRecoveryNotice(true) }
             for record in records
                 where record.blocksNewSession
-                    && record.scope.workspaceID == target.workspaceID && record.scope.machineID == target.machineID {
+                    && record.belongsTo(workspaceID: target.workspaceID,
+                        machineID: target.machineID, terminalSessionID: terminalSessionID) {
                 try checkStarting()
                 guard record.canResolve else {
                     Self.log.info("earlier session on \(self.target.machineID, privacy: .public) (\(record.state.rawValue, privacy: .public)) is still open")
@@ -2001,7 +2079,9 @@ final class TerminalSessionController {
                     authentication: attempt.selection.authentication, confirmedByUser: true,
                     attachMux: requiresExistingMux || (!shellOnly && (!candidate.requiresAuthenticationPrompt || candidate.mux)),
                     muxAccessMode: muxAccessMode, requiresExistingMux: requiresExistingMux,
-                    selection: candidate.selectedConnection)
+                    selection: candidate.selectedConnection,
+                    authenticationPrompters: connections.authenticationPrompters(for: id),
+                    terminalSessionID: terminalSessionID)
                 // Retain the owner before any following operation can throw.
                 // performStart checks cancellation before opening the channel.
                 connection = connected
@@ -2214,7 +2294,7 @@ final class TerminalSessionController {
     /// generation-less retry that can target a replacement terminal.
     private func propose(_ viewport: NativeTerminalViewport) {
         guard !keepsSharedMuxSize, !stopped, phase == .live, presentationVisible,
-              focus?.shows(machineID: target.machineID) == true,
+              focus?.shows(controllerID: id, machineID: target.machineID) == true,
               let resize, viewport.source == resize.source,
               viewport.revision > lastViewportRevision,
               let rows = UInt32(exactly: viewport.rows),
