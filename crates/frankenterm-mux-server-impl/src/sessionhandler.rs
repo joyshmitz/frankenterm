@@ -17782,12 +17782,12 @@ mod tests {
                 match field {
                     0 => {
                         stale.identity.session_incarnation =
-                            mux::MuxSessionIncarnation::from_bytes([0x41; 16])
+                            mux::MuxSessionIncarnation::from_bytes([0x41; 16]);
                     }
                     1 => stale.identity.durable_pane_id = [0x42; 16],
                     2 => {
                         stale.identity.pane_registration =
-                            ReliablePaneRegistrationIdentityV1::from_bytes([0x43; 16])
+                            ReliablePaneRegistrationIdentityV1::from_bytes([0x43; 16]);
                     }
                     _ => unreachable!(),
                 }
