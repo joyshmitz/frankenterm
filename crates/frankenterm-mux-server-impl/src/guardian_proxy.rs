@@ -103,10 +103,18 @@ const GUARDIAN_INPUT_RETRY_MAX_PAUSE: Duration = Duration::from_millis(16);
 const GUARDIAN_INPUT_RETRY_BUDGET: Duration = Duration::from_secs(2);
 const GUARDIAN_CONNECT_ATTEMPTS: usize = 32;
 const GUARDIAN_CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(5);
+/// Once a birth has sent its Spawn, a lost reply may hide a real child, and
+/// giving up closes that child and fails the spawn. So its reconciliation is
+/// admitted for this long from the Spawn, not within what is left of the
+/// birth's [`GUARDIAN_CONNECT_RETRY_BUDGET`] (ft-b55n7). A guardian publishing
+/// checkpoints closes Hello and Spawn retryably while its worker holds the
+/// protocol, 1-2 s at a time at 54 panes, and a birth there ran out of its 5 s
+/// mid reconnect. The domain's unresolved-birth fence stays up meanwhile.
+const GUARDIAN_BIRTH_RECONCILE_BUDGET: Duration = Duration::from_secs(30);
 const GUARDIAN_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
-fn wait_for_genesis_retry(started: Instant, attempts: usize) -> bool {
-    let remaining = GUARDIAN_CONNECT_RETRY_BUDGET.saturating_sub(started.elapsed());
+fn wait_for_genesis_retry(started: Instant, budget: Duration, attempts: usize) -> bool {
+    let remaining = budget.saturating_sub(started.elapsed());
     if attempts >= GUARDIAN_CONNECT_ATTEMPTS || remaining.is_zero() {
         return false;
     }
@@ -115,7 +123,7 @@ fn wait_for_genesis_retry(started: Instant, attempts: usize) -> bool {
         .min(Duration::from_millis(250))
         .min(remaining);
     thread::sleep(delay);
-    started.elapsed() < GUARDIAN_CONNECT_RETRY_BUDGET
+    started.elapsed() < budget
 }
 
 /// Closes the child a guardian birth left running unclaimed when it failed
@@ -159,7 +167,7 @@ fn reconcile_genesis_birth(
     birth: (Uuid, Uuid, Uuid),
     command: portable_pty::CommandBuilder,
     size: PtySize,
-    started: Instant,
+    spawned: Instant,
     mut reconnect: impl FnMut() -> anyhow::Result<GuardianClient>,
 ) -> anyhow::Result<(GuardianClient, GuardianReply)> {
     let (pane, request, effect) = birth;
@@ -170,12 +178,14 @@ fn reconcile_genesis_birth(
     // transport timeout, so it is not a hard end-to-end execution deadline.
     for attempt in 1..=GUARDIAN_CONNECT_ATTEMPTS {
         anyhow::ensure!(
-            started.elapsed() < GUARDIAN_CONNECT_RETRY_BUDGET,
+            spawned.elapsed() < GUARDIAN_BIRTH_RECONCILE_BUDGET,
             "guardian exact birth reconciliation retry admission exhausted"
         );
         match client.spawn(pane, request, effect, command.clone(), size) {
             Ok(reply) => return Ok((client, reply)),
-            Err(GuardianClientError::Io(_)) if wait_for_genesis_retry(started, attempt) => {
+            Err(GuardianClientError::Io(_))
+                if wait_for_genesis_retry(spawned, GUARDIAN_BIRTH_RECONCILE_BUDGET, attempt) =>
+            {
                 client =
                     reconnect().context("reconnect guardian for exact birth reconciliation")?;
             }
@@ -549,16 +559,22 @@ impl Domain for GuardianDomain {
         let result = promise::spawn::spawn_into_new_thread(move || {
             let _admission = admission;
             let started = Instant::now();
-            let connect = |expected: Option<Uuid>, before_birth: bool| {
+            // `spawned` is when this birth sent its Spawn. A connection after
+            // that reconciles a real child, so cancellation no longer stops it
+            // and it runs on the reconciliation budget.
+            let connect = |expected: Option<Uuid>, spawned: Option<Instant>| {
+                let (since, budget) = spawned.map_or(
+                    (started, GUARDIAN_CONNECT_RETRY_BUDGET),
+                    |spawned| (spawned, GUARDIAN_BIRTH_RECONCILE_BUDGET),
+                );
                 let mut attempts = 0;
                 loop {
                     anyhow::ensure!(
-                        !before_birth || !cancelled.load(Ordering::Acquire),
+                        spawned.is_some() || !cancelled.load(Ordering::Acquire),
                         "guardian spawn cancelled before connection"
                     );
                     anyhow::ensure!(
-                        attempts < GUARDIAN_CONNECT_ATTEMPTS
-                            && started.elapsed() < GUARDIAN_CONNECT_RETRY_BUDGET,
+                        attempts < GUARDIAN_CONNECT_ATTEMPTS && since.elapsed() < budget,
                         "guardian birth connection retry admission exhausted"
                     );
                     attempts += 1;
@@ -573,7 +589,7 @@ impl Domain for GuardianDomain {
                             return Ok(client);
                         }
                         Err(GuardianClientError::Io(_))
-                            if wait_for_genesis_retry(started, attempts) => {}
+                            if wait_for_genesis_retry(since, budget, attempts) => {}
                         Err(error) => return Err(anyhow::Error::new(error)),
                     }
                 }
@@ -584,7 +600,7 @@ impl Domain for GuardianDomain {
                 .as_ref()
                 .map(|census| census.guardian_incarnation());
             let mut client =
-                connect(expected_guardian, true).context("connect guardian for Genesis birth")?;
+                connect(expected_guardian, None).context("connect guardian for Genesis birth")?;
             // Establish all avoidable connection state before creating a child.
             let census = {
                 let mut state = state.lock();
@@ -661,12 +677,16 @@ impl Domain for GuardianDomain {
                 ) {
                     Ok(_) => break,
                     Err(GuardianClientError::Io(_))
-                        if wait_for_genesis_retry(started, stage_attempts) =>
+                        if wait_for_genesis_retry(
+                            started,
+                            GUARDIAN_CONNECT_RETRY_BUDGET,
+                            stage_attempts,
+                        ) =>
                     {
                         // Begin authenticates an existing candidate and returns
                         // its durable prefix. The helper retains the exact upload
                         // identity, skips that prefix, and ends with Query.
-                        client = connect(Some(census.guardian_incarnation()), true)
+                        client = connect(Some(census.guardian_incarnation()), None)
                             .context("reconnect guardian for checkpoint staging")?;
                     }
                     Err(error) => {
@@ -687,6 +707,7 @@ impl Domain for GuardianDomain {
             // From this point a lost response may hide a real child. Keep exact
             // identities until ownership has reached the cancellation-safe guard.
             state.lock().unadopted_birth = Some((pane, request, effect));
+            let spawned = Instant::now();
             let reap_census = Arc::clone(&census);
             let mut claimed = false;
             let born = (|| -> anyhow::Result<UnpublishedPane> {
@@ -695,8 +716,8 @@ impl Domain for GuardianDomain {
                     (pane, request, effect),
                     command,
                     pty_size,
-                    started,
-                    || connect(Some(census.guardian_incarnation()), false),
+                    spawned,
+                    || connect(Some(census.guardian_incarnation()), Some(spawned)),
                 )?;
                 anyhow::ensure!(
                     reply
@@ -14040,7 +14061,12 @@ mod tests {
             frame
         }
 
-        for case in ["busy-then-ready", "exhausted", "rejected"] {
+        for case in [
+            "busy-then-ready",
+            "busy-past-birth-budget",
+            "exhausted",
+            "rejected",
+        ] {
             let directory = tempfile::Builder::new()
                 .prefix("ft-genesis-retry-")
                 .permissions(std::fs::Permissions::from_mode(0o700))
@@ -14122,7 +14148,7 @@ mod tests {
                     // The first exchange represents an already-applied birth;
                     // only its identical receipt can later become available.
                     if case == "exhausted"
-                        || (case == "busy-then-ready"
+                        || (matches!(case, "busy-then-ready" | "busy-past-birth-budget")
                             && first.elapsed() < Duration::from_millis(600))
                     {
                         continue;
@@ -14158,16 +14184,21 @@ mod tests {
                 Ok(client)
             };
             let client = connect().unwrap();
-            let started = if case == "exhausted" {
-                let elapsed = GUARDIAN_CONNECT_RETRY_BUDGET
+            // When the Spawn went out. "busy-past-birth-budget" has already
+            // spent longer reconciling than a whole birth may take before its
+            // Spawn: giving up there closes a real child (ft-b55n7).
+            let elapsed = match case {
+                "exhausted" => GUARDIAN_BIRTH_RECONCILE_BUDGET
                     .checked_sub(Duration::from_millis(200))
-                    .expect("retry budget exceeds the remaining test window");
-                Instant::now()
-                    .checked_sub(elapsed)
-                    .expect("monotonic clock supports the retry test interval")
-            } else {
-                Instant::now()
+                    .expect("retry budget exceeds the remaining test window"),
+                "busy-past-birth-budget" => {
+                    GUARDIAN_CONNECT_RETRY_BUDGET + Duration::from_millis(100)
+                }
+                _ => Duration::ZERO,
             };
+            let started = Instant::now()
+                .checked_sub(elapsed)
+                .expect("monotonic clock supports the retry test interval");
             let result = reconcile_genesis_birth(
                 client,
                 (pane, request, effect),
@@ -14184,7 +14215,7 @@ mod tests {
             stop.store(true, Ordering::Release);
             let exchanges = server.join().unwrap();
             match case {
-                "busy-then-ready" => {
+                "busy-then-ready" | "busy-past-birth-budget" => {
                     let (_, reply) = result
                         .expect("same birth receipt becomes available within existing budget");
                     assert_eq!(
@@ -14198,7 +14229,7 @@ mod tests {
                 }
                 "exhausted" => {
                     assert!(result.is_err());
-                    assert!(started.elapsed() >= GUARDIAN_CONNECT_RETRY_BUDGET);
+                    assert!(started.elapsed() >= GUARDIAN_BIRTH_RECONCILE_BUDGET);
                     assert!(exchanges > 0 && exchanges < GUARDIAN_CONNECT_ATTEMPTS);
                 }
                 "rejected" => {
