@@ -874,6 +874,7 @@ final class WorkspaceHostKeyPinTests: XCTestCase {
         let f = try await fixture()
         var legacy = try catalog(f.disk), workspaces = try XCTUnwrap(legacy["workspaces"] as? [[String: Any]])
         legacy["version"] = 7
+        legacy.removeValue(forKey: "hostAlgorithmPolicies")
         workspaces[0].removeValue(forKey: "hostKeyPins"); legacy["workspaces"] = workspaces
         let history = try JSONSerialization.data(withJSONObject: XCTUnwrap(legacy["acceptedImports"]), options: [.sortedKeys])
         f.disk.seed(try JSONSerialization.data(withJSONObject: legacy, options: [.sortedKeys]), slot: .catalog)
@@ -885,7 +886,7 @@ final class WorkspaceHostKeyPinTests: XCTestCase {
         XCTAssertTrue(saved.hostKeyPins.isEmpty)
         XCTAssertTrue(try saved.document().hostTrust[0].pins.isEmpty)
         let migrated = try catalog(f.disk)
-        XCTAssertEqual(migrated["version"] as? Int, 9)
+        XCTAssertEqual(migrated["version"] as? Int, 10)
         XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(migrated["acceptedImports"]), options: [.sortedKeys]), history)
         let stable = f.disk.bytes(.catalog)
         _ = try await WorkspaceStore(persistence: f.disk, vault: f.vault).load()

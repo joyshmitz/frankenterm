@@ -273,6 +273,7 @@ public struct WorkspaceSSHAuthorization: Equatable, Sendable, CustomDebugStringC
     /// The exact verified certificate of this peer, distinct from the user's
     /// authentication certificate. Store revalidation retains this evidence.
     public let hostCertificate: SSHHostCertificate?
+    public let negotiatedHostSignature: String?
     public var debugDescription: String { "WorkspaceSSHAuthorization([redacted])" }
 }
 
@@ -286,6 +287,7 @@ public struct WorkspaceSSHPasswordAuthorization: Equatable, Sendable, CustomDebu
     public let hostKeyProbe: WorkspaceHostKeyProbe?
     public let presentedHostKey: WorkspaceDocument.HostKey
     public let hostCertificate: SSHHostCertificate?
+    public let negotiatedHostSignature: String?
     public var debugDescription: String { "WorkspaceSSHPasswordAuthorization([redacted])" }
 }
 
@@ -320,6 +322,7 @@ public struct WorkspaceSSHKeyboardInteractiveAuthorization: Equatable, Sendable,
     public let hostKeyProbe: WorkspaceHostKeyProbe?
     public let presentedHostKey: WorkspaceDocument.HostKey
     public let hostCertificate: SSHHostCertificate?
+    public let negotiatedHostSignature: String?
     public var debugDescription: String { "WorkspaceSSHKeyboardInteractiveAuthorization([redacted])" }
 }
 
@@ -628,6 +631,7 @@ public actor SSHAuthenticationBroker {
     public func authorization(workspaceID: UUID, expectedRevision: UUID, routeID: String, credentialID: String,
                               presentedHostKey: WorkspaceDocument.HostKey,
                               hostCertificate: SSHHostCertificate? = nil,
+                              negotiatedHostSignature: String? = nil,
                               transitForRouteID: String? = nil,
                               hostKeyProbe: WorkspaceHostKeyProbe? = nil) async throws -> WorkspaceSSHAuthorization {
         guard foreground else { throw SSHAuthenticationError.unavailable }
@@ -635,7 +639,8 @@ public actor SSHAuthenticationBroker {
         let generation = foregroundGeneration
         let result = try await store.authorizeSSHAuthentication(workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, credentialID: credentialID,
-            presentedHostKey: presentedHostKey, hostCertificate: hostCertificate, support: support, transitForRouteID: transitForRouteID,
+            presentedHostKey: presentedHostKey, hostCertificate: hostCertificate,
+            negotiatedHostSignature: negotiatedHostSignature, support: support, transitForRouteID: transitForRouteID,
             hostKeyProbe: hostKeyProbe)
         guard foreground, foregroundGeneration == generation else { throw SSHAuthenticationError.unavailable }
         try Task.checkCancellation()
@@ -648,6 +653,7 @@ public actor SSHAuthenticationBroker {
     public func passwordIdentity(workspaceID: UUID, expectedRevision: UUID, routeID: String,
                                  presentedHostKey: WorkspaceDocument.HostKey,
                                  hostCertificate: SSHHostCertificate? = nil,
+                                 negotiatedHostSignature: String? = nil,
                                  transitForRouteID: String? = nil,
                                  hostKeyProbe: WorkspaceHostKeyProbe? = nil) async throws -> WorkspaceSSHPasswordIdentity {
         let lease = try foregroundLease()
@@ -655,7 +661,7 @@ public actor SSHAuthenticationBroker {
         let passwordEpoch = passwordGeneration
         let authorization = try await store.authorizeSSHPasswordAuthentication(workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, presentedHostKey: presentedHostKey,
-            hostCertificate: hostCertificate,
+            hostCertificate: hostCertificate, negotiatedHostSignature: negotiatedHostSignature,
             support: support, transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
         try validateForeground(lease)
         guard passwordForeground, passwordGeneration == passwordEpoch else { throw SSHAuthenticationError.stale }
@@ -719,6 +725,7 @@ public actor SSHAuthenticationBroker {
     public func keyboardInteractiveIdentity(workspaceID: UUID, expectedRevision: UUID, routeID: String,
                                             presentedHostKey: WorkspaceDocument.HostKey,
                                             hostCertificate: SSHHostCertificate? = nil,
+                                            negotiatedHostSignature: String? = nil,
                                             transitForRouteID: String? = nil,
                                             hostKeyProbe: WorkspaceHostKeyProbe? = nil) async throws -> WorkspaceSSHKeyboardInteractiveIdentity {
         let lease = try foregroundLease()
@@ -726,7 +733,7 @@ public actor SSHAuthenticationBroker {
         let promptEpoch = passwordGeneration
         let authorization = try await store.authorizeSSHKeyboardInteractiveAuthentication(workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, presentedHostKey: presentedHostKey,
-            hostCertificate: hostCertificate,
+            hostCertificate: hostCertificate, negotiatedHostSignature: negotiatedHostSignature,
             support: support, transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
         try validateForeground(lease)
         guard passwordForeground, passwordGeneration == promptEpoch else { throw SSHAuthenticationError.stale }
@@ -838,6 +845,7 @@ public actor SSHAuthenticationBroker {
     /// selected public identity. This uses the same bounded worker as signing.
     public func publicIdentity(workspaceID: UUID, expectedRevision: UUID, routeID: String, credentialID: String,
                                presentedHostKey: WorkspaceDocument.HostKey, hostCertificate: SSHHostCertificate? = nil,
+                               negotiatedHostSignature: String? = nil,
                                transportID: UUID,
                                transitForRouteID: String? = nil,
                                hostKeyProbe: WorkspaceHostKeyProbe? = nil) async throws -> WorkspaceSSHIdentity {
@@ -847,7 +855,8 @@ public actor SSHAuthenticationBroker {
         try checkCurrent(id)
         let authorization = try await store.authorizeSSHAuthentication(workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, credentialID: credentialID,
-            presentedHostKey: presentedHostKey, hostCertificate: hostCertificate, support: support, transitForRouteID: transitForRouteID,
+            presentedHostKey: presentedHostKey, hostCertificate: hostCertificate,
+            negotiatedHostSignature: negotiatedHostSignature, support: support, transitForRouteID: transitForRouteID,
             hostKeyProbe: hostKeyProbe)
         try checkCurrent(id)
         try validateCertificate(authorization)
@@ -907,6 +916,7 @@ public actor SSHAuthenticationBroker {
 
     public func prepare(workspaceID: UUID, expectedRevision: UUID, routeID: String, credentialID: String,
                         presentedHostKey: WorkspaceDocument.HostKey, hostCertificate: SSHHostCertificate? = nil,
+                        negotiatedHostSignature: String? = nil,
                         transportID: UUID,
                         sessionIdentifier: Data, publicBlob: Data,
                         signatureAlgorithm: String? = nil,
@@ -924,7 +934,8 @@ public actor SSHAuthenticationBroker {
             try checkCurrent(id)
             let authorization = try await store.authorizeSSHAuthentication(workspaceID: workspaceID,
                 expectedRevision: expectedRevision, routeID: routeID, credentialID: credentialID,
-                presentedHostKey: presentedHostKey, hostCertificate: hostCertificate, support: support, transitForRouteID: transitForRouteID,
+                presentedHostKey: presentedHostKey, hostCertificate: hostCertificate,
+                negotiatedHostSignature: negotiatedHostSignature, support: support, transitForRouteID: transitForRouteID,
                 hostKeyProbe: hostKeyProbe)
             try checkCurrent(id)
             let challenge = try SSHUserAuthenticationChallenge(sessionIdentifier: sessionIdentifier,

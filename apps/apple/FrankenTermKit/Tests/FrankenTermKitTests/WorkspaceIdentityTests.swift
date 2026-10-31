@@ -63,6 +63,7 @@ final class WorkspaceIdentityTests: XCTestCase {
         catalog.removeValue(forKey: "scopedHostRevocations"); catalog.removeValue(forKey: "hostRequirements")
         catalog.removeValue(forKey: "machineConnectionPreferences")
         catalog.removeValue(forKey: "groupNavigationPreferences")
+        catalog.removeValue(forKey: "hostAlgorithmPolicies")
         disk.seed(try JSONSerialization.data(withJSONObject: catalog), slot: .catalog)
         let reopened = WorkspaceStore(persistence: disk, vault: vault)
         let available = try await reopened.availableCredentialIDs(workspaceID: first.workspace.id)
