@@ -3059,6 +3059,9 @@ pub struct GuardianPaneLeaseActor {
     pending: Option<PendingMutation>,
     transport: Box<dyn GuardianMutationTransport>,
     _recovery_admission: Option<Arc<frankenterm_pty_guardian::GuardianRecoveryClaimAdmission>>,
+    /// Whether this lease saw its child exit. The guardian then keeps the pane
+    /// and its journal for whatever this mux still reads, until it closes it.
+    exited_unclosed: bool,
     #[cfg(test)]
     fail_next_input_copy: bool,
 }
@@ -3093,6 +3096,7 @@ impl GuardianPaneLeaseActor {
             pending: None,
             transport,
             _recovery_admission: None,
+            exited_unclosed: false,
             #[cfg(test)]
             fail_next_input_copy: false,
         }
@@ -3914,12 +3918,45 @@ impl GuardianPaneLeaseActor {
 
     fn close(&mut self, identity: GuardianPaneLeaseIdentity) -> Result<(), GuardianProxyError> {
         self.ensure_identity(identity)?;
-        self.mutate_generic(GenericMutation::Close)
+        let closed = self.mutate_generic(GenericMutation::Close);
+        let exited_closed = self.close_exited();
+        closed.and(exited_closed)
     }
 
     fn retire(&mut self, identity: GuardianPaneLeaseIdentity) -> Result<(), GuardianProxyError> {
         self.ensure_identity(identity)?;
-        self.mutate_generic(GenericMutation::Retire)
+        let retired = self.mutate_generic(GenericMutation::Retire);
+        let exited_closed = self.close_exited();
+        retired.and(exited_closed)
+    }
+
+    /// Close the guardian pane of a child this lease saw exit, as this mux lets
+    /// go of it, so the guardian can release it. Lease sequence zero is the
+    /// protocol's close of an exited pane, which no lease holds any more.
+    fn close_exited(&mut self) -> Result<(), GuardianProxyError> {
+        if self.disposition != GuardianLeaseDisposition::Closed
+            || !std::mem::take(&mut self.exited_unclosed)
+        {
+            return Ok(());
+        }
+        let pane_id = self.identity.pane_id();
+        let generation = self.identity.generation();
+        match self
+            .transport
+            .close(pane_id, generation, 0, Uuid::new_v4(), Uuid::new_v4())
+        {
+            Ok(GuardianReply::MutationApplied {
+                pane_id: closed,
+                generation: closed_generation,
+                sequence: 0,
+            }) if closed == pane_id && closed_generation == generation => Ok(()),
+            // Closed or quarantined already: nothing is left to release.
+            Err(GuardianMutationTransportError::Client(GuardianClientError::Rejected(
+                GuardianRejectionCode::PaneTerminal,
+            ))) => Ok(()),
+            Ok(_) => Err(GuardianProxyError::UnexpectedMutationReply),
+            Err(error) => Err(self.transport_failure(error)),
+        }
     }
 }
 
@@ -6699,6 +6736,8 @@ pub struct PreparedGuardianWholeMuxTopology {
     owner: Arc<mux::Mux>,
     target_incarnation: Uuid,
     topology: frankenterm_core::session_restore::PreparedWholeMuxTopology,
+    /// The stand-ins for root panes that ended, removed once published.
+    ended: Vec<PaneId>,
 }
 
 /// Load existing recovery authority and restore before exposing a listener.
@@ -6864,15 +6903,26 @@ pub fn restore_authenticated_topology(
     }
     let mut staged = Vec::new();
     staged.try_reserve_exact(plans.len())?;
+    let mut ended = Vec::new();
     for (plan, pane, generation) in plans {
         checkpoint()?;
-        staged.push(plan.claim(pane, generation, Uuid::new_v4(), Uuid::new_v4())?);
+        match plan.claim(pane, generation, Uuid::new_v4(), Uuid::new_v4()) {
+            Ok(proxy) => staged.push(proxy),
+            // A pane can end at any moment after a root names it, and it must
+            // not cost the rest of the host their panes.
+            Err(GuardianProxyError::LeaseNotAttached) => {
+                log::warn!("recovered pane {pane} ended after its recovery root");
+                ended.push(pane);
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
     checkpoint()?;
     let prepared = PreparedGuardianWholeMuxTopology::prepare_with_budget(
         owner,
         recovery,
         staged,
+        ended,
         limits,
         GuardianRestoreBudget { cx, deadline },
     )?;
@@ -6885,6 +6935,7 @@ impl PreparedGuardianWholeMuxTopology {
         owner: &mux::Mux,
         recovery: &'a frankenterm_core::session_restore::ValidatedWholeMuxRecovery,
         staged: &[GuardianProxyStaging],
+        ended: &[Uuid],
     ) -> Result<
         (
             Uuid,
@@ -6910,7 +6961,7 @@ impl PreparedGuardianWholeMuxTopology {
                     "recovery source mux incarnation is invalid",
                 )
             })?;
-        let activation_count_matches = staged.len() == recovery.pane_count();
+        let activation_count_matches = staged.len() + ended.len() == recovery.pane_count();
         if source_incarnation == target_incarnation
             || !activation_count_matches
             || revision != mux::TopologyRevision::INITIAL
@@ -6957,6 +7008,13 @@ impl PreparedGuardianWholeMuxTopology {
                 ));
             }
         }
+        for pane in ended {
+            if !by_uuid.contains_key(pane) || !seen.insert(*pane) {
+                return Err(GuardianProxyError::InvalidConfiguration(
+                    "guardian recovery cohort names an unknown or duplicate ended pane",
+                ));
+            }
+        }
         Ok((target_incarnation, by_uuid))
     }
 
@@ -6971,6 +7029,7 @@ impl PreparedGuardianWholeMuxTopology {
             owner,
             recovery,
             staged,
+            Vec::new(),
             limits,
             GuardianRestoreBudget {
                 cx: &cx,
@@ -6983,12 +7042,13 @@ impl PreparedGuardianWholeMuxTopology {
         owner: Arc<mux::Mux>,
         recovery: frankenterm_core::session_restore::ValidatedWholeMuxRecovery,
         staged: Vec<GuardianProxyStaging>,
+        ended: Vec<Uuid>,
         limits: TerminalCheckpointLimits,
         budget: GuardianRestoreBudget<'_>,
     ) -> Result<Self, GuardianProxyError> {
         budget.checkpoint()?;
         let (target_incarnation, by_uuid) =
-            Self::validate_staged_cohort(&owner, &recovery, &staged)?;
+            Self::validate_staged_cohort(&owner, &recovery, &staged, &ended)?;
         let root = SelectedRecoveryRoot::from_validated(&recovery);
         let domains: HashMap<_, _> = recovery
             .image()
@@ -6999,8 +7059,36 @@ impl PreparedGuardianWholeMuxTopology {
             .collect();
         let mut unpublished = Vec::new();
         unpublished
-            .try_reserve_exact(staged.len())
+            .try_reserve_exact(staged.len() + ended.len())
             .map_err(|_| GuardianProxyError::ReplayCapacity)?;
+        let mut ended_panes = Vec::new();
+        ended_panes
+            .try_reserve_exact(ended.len())
+            .map_err(|_| GuardianProxyError::ReplayCapacity)?;
+        for durable_pane_id in ended {
+            let pane =
+                by_uuid
+                    .get(&durable_pane_id)
+                    .ok_or(GuardianProxyError::InvalidConfiguration(
+                        "recovery pane disappeared during assembly",
+                    ))?;
+            let domain_id = *domains.get(pane.domain_name.as_str()).ok_or(
+                GuardianProxyError::InvalidConfiguration("recovery pane domain is absent"),
+            )?;
+            ended_panes.push(pane.pane_id);
+            unpublished.push(UnpublishedPane::ended_recovered(
+                pane.pane_id,
+                domain_id,
+                *durable_pane_id.as_bytes(),
+                wezterm_term::TerminalSize {
+                    rows: pane.size.rows,
+                    cols: pane.size.cols,
+                    pixel_width: pane.size.pixel_width,
+                    pixel_height: pane.size.pixel_height,
+                    dpi: pane.size.dpi,
+                },
+            ));
+        }
         for proxy in staged {
             budget.checkpoint()?;
             let pane = by_uuid.get(&proxy.identity().pane_id()).ok_or(
@@ -7046,6 +7134,7 @@ impl PreparedGuardianWholeMuxTopology {
             owner,
             target_incarnation,
             topology,
+            ended: ended_panes,
         })
     }
 
@@ -7111,14 +7200,23 @@ impl PreparedGuardianWholeMuxTopology {
             budget.checkpoint()?;
         }
         let cancellation = budget.map(|budget| mux::CancellationObserver::from_cx(budget.cx));
-        self.topology
+        let published = self
+            .topology
             .publish(
                 &self.owner,
                 domains,
                 budget.map(|budget| budget.deadline),
                 cancellation.as_ref(),
             )
-            .map_err(GuardianProxyError::RestoredModel)
+            .map_err(GuardianProxyError::RestoredModel)?;
+        // Before any listener exists, so no client ever sees a stand-in.
+        for pane_id in self.ended {
+            if let Some(pane) = self.owner.get_pane(pane_id) {
+                pane.kill();
+            }
+        }
+        self.owner.prune_dead_windows();
+        Ok(published)
     }
 
     pub fn target_is_current(&self) -> bool {
@@ -7367,6 +7465,7 @@ impl Child for GuardianProxyChild {
                 } else {
                     GuardianLeaseDisposition::Closed
                 };
+                actor.exited_unclosed = true;
                 drop(actor);
                 Ok(Some(exit_status(status)))
             }
@@ -9973,8 +10072,22 @@ mod tests {
             &successor_mux,
             &validated,
             std::slice::from_ref(&staging),
+            &[],
         )
         .expect("actual claimed successor cohort matches the authenticated root");
+        // One pane of a one-pane root cannot be both restored and ended, and
+        // an ended pane must be one the root names.
+        for ended in [provenance.original.pane_id, Uuid::new_v4()] {
+            assert!(
+                PreparedGuardianWholeMuxTopology::validate_staged_cohort(
+                    &successor_mux,
+                    &validated,
+                    std::slice::from_ref(&staging),
+                    &[ended],
+                )
+                .is_err()
+            );
+        }
         let exact_selection = staging
             .selected_checkpoint
             .expect("selected authenticated root");
@@ -9991,6 +10104,7 @@ mod tests {
                     &successor_mux,
                     &validated,
                     std::slice::from_ref(&staging),
+                    &[],
                 )
                 .is_err(),
                 "same-pane wrong-root cohort must refuse before activation"
@@ -16028,7 +16142,43 @@ mod tests {
             .lock()
             .retire(identity())
             .expect("terminal census already proves the live lease absent");
-        assert_eq!(state.lock().calls, vec![FakeCall::Census]);
+        // Letting go of the exited child closes its pane, outside the lease.
+        assert!(matches!(
+            state.lock().calls.as_slice(),
+            [FakeCall::Census, FakeCall::Close { sequence: 0, .. }]
+        ));
+        assert_eq!(actor.lock().next_sequence(), 61);
+        actor
+            .lock()
+            .retire(identity())
+            .expect("a second release has nothing left to do");
+        assert_eq!(state.lock().calls.len(), 2);
+    }
+
+    #[test]
+    fn an_exited_panes_close_is_quiet_when_the_guardian_already_closed_it() {
+        let (staging, state) = fake_staging(
+            [
+                FakeDirective::Observe(ObservedChildState::Exited(23)),
+                FakeDirective::Reject(GuardianRejectionCode::PaneTerminal),
+            ],
+            61,
+        );
+        let actor = staging.shared_actor();
+        let mut child = GuardianProxyChild {
+            actor: Arc::clone(&actor),
+            census: Arc::clone(&staging.census),
+        };
+        assert_eq!(child.try_wait().unwrap().unwrap().exit_code(), 23);
+        actor
+            .lock()
+            .close(identity())
+            .expect("a pane the guardian already closed needs nothing more");
+        assert_eq!(actor.lock().disposition, GuardianLeaseDisposition::Closed);
+        assert!(matches!(
+            state.lock().calls.as_slice(),
+            [FakeCall::Census, FakeCall::Close { sequence: 0, .. }]
+        ));
     }
 
     #[test]
@@ -16195,6 +16345,7 @@ mod tests {
                     FakeCall::Input { .. },
                     FakeCall::Census,
                     FakeCall::QueryInput { .. },
+                    FakeCall::Close { sequence: 0, .. },
                 ]
             ));
         }
@@ -16251,12 +16402,14 @@ mod tests {
             } else {
                 assert!(actor.lock().close(identity()).is_ok());
             }
+            // The refused release still let go of the exited pane, and closed it.
             assert!(matches!(
                 state.lock().calls.as_slice(),
                 [
                     FakeCall::Input { .. },
                     FakeCall::Census,
                     FakeCall::QueryInput { .. },
+                    FakeCall::Close { sequence: 0, .. },
                 ]
             ));
         }

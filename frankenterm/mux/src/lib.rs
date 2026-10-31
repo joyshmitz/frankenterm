@@ -29008,6 +29008,19 @@ mod tests {
         Vec<Arc<dyn Domain>>,
         OwnedRecoveryTestPanes,
     )> {
+        recovered_pty_fixture(None)
+    }
+
+    /// Two windows of one real pane each, or with `ended` naming one of them,
+    /// a stand-in for a pane that ended after its root.
+    #[cfg(unix)]
+    fn recovered_pty_fixture(
+        ended: Option<usize>,
+    ) -> anyhow::Result<(
+        domain::UnpublishedRecoveredTopology,
+        Vec<Arc<dyn Domain>>,
+        OwnedRecoveryTestPanes,
+    )> {
         use portable_pty::{native_pty_system, CommandBuilder, PtySize};
         let occupied: Arc<dyn Domain> = Arc::new(domain::LocalDomain::new("recovered-occupied")?);
         let empty: Arc<dyn Domain> = Arc::new(domain::LocalDomain::new("recovered-empty")?);
@@ -29033,6 +29046,38 @@ mod tests {
             let id = pane::alloc_pane_id()?;
             let durable = uuid::Uuid::new_v4();
             let domain_id = domains[0].domain_id();
+            if ended == Some(ordinal) {
+                let owned = domain::UnpublishedPane::ended_recovered(
+                    id,
+                    domain_id,
+                    *durable.as_bytes(),
+                    test_size(),
+                );
+                let pane = Arc::clone(owned.pane());
+                panes.0.push(Arc::clone(&pane));
+                let tab = Tab::new(&test_size());
+                tab.assign_pane(&pane);
+                let window_id = 500_000 + ordinal;
+                let captured = tab.capture_tab_topology(window_id, "recovered-workspace")?;
+                windows.push(MuxCapturedWindow {
+                    window_id,
+                    durable_window_id: uuid::Uuid::new_v4(),
+                    workspace: "recovered-workspace".into(),
+                    title: format!("recovered window {ordinal}"),
+                    order_revision: WindowOrderRevision::INITIAL,
+                    ordered_tab_ids: vec![captured.tab_id],
+                    active_tab_id: Some(captured.tab_id),
+                    active_tab_index: Some(0),
+                    last_active_tab_id: Some(captured.tab_id),
+                    tab_stacks: Vec::new(),
+                    position: None,
+                    structural_pane_count: 1,
+                });
+                expected.insert(id, (*durable.as_bytes(), domain_id));
+                custody.push(owned);
+                tabs.push(captured);
+                continue;
+            }
             let pair = native_pty_system().openpty(PtySize {
                 rows: 24,
                 cols: 80,
@@ -29219,6 +29264,39 @@ mod tests {
             pane.kill();
             owner.remove_pane(pane.pane_id());
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_stand_in_for_an_ended_pane_leaves_only_the_live_panes() -> anyhow::Result<()> {
+        let _guard = global_test_lock();
+        let executor = BoundedTestExecutor::new();
+        let owner = Arc::new(Mux::new(None));
+        let _installed = ScopedMuxOverride::install(&owner);
+        let (topology, domains, panes) = recovered_pty_fixture(Some(1))?;
+        let live = Arc::clone(&panes[0]);
+        let stand_in = Arc::clone(&panes[1]);
+        let receipt = owner.publish_recovered_topology(topology, domains, None, None)?;
+        assert_eq!(receipt.counts(), (2, 2, 2));
+
+        stand_in.kill();
+        owner.prune_dead_windows();
+
+        assert!(owner.get_pane(stand_in.pane_id()).is_none());
+        assert_eq!(owner.iter_windows().len(), 1);
+        assert_structural_pane_count_authority(&owner);
+        let captured = owner.capture_topology_coherent(Default::default())?;
+        assert_eq!(captured.pane_bindings.len(), 1);
+        assert_eq!(captured.pane_bindings[0].pane_id, live.pane_id());
+        executor.run_until(Duration::from_secs(10), || {
+            live.get_lines(0..24)
+                .1
+                .iter()
+                .any(|line| line.as_str().contains("recovered-native-ready"))
+        });
+        live.kill();
+        owner.remove_pane(live.pane_id());
         Ok(())
     }
 

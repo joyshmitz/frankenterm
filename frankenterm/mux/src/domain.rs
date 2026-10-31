@@ -374,6 +374,39 @@ impl UnpublishedPane {
         })
     }
 
+    /// Hold the place of a pane a recovery root names whose child ended after
+    /// that root, so the guardian has no lease left to hand over. The root's
+    /// layout cannot be assembled without every pane it names. Kill this
+    /// stand-in once the topology is published and the mux's own pane removal
+    /// closes the gap, as it would have if that root's mux had lived. It has
+    /// no child and no PTY, and no client can have seen it.
+    pub fn ended_recovered(
+        pane_id: PaneId,
+        domain_id: DomainId,
+        durable_pane_id: [u8; 16],
+        size: TerminalSize,
+    ) -> Self {
+        let term_config =
+            config::TermConfig::new_for_pane(pane_id, domain_id, durable_pane_id, String::new());
+        let terminal = frankenterm_term::Terminal::new(
+            size,
+            Arc::new(term_config),
+            "WezTerm",
+            config::wezterm_version(),
+            Box::new(std::io::sink()),
+        );
+        Self::new(Arc::new(LocalPane::new(
+            pane_id,
+            terminal,
+            Box::new(EndedPaneChild),
+            Box::new(EndedPanePty),
+            Box::new(std::io::sink()),
+            domain_id,
+            durable_pane_id,
+            String::new(),
+        )))
+    }
+
     /// Observe publication without acquiring pane ownership or mutation authority.
     #[must_use]
     pub fn guardian_publication_receipt(&self) -> Option<GuardianPanePublicationReceipt> {
@@ -1587,6 +1620,73 @@ impl portable_pty::ChildKiller for FailedProcessSpawn {
     }
     fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
         Box::new(FailedProcessSpawn {})
+    }
+}
+
+/// The PTY of an [`UnpublishedPane::ended_recovered`] stand-in: nothing to read
+/// and nowhere to write.
+struct EndedPanePty;
+
+impl portable_pty::MasterPty for EndedPanePty {
+    fn resize(&self, _new_size: PtySize) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn get_size(&self) -> anyhow::Result<PtySize> {
+        Ok(PtySize::default())
+    }
+    fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send + 'static>> {
+        Ok(Box::new(std::io::empty()))
+    }
+    fn take_writer(&self) -> anyhow::Result<Box<dyn std::io::Write + Send + 'static>> {
+        Ok(Box::new(std::io::sink()))
+    }
+
+    #[cfg(unix)]
+    fn process_group_leader(&self) -> Option<i32> {
+        None
+    }
+
+    #[cfg(unix)]
+    fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
+
+    #[cfg(unix)]
+    fn tty_name(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
+/// The child of an [`UnpublishedPane::ended_recovered`] stand-in. It reports a
+/// clean exit, so no exit behavior holds the pane open to show why it ended.
+#[derive(Debug)]
+struct EndedPaneChild;
+
+impl portable_pty::Child for EndedPaneChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        Ok(Some(ExitStatus::with_exit_code(0)))
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        Ok(ExitStatus::with_exit_code(0))
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+
+    #[cfg(windows)]
+    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        None
+    }
+}
+
+impl portable_pty::ChildKiller for EndedPaneChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(EndedPaneChild)
     }
 }
 
