@@ -74,7 +74,8 @@ final class WorkspaceSSHConnectionSelectionTests: XCTestCase, @unchecked Sendabl
         return .init(workspace: installed, connectionPreferences: .init(autoConnectOverrides: [:]),
             navigationPreferences: .init(), credentialIDs: available,
             revokedHostKeysByTrustScope: denied, unsavedHostKeysByTrustScope: [:],
-            requiredHostCapabilitiesByTrustScope: required, hostAlgorithmPoliciesByTrustScope: [:], routes: readiness)
+            requiredHostCapabilitiesByTrustScope: required, hostAlgorithmPoliciesByTrustScope: [:],
+            hostRevocationSourcesByTrustScope: [:], routes: readiness)
     }
 
     private func options(_ state: WorkspaceLocalState, routeID: String = "destination") throws -> WorkspaceSSHRouteOptions {

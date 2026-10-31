@@ -27,11 +27,12 @@ final class SSHWorkspaceSourceTests: XCTestCase {
     }
     private func exported(_ text: String, aliases: [String]? = nil, keys: [String: Data] = [:],
                           certificates: SSHWorkspaceSource.PublicCertificateSnapshot? = nil,
-                          known: Data? = nil) throws -> SSHWorkspaceExport {
+                          known: Data? = nil, revocations: SSHWorkspaceSource.HostRevocationSnapshot? = nil) throws -> SSHWorkspaceExport {
         let input = try source(text)
         var registry = SSHWorkspaceRegistry()
         return try input.export(aliases: aliases ?? input.aliases, workspaceName: "Selected machines", defaultUser: "local-user",
-                                publicKeys: keys, publicCertificateFiles: certificates, knownHosts: known, registry: &registry, using: crypto)
+                                publicKeys: keys, publicCertificateFiles: certificates, knownHosts: known,
+                                hostRevocationFiles: revocations, registry: &registry, using: crypto)
     }
     private func destination(_ alias: String, in document: WorkspaceDocument) throws -> WorkspaceDocument.Route {
         let machine = try XCTUnwrap(document.machines.first { $0.name == alias })
@@ -81,6 +82,190 @@ final class SSHWorkspaceSourceTests: XCTestCase {
 
     private func sourceRevision(_ document: WorkspaceDocument) throws -> JSONValue? {
         try StrictJSON.decode(document.raw).object().required("source").object()["configuration_revision"]
+    }
+
+    private func revocationOracleSource(_ id: String) throws -> Data {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        let fixture = try StrictJSON.decode(Data(contentsOf: root.appendingPathComponent("fixtures/ios-airgap/ssh-host-revocations.json"))).object()
+        let records = try fixture.required("sources").array().map { try $0.object() }
+        let record = try XCTUnwrap(records.first { $0["id"] == .string(id) })
+        return try XCTUnwrap(Data(base64Encoded: record.text("data")))
+    }
+
+    func testRevokedHostKeysInventoryKeepsFirstAssignmentWholeListsAndJumpSources() throws {
+        let input = try source("""
+        IdentityFile none
+        Host target
+          ProxyJump gate
+          RevokedHostKeys "~/.ssh/first list" /trust/second /trust/second
+        Host gate
+          RevokedHostKeys /trust/gateway
+        Host disabled
+          RevokedHostKeys NoNe
+        Host unrelated
+          RevokedHostKeys /trust/unrelated
+        Host *
+          RevokedHostKeys /trust/fallback
+        """)
+        XCTAssertEqual(try input.hostRevocationFileReferences(for: ["target"]), ["~/.ssh/first list", "/trust/second", "/trust/gateway"])
+        XCTAssertEqual(try input.hostRevocationFileReferences(for: ["disabled"]), [])
+        let disabled = try exported("Host disabled\nIdentityFile none\nRevokedHostKeys NoNe\n")
+        XCTAssertTrue(disabled.workspace.routes[0].requiredCapabilities.isEmpty)
+        XCTAssertTrue(disabled.workspace.hostRevocationSources.isEmpty)
+        for expression in ["none /trust/good", "/trust/good %d/revoked", "relative", "~someone/revoked", "/trust/../revoked", "/trust/*.krl"] {
+            let source = try source("Host blocked\nIdentityFile none\nRevokedHostKeys \(expression)\n")
+            XCTAssertEqual(try source.hostRevocationFileReferences(for: ["blocked"]), [], expression)
+            let result = try exportSource(source)
+            XCTAssertEqual(result.workspace.routes[0].requiredCapabilities, ["ssh_config.unresolved_policy"], expression)
+            XCTAssertTrue(result.portability.contains { $0.setting == "ssh_config.revokedhostkeys" && $0.disposition == 1 }, expression)
+        }
+    }
+
+    func testRevocationExportDeduplicatesContentAndPreservesRealKRLWithoutPrivateSources() throws {
+        let list = Data("# never-export-this-source-comment\n".utf8) + (try publicFile(8))
+        let krl = try revocationOracleSource("serial-range")
+        let files = try SSHWorkspaceSource.HostRevocationSnapshot(files: [
+            "/private/denials-a": .present(list), "/private/denials-copy": .present(list), "/private/fleet.krl": .present(krl)])
+        let result = try exported("""
+        Host target
+          IdentityFile none
+          RevokedHostKeys /private/denials-a /private/denials-copy /private/fleet.krl
+        """, known: Data(hostLine("target", seed: 16).utf8), revocations: files)
+        XCTAssertTrue(result.workspace.routes[0].requiredCapabilities.isEmpty)
+        let trust = try trust("target", in: result.workspace)
+        XCTAssertEqual(trust.revocationSourceIDs.count, 2)
+        XCTAssertEqual(trust.requiredCapabilities, [WorkspaceDocument.hostRevocationCapability])
+        XCTAssertEqual(result.workspace.hostRevocationSources.count, 2)
+        XCTAssertEqual(Set(result.workspace.hostRevocationSources.map(\.id)), Set(trust.revocationSourceIDs))
+        let parsed = try SSHRevokedHostKeys.parse(data: krl)
+        XCTAssertEqual(result.workspace.hostRevocationSources.first { $0.id == parsed.id }, parsed)
+        XCTAssertEqual(parsed.policy.certificates[0].serialRanges.last?.last, UInt64.max)
+        let text = String(decoding: result.workspace.raw, as: UTF8.self)
+        XCTAssertFalse(text.contains("/private/")); XCTAssertFalse(text.contains("never-export-this-source-comment"))
+        XCTAssertFalse(text.contains(list.base64EncodedString()), "The source is normalized denial data, not an embedded file.")
+    }
+
+    func testIncompleteRevocationListNeverExportsItsUsablePrefixOrUnblocksItsRoute() throws {
+        let config = """
+        IdentityFile none
+        Host good
+          RevokedHostKeys /trust/good
+        Host blocked
+          RevokedHostKeys /trust/good /trust/required
+        """
+        for state: SSHWorkspaceSource.HostRevocationSnapshot.File in [.missing, .unavailable, .present(Data("malformed key\n".utf8))] {
+            let files = try SSHWorkspaceSource.HostRevocationSnapshot(files: ["/trust/good": .present(publicFile(8)), "/trust/required": state])
+            let result = try exported(config, revocations: files)
+            XCTAssertTrue(try destination("good", in: result.workspace).requiredCapabilities.isEmpty)
+            XCTAssertEqual(try destination("blocked", in: result.workspace).requiredCapabilities, ["ssh_config.unresolved_policy"])
+            XCTAssertTrue(try trust("blocked", in: result.workspace).revocationSourceIDs.isEmpty)
+            XCTAssertEqual(result.workspace.hostRevocationSources.count, 1)
+            XCTAssertTrue(result.portability.contains { $0.setting == "ssh_config.revokedhostkeys" && $0.disposition == 1 })
+        }
+        let absent = try exported("Host blocked\nIdentityFile none\nRevokedHostKeys /not/captured\n")
+        XCTAssertEqual(absent.workspace.routes[0].requiredCapabilities, ["ssh_config.unresolved_policy"])
+    }
+
+    func testRevocationSnapshotFreezesBytesAndEveryObservationChangesRevision() throws {
+        let home = try configurationFiles([
+            "config": "Host target\nIdentityFile none\nRevokedHostKeys ~/.ssh/revoked\n",
+            "revoked": String(decoding: publicFile(8), as: UTF8.self)
+        ])
+        let source = try loadFiles(home)
+        let frozen = try source.loadHostRevocationFiles(for: ["target"], homeDirectory: home)
+        func export(_ files: SSHWorkspaceSource.HostRevocationSnapshot) throws -> SSHWorkspaceExport {
+            var registry = SSHWorkspaceRegistry()
+            return try source.export(aliases: ["target"], workspaceName: "Snapshot", defaultUser: "operator",
+                hostRevocationFiles: files, registry: &registry, using: crypto)
+        }
+        let first = try export(frozen)
+        try publicFile(16).write(to: home.appendingPathComponent(".ssh/revoked"))
+        XCTAssertEqual(try export(frozen).workspace.hostRevocationSources, first.workspace.hostRevocationSources)
+        let changed = try export(source.loadHostRevocationFiles(for: ["target"], homeDirectory: home))
+        XCTAssertNotEqual(try sourceRevision(changed.workspace), try sourceRevision(first.workspace))
+        var revisions = Set<String>()
+        for state: SSHWorkspaceSource.HostRevocationSnapshot.File in [.missing, .unavailable, .present(Data()), .present(Data("# comment only\n".utf8)), .present(Data("invalid one".utf8)), .present(Data("invalid two".utf8))] {
+            revisions.insert(try XCTUnwrap(sourceRevision(export(.init(files: ["~/.ssh/revoked": state])).workspace)).string())
+        }
+        XCTAssertEqual(revisions.count, 6, "Empty, failed, malformed and comment-only observations must not share a review witness.")
+    }
+
+    func testRevocationFileLoaderReadsBinaryKRLAndRefusesUnsafeOrOversizedSources() throws {
+        let home = try configurationFiles([
+            "config": """
+            IdentityFile none
+            Host target
+              RevokedHostKeys ~/.ssh/list ~/.ssh/binary ~/.ssh/missing ~/.ssh/linked ~/.ssh/unsafe ~/.ssh/large
+            Host unrelated
+              RevokedHostKeys ~/.ssh/unselected
+            """,
+            "list": String(decoding: publicFile(8), as: UTF8.self), "unsafe": "", "unselected": "do not read"
+        ])
+        let binary = try revocationOracleSource("serial-bitmap")
+        try binary.write(to: home.appendingPathComponent(".ssh/binary"))
+        try FileManager.default.createSymbolicLink(at: home.appendingPathComponent(".ssh/linked"), withDestinationURL: home.appendingPathComponent(".ssh/list"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o666], ofItemAtPath: home.appendingPathComponent(".ssh/unsafe").path)
+        try Data(repeating: 0, count: 256 * 1024 + 1).write(to: home.appendingPathComponent(".ssh/large"))
+        let loaded = try loadFiles(home).loadHostRevocationFiles(for: ["target"], homeDirectory: home)
+        XCTAssertEqual(loaded.files["~/.ssh/binary"], .present(binary))
+        XCTAssertEqual(loaded.files["~/.ssh/missing"], .missing)
+        for file in ["linked", "unsafe", "large"] { XCTAssertEqual(loaded.files["~/.ssh/" + file], .unavailable, file) }
+        XCTAssertNil(loaded.files["~/.ssh/unselected"])
+    }
+
+    func testRevocationAdmissionRejectsExtraSourcesAndCompleteListOverBudget() throws {
+        XCTAssertThrowsError(try SSHWorkspaceSource.HostRevocationSnapshot(files: ["/large": .present(Data(repeating: 0, count: 256 * 1024 + 1))]))
+        XCTAssertThrowsError(try SSHWorkspaceSource.HostRevocationSnapshot(files: Dictionary(uniqueKeysWithValues: (0..<9).map {
+            ("/source-\($0)", .present(Data(repeating: 0, count: 256 * 1024)))
+        })))
+        XCTAssertThrowsError(try SSHWorkspaceSource.HostRevocationSnapshot(files: Dictionary(uniqueKeysWithValues: (0..<65).map {
+            ("/source-\($0)", .missing)
+        })))
+        let tooMany = (0..<17).map { "/source-\($0)" }.joined(separator: " ")
+        let result = try exported("Host target\nIdentityFile none\nRevokedHostKeys \(tooMany)\n")
+        XCTAssertEqual(result.workspace.routes[0].requiredCapabilities, ["ssh_config.unresolved_policy"])
+        XCTAssertThrowsError(try exported("Host target\nIdentityFile none\nRevokedHostKeys /selected\n",
+            revocations: .init(files: ["/unselected": .present(Data())])))
+    }
+
+    func testSameScopeRevocationSourcesSurviveMachineSelectionAndFTAG() throws {
+        let files = try SSHWorkspaceSource.HostRevocationSnapshot(files: ["/trust/denied": .present(publicFile(8))])
+        let config = """
+        IdentityFile none
+        PreferredAuthentications password
+        Host selected
+          HostName shared.example.invalid
+        Host denial-alias
+          HostName shared.example.invalid
+          RevokedHostKeys /trust/denied
+        """
+        let source = try exported(config, known: Data(hostLine("shared.example.invalid", seed: 8).utf8), revocations: files)
+        let machine = try XCTUnwrap(source.workspace.machines.first { $0.name == "selected" })
+        let selection = try WorkspaceExportSelection(workspace: source.workspace, groupIDs: [source.workspace.initialGroupID],
+            machineIDs: [machine.id], findings: source.portability)
+        XCTAssertEqual(selection.workspace.hostTrust.count, 2, "The unselected alias carries negative policy for the retained endpoint.")
+        XCTAssertEqual(selection.workspace.hostRevocationSources, source.workspace.hostRevocationSources)
+        let route = try XCTUnwrap(selection.workspace.routes.first)
+        let pin = try XCTUnwrap(selection.workspace.hostTrust.first { $0.id == route.trustID }?.pins.first)
+        XCTAssertTrue(try selection.workspace.hostRevocationPolicy(forTrustID: route.trustID).denies(presented: pin))
+        let review = try selection.review(decisions: [:], loadedFingerprints: [])
+        XCTAssertEqual(review.blockedRouteIDs, [route.id])
+        let archive = try selection.archive(including: [], using: crypto)
+        let sealed = try FTAG.seal(archive, using: crypto), restored = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+        XCTAssertEqual(restored.workspace.hostRevocationSources, selection.workspace.hostRevocationSources)
+        XCTAssertTrue(try restored.workspace.hostRevocationPolicy(forTrustID: route.trustID).denies(presented: pin))
+
+        let missing = try exported(config, known: Data(hostLine("shared.example.invalid", seed: 8).utf8),
+            revocations: .init(files: ["/trust/denied": .missing]))
+        let retainedMachine = try XCTUnwrap(missing.workspace.machines.first { $0.name == "selected" })
+        let incomplete = try WorkspaceExportSelection(workspace: missing.workspace, groupIDs: [missing.workspace.initialGroupID],
+            machineIDs: [retainedMachine.id], findings: missing.portability)
+        XCTAssertTrue(incomplete.workspace.hostRevocationSources.isEmpty)
+        XCTAssertTrue(incomplete.workspace.routes[0].requiredCapabilities.isEmpty, "The selected route itself has no missing file.")
+        XCTAssertTrue(incomplete.workspace.hostTrust.contains { $0.requiredCapabilities.contains("ssh_config.unresolved_policy") })
+        XCTAssertEqual(try incomplete.review(decisions: [:], loadedFingerprints: []).blockedRouteIDs, incomplete.workspace.routes.map(\.id),
+            "Selecting another alias cannot erase its canonical host's required unreadable denial policy.")
     }
 
     func testLocalIncludeInventoryLexicalOrderAndFrozenSource() throws {
@@ -1148,7 +1333,9 @@ final class SSHWorkspaceSourceTests: XCTestCase {
             let result = try exported("Host build\nIdentityFile none\n\(policy)\n", known: Data(known.utf8))
             XCTAssertEqual(result.workspace.hostTrust[0].certificateAuthorities.count, 1, policy)
             XCTAssertEqual(result.workspace.hostTrust[0].pins.count, 1)
-            XCTAssertEqual(result.workspace.hostTrust[0].requiredCapabilities, [WorkspaceDocument.hostCertificateCapability])
+            var expected = [WorkspaceDocument.hostCertificateCapability]
+            if policy.hasPrefix("RevokedHostKeys ") { expected.append("ssh_config.unresolved_policy") }
+            XCTAssertEqual(result.workspace.hostTrust[0].requiredCapabilities, expected, policy)
             XCTAssertFalse(result.workspace.routes[0].requiredCapabilities.isEmpty, policy)
             XCTAssertTrue(result.portability.contains { $0.disposition == 1 }, policy)
         }

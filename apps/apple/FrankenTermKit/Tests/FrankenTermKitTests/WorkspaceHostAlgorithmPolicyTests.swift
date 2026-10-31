@@ -326,6 +326,9 @@ final class WorkspaceHostAlgorithmPolicyTests: XCTestCase {
             default: fields["version"] = 9
             }
             if corruption != "legacy-manifest" { fields["hostAlgorithmPolicies"] = entries }
+            if corruption == "legacy-manifest" || corruption == "downgraded" {
+                fields.removeValue(forKey: "hostRevocationSources"); fields.removeValue(forKey: "hostRevocationSourceScopes")
+            }
             try seed(fields, in: f.disk)
             let bytes = f.disk.bytes(.catalog)
             do { _ = try await WorkspaceStore(persistence: f.disk, vault: f.vault).load(); XCTFail(corruption) }
@@ -345,6 +348,7 @@ final class WorkspaceHostAlgorithmPolicyTests: XCTestCase {
             let f = try await fixture(document())
             var fields = try catalog(f.disk); fields["version"] = version
             fields.removeValue(forKey: "hostAlgorithmPolicies")
+            fields.removeValue(forKey: "hostRevocationSources"); fields.removeValue(forKey: "hostRevocationSourceScopes")
             if version < 3 { fields.removeValue(forKey: "hostRevocations") }
             if version < 4 { fields.removeValue(forKey: "scopedHostRevocations"); fields.removeValue(forKey: "hostRequirements") }
             if version < 5 { fields.removeValue(forKey: "machineConnectionPreferences") }
@@ -358,7 +362,7 @@ final class WorkspaceHostAlgorithmPolicyTests: XCTestCase {
             let effective = try await policy(f, store: reopened)
             XCTAssertFalse(effective.isConstrained)
             let migrated = try catalog(f.disk)
-            XCTAssertEqual(migrated["version"] as? Int, 10)
+            XCTAssertEqual(migrated["version"] as? Int, 11)
             XCTAssertEqual((migrated["hostAlgorithmPolicies"] as? [Any])?.count, 0)
             XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(migrated["acceptedImports"]), options: [.sortedKeys]), history)
             XCTAssertEqual(f.vault.creates, 1)

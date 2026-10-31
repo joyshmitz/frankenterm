@@ -305,6 +305,68 @@ final class WorkspaceExportTests: XCTestCase {
         XCTAssertEqual(restored.workspace.groups[0].machineOrder, ["build", "gpu"])
         XCTAssertEqual(restored.keys.map(\.credentialID), ["key-alias"])
     }
+
+    func testSelectionPrunesOnlyUnreferencedRevocationResourcesIncludingDetachedSameScopePolicy() throws {
+        let resources = try ["archive", "detached", "hop", "destination"].map {
+            try SSHRevokedHostKeys.parse(data: Data("# \($0) captured source\n".utf8))
+        }
+        var root = try StrictJSON.decode(fixture().raw).object()
+        var workspace = try root.required("workspace").object()
+        var trusts = try workspace.required("host_trust").array().map { try $0.object() }
+        for (trustID, resource) in [("archive-route-trust", resources[0]), ("first-hop-trust", resources[2]), ("build-route-trust", resources[3])] {
+            let index = try XCTUnwrap(trusts.firstIndex { $0["id"] == .string(trustID) })
+            trusts[index]["revocation_source_refs"] = .array([.string(resource.id)])
+        }
+        var detached = try XCTUnwrap(trusts.first { $0["id"] == .string("build-route-trust") })
+        detached["id"] = .string("detached-denial-policy")
+        detached["revocation_source_refs"] = .array([.string(resources[1].id)])
+        trusts.append(detached)
+        workspace["host_trust"] = .array(trusts.map(JSONValue.object))
+        workspace["host_revocation_sources"] = .array(resources.map(\.json))
+        root["workspace"] = .object(workspace)
+        let source = try WorkspaceDocument(data: StrictJSON.encode(.object(root)))
+        let findings = resources.map { AirGapArchive.Portability(entityID: $0.id, setting: "revocation.snapshot", disposition: 0, reason: "Captured revocation policy.") }
+        let selection = try WorkspaceExportSelection(workspace: source, groupIDs: ["selected"], machineIDs: ["build"], findings: findings)
+        XCTAssertEqual(selection.workspace.hostRevocationSources.map(\.id), resources.dropFirst().map(\.id))
+        let review = try selection.review(decisions: [:], loadedFingerprints: [])
+        XCTAssertEqual(review.findings.filter { $0.setting == "revocation.snapshot" }.map(\.entityID), resources.dropFirst().map(\.id))
+        XCTAssertTrue(selection.workspace.hostTrust.contains { $0.id == "detached-denial-policy" })
+        XCTAssertFalse(selection.workspace.hostTrust.contains { $0.id == "archive-route-trust" })
+        let archive = try selection.archive(including: [], using: crypto)
+        let sealed = try FTAG.seal(archive, using: crypto), restored = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+        XCTAssertEqual(restored.workspace.hostRevocationSources, selection.workspace.hostRevocationSources)
+        for trust in restored.workspace.hostTrust {
+            XCTAssertTrue(Set(trust.revocationSourceIDs).isSubset(of: Set(restored.workspace.hostRevocationSources.map(\.id))))
+        }
+    }
+
+    func testOfflineReviewPreservesSupportedHostPoliciesWithoutPermanentUnavailableFinding() throws {
+        let empty = try SSHRevokedHostKeys.parse(data: Data())
+        for unknown in [false, true] {
+            var root = try StrictJSON.decode(fixture().raw).object()
+            var workspace = try root.required("workspace").object()
+            var trusts = try workspace.required("host_trust").array().map { try $0.object() }
+            let index = try XCTUnwrap(trusts.firstIndex { $0["id"] == .string("gpu-route-trust") })
+            trusts[index]["host_key_algorithms"] = .array([.string("ssh-ed25519")])
+            trusts[index]["ca_signature_algorithms"] = .array([.string("rsa-sha2-512")])
+            trusts[index]["revocation_source_refs"] = .array([.string(empty.id)])
+            var capabilities = [WorkspaceDocument.hostAlgorithmPolicyCapability, WorkspaceDocument.hostRevocationCapability]
+            if unknown { capabilities.append("future.required_trust_check") }
+            trusts[index]["required_capabilities"] = .array(capabilities.map(JSONValue.string))
+            workspace["host_trust"] = .array(trusts.map(JSONValue.object))
+            workspace["host_revocation_sources"] = .array([empty.json])
+            root["workspace"] = .object(workspace)
+            let source = try WorkspaceDocument(data: StrictJSON.encode(.object(root)))
+            let selection = try WorkspaceExportSelection(workspace: source, groupIDs: ["selected"], machineIDs: ["gpu"])
+            let review = try selection.review(decisions: [:], loadedFingerprints: [])
+            XCTAssertEqual(review.blockedRouteIDs, unknown ? ["gpu-route"] : [])
+            let archive = try selection.archive(including: [], using: crypto)
+            let restored = try AirGapArchive(data: archive.encoded(), using: crypto)
+            XCTAssertEqual(restored.workspace.hostTrust[0].requiredCapabilities, capabilities)
+            XCTAssertEqual(restored.workspace.hostRevocationSources, [empty])
+            XCTAssertEqual(restored.portability.contains { $0.setting == "route_readiness" && $0.disposition == 1 }, unknown)
+        }
+    }
 }
 
 @MainActor

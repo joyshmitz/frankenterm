@@ -383,13 +383,14 @@ final class WorkspaceUserCertificateTests: XCTestCase {
         var workspaces = try XCTUnwrap(legacy["workspaces"] as? [[String: Any]])
         legacy["version"] = 8; workspaces[0].removeValue(forKey: "certificateRenewals"); legacy["workspaces"] = workspaces
         legacy.removeValue(forKey: "hostAlgorithmPolicies")
+        legacy.removeValue(forKey: "hostRevocationSources"); legacy.removeValue(forKey: "hostRevocationSourceScopes")
         let history = try JSONSerialization.data(withJSONObject: XCTUnwrap(legacy["acceptedImports"]), options: [.sortedKeys])
         disk.seed(try JSONSerialization.data(withJSONObject: legacy, options: [.sortedKeys]), slot: .catalog)
         let loaded = try await WorkspaceStore(persistence: disk, vault: vault).load(), migrated = try XCTUnwrap(loaded.first)
         XCTAssertTrue(migrated.certificateRenewals.isEmpty); XCTAssertEqual(migrated.revision, saved.revision)
         XCTAssertEqual(migrated.manifest, saved.manifest); XCTAssertEqual(migrated.bindings, saved.bindings)
         let upgraded = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(disk.bytes(.catalog))) as? [String: Any])
-        XCTAssertEqual(upgraded["version"] as? Int, 10)
+        XCTAssertEqual(upgraded["version"] as? Int, 11)
         XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(upgraded["acceptedImports"]), options: [.sortedKeys]), history)
         let review = try await store.reviewCertificateRenewal(workspaceID: saved.id, expectedRevision: saved.revision,
             credentialID: "key", certificateFile: certificateFile(workspaceTestCertificate(serial: 2)))
@@ -402,7 +403,9 @@ final class WorkspaceUserCertificateTests: XCTestCase {
             case "duplicate": entries.append(entries[0])
             case "witness": entries[0]["sourceWitness"] = Data(repeating: 0, count: 32).base64EncodedString()
             case "signature": entries[0]["certificate"] = Data([1, 2, 3]).base64EncodedString()
-            default: catalog["version"] = 8
+            default:
+                catalog["version"] = 8; catalog.removeValue(forKey: "hostAlgorithmPolicies")
+                catalog.removeValue(forKey: "hostRevocationSources"); catalog.removeValue(forKey: "hostRevocationSourceScopes")
             }
             workspaces[0]["certificateRenewals"] = entries; catalog["workspaces"] = workspaces
             disk.seed(try JSONSerialization.data(withJSONObject: catalog, options: [.sortedKeys]), slot: .catalog)
