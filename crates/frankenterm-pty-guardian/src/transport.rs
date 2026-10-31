@@ -1033,6 +1033,8 @@ pub struct GuardianService {
     transport_failures: u64,
     /// When a connection refused for want of a slot was last logged.
     capacity_refusal_logged_at: Option<Instant>,
+    /// The last disconnected mux logged as unable to retire.
+    blocked_retirement_logged: Option<Uuid>,
     lifecycle: GuardianLifecycle,
     output_completion_token: Token,
     next_connection_generation: u64,
@@ -1157,6 +1159,7 @@ impl GuardianService {
             poll_interval: config.poll_interval,
             transport_failures: 0,
             capacity_refusal_logged_at: None,
+            blocked_retirement_logged: None,
             lifecycle: GuardianLifecycle::Running,
             output_completion_token,
             next_connection_generation: 1,
@@ -2242,6 +2245,15 @@ impl GuardianService {
                 }
             };
             if result.pending_input_panes != 0 || result.indeterminate_checkpoint_panes != 0 {
+                if self.blocked_retirement_logged != Some(retirement.mux_incarnation) {
+                    self.blocked_retirement_logged = Some(retirement.mux_incarnation);
+                    log::warn!(
+                        "guardian cannot retire disconnected mux {}: {} pane(s) hold an unsettled input, {} an indeterminate checkpoint",
+                        retirement.mux_incarnation,
+                        result.pending_input_panes,
+                        result.indeterminate_checkpoint_panes,
+                    );
+                }
                 return;
             }
             if self
