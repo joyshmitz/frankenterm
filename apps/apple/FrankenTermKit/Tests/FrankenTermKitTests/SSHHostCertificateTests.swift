@@ -9,12 +9,13 @@ func workspaceTestHostCertificate(
     validAfter: UInt64 = 946_684_800, validBefore: UInt64 = 4_102_444_800,
     subjectSeed: Data = Data(0..<32), authoritySeed: Data = Data(32..<64),
     certificateType: UInt32 = 2, criticalOptions: [String: Data] = [:],
-    extensionOptions: [String: Data] = [:], reserved: Data = Data()
+    extensionOptions: [String: Data] = [:], reserved: Data = Data(),
+    keyID: Data = Data("workspace-fixture".utf8)
 ) throws -> Data {
     try workspaceTestCertificate(serial: serial, principals: principals, validAfter: validAfter,
         validBefore: validBefore, extensions: [], subjectSeed: subjectSeed, authoritySeed: authoritySeed,
         criticalOptions: criticalOptions, extensionValues: extensionOptions,
-        certificateType: certificateType, reserved: reserved)
+        certificateType: certificateType, reserved: reserved, keyID: keyID)
 }
 
 /// Public OpenSSH-generated certificates exercise every admitted subject and

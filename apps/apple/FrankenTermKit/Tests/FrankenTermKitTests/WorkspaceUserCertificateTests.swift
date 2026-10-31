@@ -15,7 +15,8 @@ func workspaceTestCertificate(serial: UInt64 = 1, principals: [String] = ["opera
                               extensions: [String] = ["permit-port-forwarding", "permit-pty"],
                               subjectSeed: Data = Data(0..<32), authoritySeed: Data = Data(32..<64),
                               criticalOptions: [String: Data] = [:], extensionValues: [String: Data] = [:],
-                              certificateType: UInt32 = 1, reserved: Data = Data()) throws -> Data {
+                              certificateType: UInt32 = 1, reserved: Data = Data(),
+                              keyID: Data = Data("workspace-fixture".utf8)) throws -> Data {
     func field(_ bytes: Data) -> Data {
         var value = Data(); value.appendBE(UInt64(bytes.count), bytes: 4); value.append(bytes); return value
     }
@@ -25,7 +26,7 @@ func workspaceTestCertificate(serial: UInt64 = 1, principals: [String] = ["opera
     result.append(field(Data(repeating: 19, count: 32)))
     result.append(field(subject.publicKey.rawRepresentation))
     result.appendBE(serial, bytes: 8); result.appendBE(UInt64(certificateType), bytes: 4)
-    result.append(field(Data("workspace-fixture".utf8)))
+    result.append(field(keyID))
     result.append(field(principals.reduce(into: Data()) { $0.append(field(Data($1.utf8))) }))
     result.appendBE(validAfter, bytes: 8); result.appendBE(validBefore, bytes: 8)
     result.append(field(criticalOptions.keys.sorted().reduce(into: Data()) {
