@@ -1320,6 +1320,13 @@ fn run_broker_exec_bootstrap_with_identity(
         },
     )?;
 
+    // A recovery root names each pane by an output record, so one pane that
+    // has printed nothing (`sleep`, `ssh -N`, a quiet server) would keep every
+    // pane of the host out of recovery for as long as it stays silent. Every
+    // journal starts with this one padding byte, which every terminal ignores.
+    // A failed write means the terminal is already gone, and the child may
+    // still have work to do without it.
+    let _ = output.write_all(&[0]).and_then(|()| output.flush());
     drop(output);
     drop(input);
     terminal.restore()?;
@@ -5749,6 +5756,7 @@ impl BrokerControlServiceV1 {
                         payload[0] = 1;
                         payload[1] = u8::from(status.signal().is_some());
                         payload[2..].copy_from_slice(&status.exit_code().to_be_bytes());
+                        live.adoption.pane.release_finished_pty();
                     }
                     header.status = BrokerControlResponseStatusV1::Applied;
                     return BrokerControlResponseV1::new(header, &payload).map_err(|_| ());
@@ -19163,7 +19171,7 @@ impl BrokerPreparedPaneV1 {
         let pane = BrokerAdoptedPaneV1 {
             broker_incarnation,
             binding,
-            broker_master,
+            broker_master: Some(broker_master),
             proxy_reader: Some(proxy_reader),
             proxy_writer: Some(proxy_writer),
             output_buffer,
@@ -19302,7 +19310,7 @@ impl BrokerPreparedPaneV1 {
         let pane = BrokerAdoptedPaneV1 {
             broker_incarnation: self.broker_incarnation,
             binding: self.binding,
-            broker_master: self.broker_master,
+            broker_master: Some(self.broker_master),
             proxy_reader: Some(self.proxy_reader),
             proxy_writer: Some(self.proxy_writer),
             output_buffer: self.output_buffer,
@@ -19606,7 +19614,7 @@ struct BrokerOutputTerminalState {
 pub struct BrokerAdoptedPaneV1 {
     broker_incarnation: Uuid,
     binding: BrokerGenesisBinding,
-    broker_master: Box<dyn MasterPty + Send>,
+    broker_master: Option<Box<dyn MasterPty + Send>>,
     proxy_reader: Option<Box<dyn PollablePtyReader>>,
     proxy_writer: Option<Box<dyn Write + Send>>,
     output_buffer: VecDeque<u8>,
@@ -19818,7 +19826,7 @@ impl BrokerAdoptedPaneV1 {
             } => 0,
         };
         BrokerResourceUsageV1 {
-            broker_pty_descriptors: 1
+            broker_pty_descriptors: u8::from(self.broker_master.is_some())
                 + u8::from(self.proxy_reader.is_some())
                 + u8::from(self.proxy_writer.is_some()),
             child_handles: 1,
@@ -19958,6 +19966,9 @@ impl BrokerAdoptedPaneV1 {
             state.child_exit_observed = self.query_child_exit();
             self.output_terminal = Some(state);
         }
+        if state.child_exit_observed == Some(true) {
+            self.release_finished_pty();
+        }
         BrokerOutputTerminalReceiptV1 {
             reason: state.reason,
             output_sequence: self.next_output_sequence,
@@ -19969,6 +19980,19 @@ impl BrokerAdoptedPaneV1 {
 
     fn query_child_exit(&mut self) -> Option<bool> {
         self.child.try_wait().map(|status| status.is_some()).ok()
+    }
+
+    /// Close the PTY of a child that has exited, once its output has ended.
+    /// This record outlives the pane, and a master kept with it would cost the
+    /// host a PTY for every pane the broker ever opened: macOS has 511 in all,
+    /// for every application. Output EOF alone keeps it, as a child still
+    /// running can reopen its terminal, and so does an exit before EOF, as a
+    /// child's background job can still be printing.
+    fn release_finished_pty(&mut self) {
+        if self.output_terminal.is_some() {
+            drop(self.proxy_writer.take());
+            drop(self.broker_master.take());
+        }
     }
 
     /// Admit one bounded write under the current logical attachment lease.
@@ -20260,9 +20284,13 @@ impl BrokerAdoptedPaneV1 {
         let BrokerProxyOperationV1::Resize { size } = permit.operation else {
             return Err(BrokerError::InvalidProxyOperation);
         };
-        self.broker_master
-            .resize(size)
-            .map_err(|_| BrokerError::ProxyEffectIndeterminate)?;
+        // Nothing is left to resize after release_finished_pty. A mux can
+        // still ask before it learns the pane has ended.
+        if let Some(master) = self.broker_master.as_ref() {
+            master
+                .resize(size)
+                .map_err(|_| BrokerError::ProxyEffectIndeterminate)?;
+        }
         Ok(BrokerProxyEffectReceiptV1 {
             operation_id: permit.operation_id,
             lease_generation: permit.attachment.lease_generation,
@@ -20649,17 +20677,20 @@ impl BrokerAdoptedPaneV1 {
             return Err(BrokerError::FinalTerminalEofAuthorityMismatch);
         }
         if begin_retirement {
-            let proxy_writer = self
-                .proxy_writer
-                .take()
-                .ok_or(BrokerError::FinalTerminalEofInProgress)?;
-            drop(proxy_writer);
+            // After release_finished_pty no writer and no child remain, so
+            // nothing is left to hear this EOF.
+            if self.proxy_writer.is_none() && self.broker_master.is_some() {
+                return Err(BrokerError::FinalTerminalEofInProgress);
+            }
+            drop(self.proxy_writer.take());
             self.lease = BrokerLeaseState::FinalTerminalEofPending {
                 predecessor,
                 generation,
             };
         }
-        if self.broker_master.send_terminal_eof().is_err() {
+        if let Some(master) = self.broker_master.as_ref()
+            && master.send_terminal_eof().is_err()
+        {
             return Err(BrokerError::FinalTerminalEofFailed);
         }
         self.lease = BrokerLeaseState::FinalTerminalEof {
@@ -26521,7 +26552,8 @@ mod tests {
                         thread::sleep(Duration::from_millis(1));
                     }
                     BrokerPaneOutputV1::Data(delivery) => {
-                        assert_eq!(delivery.bytes(), b"b");
+                        // The exec bootstrap's padding byte, still unacknowledged.
+                        assert_eq!(delivery.bytes(), b"\0");
                         break;
                     }
                     _ => panic!("upgraded owner lost real child output"),
@@ -27233,7 +27265,9 @@ mod tests {
             }
         };
         let (start, end) = first_delivery.sequence_range();
-        assert_eq!(first_delivery.bytes(), b"b");
+        // Every journal starts with the exec bootstrap's padding byte; the
+        // child's `broker-output-prefix` follows it.
+        assert_eq!(first_delivery.bytes(), b"\0");
         assert_eq!(
             end - start,
             u64::try_from(first_delivery.bytes().len()).unwrap()
@@ -27371,7 +27405,7 @@ mod tests {
                 }
                 BrokerPaneOutputV1::Data(delivery) => {
                     assert_eq!(delivery.sequence_range(), (end, end + 1));
-                    assert_eq!(delivery.bytes(), b"r");
+                    assert_eq!(delivery.bytes(), b"b");
                     break;
                 }
                 _ => panic!("durable ACK did not release next broker byte"),
@@ -27432,7 +27466,7 @@ mod tests {
             panic!("failed append must not release broker prefix");
         };
         assert_eq!(delivery.sequence_range(), (end, end + 1));
-        assert_eq!(delivery.bytes(), b"r");
+        assert_eq!(delivery.bytes(), b"b");
         assert!(matches!(
             client
                 .query_spawn_claim(binding.durable_pane_id, binding.spawn_effect_id)
@@ -27523,7 +27557,7 @@ mod tests {
                     result: Ok(BrokerPaneOutputV1::Data(delivery)),
                 }) => {
                     assert_eq!(delivery.sequence_range(), (end, end + 1));
-                    assert_eq!(delivery.bytes(), b"r");
+                    assert_eq!(delivery.bytes(), b"b");
                     break handle;
                 }
                 Err(TryRecvError::Empty) if Instant::now() < worker_deadline => {
@@ -31237,6 +31271,10 @@ mod tests {
             b"R",
             "durable Release or its lost-reply retry executed the user command incorrectly"
         );
+        // This child prints nothing, and its journal still gets a first record
+        // for a recovery root to name.
+        pump_until_sequence_advances(&mut pane, 0);
+        assert_eq!(pane.output_buffer, [0]);
         pane.terminate_and_wait_for_test();
     }
 
@@ -31938,6 +31976,77 @@ mod tests {
                 .expect("wait for output child")
                 .success()
         );
+    }
+
+    #[test]
+    fn a_finished_pane_gives_its_pty_back_and_still_answers() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let sentinel = temp.path().join("unused");
+        let auth = authority(id(71), id(72), id(73), id(74), 0x41, 0x42);
+        let payload = command_payload("exit 0", &sentinel);
+        let binding = binding_for(&payload, &auth);
+        let (prepared, control) =
+            prepare_for_test(payload, binding, &auth, BrokerResourceLimitsV1::default())
+                .expect("prepare a short-lived pane");
+        let BrokerAdoptionV1 {
+            mut pane,
+            attachment,
+        } = commit_for_test(prepared, control, binding).expect("commit a short-lived pane");
+        // Whichever of EOF and the exit comes last gives the PTY back: a read
+        // of the ended output keeps looking for the exit.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pane.resource_usage().broker_pty_descriptors != 0 {
+            assert!(Instant::now() < deadline, "the PTY was never given back");
+            match pane.pump_ready_output() {
+                Ok(_) | Err(BrokerError::ProxyWouldBlock) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("PTY output pump failed: {error}"),
+            }
+        }
+        assert!(!pane.child_is_running_for_test().expect("query the child"));
+
+        // The mux can still resize it before it learns the pane has ended.
+        let late_resize = pane
+            .admit_proxy_resize(
+                &attachment,
+                PtySize {
+                    rows: 42,
+                    cols: 132,
+                    pixel_width: 8,
+                    pixel_height: 16,
+                },
+            )
+            .expect("admit a late resize");
+        pane.execute_proxy_resize(late_resize)
+            .expect("a late resize finds nothing to do");
+        assert!(matches!(
+            pane.pump_ready_output(),
+            Ok(BrokerOutputPumpOutcomeV1::TerminalDrained(_))
+        ));
+    }
+
+    #[test]
+    fn a_running_child_keeps_the_pty_its_output_ended_on() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let sentinel = temp.path().join("unused");
+        let auth = authority(id(75), id(76), id(77), id(78), 0x41, 0x42);
+        let payload = command_payload("IFS= read -r ignored", &sentinel);
+        let binding = binding_for(&payload, &auth);
+        let (prepared, control) =
+            prepare_for_test(payload, binding, &auth, BrokerResourceLimitsV1::default())
+                .expect("prepare a pane");
+        let BrokerAdoptionV1 { mut pane, .. } =
+            commit_for_test(prepared, control, binding).expect("commit a pane");
+        pane.proxy_reader = Some(Box::new(TerminalTestReader {
+            fd: fs::File::open("/dev/null").expect("open inert test descriptor"),
+            reads: Arc::new(AtomicUsize::new(0)),
+            mode: TerminalReadMode::Zero,
+        }));
+        pane.pump_ready_output().expect("observe the output's end");
+        pane.pump_ready_output().expect("repeat the query");
+        assert_eq!(pane.resource_usage().broker_pty_descriptors, 2);
+        assert!(pane.child_is_running_for_test().expect("query the child"));
     }
 
     #[test]
