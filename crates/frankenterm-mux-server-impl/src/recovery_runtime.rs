@@ -94,6 +94,19 @@ fn recovery_error_chain(error: &dyn std::error::Error) -> String {
     text
 }
 
+/// Whether a capture only met a spawn or another topology change in flight,
+/// which the next period retries, as it does a busy pane.
+fn capture_was_busy(error: &WholeMuxCaptureError) -> bool {
+    matches!(
+        error,
+        WholeMuxCaptureError::Busy
+            | WholeMuxCaptureError::Topology(
+                mux::MuxTopologyCaptureError::DomainPolicyBusy
+                    | mux::MuxTopologyCaptureError::ConcurrentMutation { .. }
+            )
+    )
+}
+
 fn parse_identity(value: &str) -> Result<[u8; 32], String> {
     let mut identity = [0; 32];
     hex::decode_to_slice(value, &mut identity).map_err(|_| "expected 64 hex digits".to_owned())?;
@@ -689,10 +702,8 @@ impl PeriodicRecovery {
             }
             // The outcome below is only a label; operators need the cause.
             if let Err(error) = &outcome
-                && !matches!(
-                    error,
-                    WholeMuxCaptureError::Busy | WholeMuxCaptureError::Context(_)
-                )
+                && !capture_was_busy(error)
+                && !matches!(error, WholeMuxCaptureError::Context(_))
             {
                 log::warn!(
                     "mux periodic recovery capture failed: {}",
@@ -716,7 +727,7 @@ impl PeriodicRecovery {
                         ),
                     }
                 }
-                Err(WholeMuxCaptureError::Busy) => (None, Some("busy"), false, false),
+                Err(error) if capture_was_busy(&error) => (None, Some("busy"), false, false),
                 Err(
                     WholeMuxCaptureError::CaptureDeadline { .. }
                     | WholeMuxCaptureError::StaleCapture(_)
