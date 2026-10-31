@@ -2,6 +2,39 @@
 
 This directory contains the shared Swift 6 `FrankenTermKit` package and the native Xcode project for the first offline workspace-transfer slice. It is implementation source, not a signed or device-qualified terminal release.
 
+## Imported OpenSSH host revocations
+
+The native SSH and air-gapped workspace paths now carry `RevokedHostKeys` public
+key lists and unsigned OpenSSH KRL v1 files from both desktop exporters to the
+phone's verifier. The passive source resolver captures every path in the first
+effective assignment, including a complete list of up to sixteen literal
+absolute or `~/` paths. Missing, unreadable, unsafe, malformed or unsupported
+sources block their canonical host scope, including when another alias is
+selected and the original route is omitted from the transfer.
+
+Public revocation resources are deduplicated in the manifest and referenced by
+trust records. The verifier checks raw subject and issuer key hashes, exact
+certificate key IDs, serial lists, intervals and bitmaps. Intervals stay compact
+even through `UInt64.max`; key hashes and IDs use cached sets, and serial checks
+use binary search. Fleet endpoints with the same source set share the compiled
+immutable policy. SHA-1 here identifies revoked keys; it does not enable SHA-1
+SSH signatures.
+
+Catalog version eleven preserves each accepted source once and retains its
+canonical scope references. A later export, an older recording, a renamed trust
+record or a lower KRL version cannot remove a previously accepted denial.
+Public-key, password and interactive authentication all retain the actual peer
+identity and recheck that policy, independently for every jump and destination.
+A first-use probe reports a revoked peer without exposing a candidate that the
+phone could approve as a new pin.
+
+Import details, route and jump-account review, and the Keys screen show source
+digests, KRL versions, source timestamps and retained history. Source version
+and time are descriptive; they do not establish freshness. Unsupported freshness
+requirements and signed or unknown critical KRL sections remain blocked.
+See [the SSH package's profile and validation](FrankenTermSSH/README.md#imported-host-revocation-lists-and-krls)
+for exact bounds, interoperability evidence and remaining native qualification.
+
 ## Remote files over verified SSH
 
 The native SSH backend supports a dedicated SFTP owner using the same exact

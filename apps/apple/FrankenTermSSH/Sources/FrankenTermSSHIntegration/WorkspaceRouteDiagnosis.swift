@@ -168,7 +168,8 @@ public enum WorkspaceRouteProbe {
         /// is evidence to compare independently, not proof of the host's name.
         /// Use the same signature/algorithm qualification as authentication.
         public var observedIdentity: SSHPublicIdentity? {
-            guard failure == nil, let peer else { return nil }
+            guard failure == nil, let peer,
+                  hostKey == .pinMismatch || hostKey == .trustedPin || hostKey == .reviewRequired else { return nil }
             return try? WorkspaceNativeSSHAuthentication.hostIdentity(for: peer).rawIdentity
         }
     }
@@ -204,6 +205,8 @@ public enum WorkspaceRouteProbe {
             guard let route = document.routes.first(where: { $0.id == routeID }) else { throw SSHAuthenticationError.stale }
             network = WorkspaceRouteNetwork(host: route.host)
             let algorithms = try await store.hostAlgorithmPolicy(workspaceID: workspaceID,
+                expectedRevision: expectedRevision, routeID: routeID, support: support)
+            let revocations = try await store.hostRevocationSources(workspaceID: workspaceID,
                 expectedRevision: expectedRevision, routeID: routeID, support: support)
             let negotiation = try WorkspaceNativeSSHAuthentication.hostKeyNegotiation(
                 for: route, document: document, algorithmPolicy: algorithms)
@@ -244,13 +247,18 @@ public enum WorkspaceRouteProbe {
             try await owner.validateForwardingPath()
             try Task.checkCancellation()
             let result = await exchangeAndClose(owner, route: route, document: document,
-                algorithmPolicy: algorithms, negotiation: negotiation, timeout: timeout)
+                algorithmPolicy: algorithms, revocationSources: revocations,
+                negotiation: negotiation, timeout: timeout)
             session = nil
             try Task.checkCancellation()
             try await broker.validateForeground(foreground)
             _ = try await store.validateHostKeyVerification(probe, support: support)
             guard try await store.hostAlgorithmPolicy(workspaceID: workspaceID,
                 expectedRevision: expectedRevision, routeID: routeID, support: support) == algorithms else {
+                throw SSHAuthenticationError.stale
+            }
+            guard try await store.hostRevocationSources(workspaceID: workspaceID,
+                expectedRevision: expectedRevision, routeID: routeID, support: support) == revocations else {
                 throw SSHAuthenticationError.stale
             }
             await store.endHostKeyVerification(probe)
@@ -273,9 +281,11 @@ public enum WorkspaceRouteProbe {
         }
         let session: NativeSSHSession, lease: WorkspaceNetworkLease
         let algorithms: WorkspaceHostAlgorithmPolicy
+        let revocations: [WorkspaceHostRevocationSource]
         let negotiation: (profile: NativeSSHHostKeyPolicy, algorithms: [String])
         do {
             algorithms = try document.hostAlgorithmPolicy(forTrustID: route.trustID)
+            revocations = try document.hostRevocationSources(forTrustID: route.trustID)
             negotiation = try WorkspaceNativeSSHAuthentication.hostKeyNegotiation(
                 for: route, document: document, algorithmPolicy: algorithms)
             lease = try networkActivity.beginConnection()
@@ -283,7 +293,8 @@ public enum WorkspaceRouteProbe {
                                                            timeout: timeout, networkLifetime: lease)
         } catch { return .init(network: network, hostKey: nil, peer: nil, failure: error) }
         let result = await exchangeAndClose(session, route: route, document: document,
-            algorithmPolicy: algorithms, negotiation: negotiation, timeout: timeout)
+            algorithmPolicy: algorithms, revocationSources: revocations,
+            negotiation: negotiation, timeout: timeout)
         withExtendedLifetime(lease) {}
         return result
     }
@@ -291,6 +302,7 @@ public enum WorkspaceRouteProbe {
     private static func exchangeAndClose(_ session: NativeSSHSession, route: WorkspaceDocument.Route,
                                         document: WorkspaceDocument,
                                         algorithmPolicy: WorkspaceHostAlgorithmPolicy,
+                                        revocationSources: [WorkspaceHostRevocationSource],
                                         negotiation: (profile: NativeSSHHostKeyPolicy, algorithms: [String]),
                                         timeout: Duration) async -> Result {
         let network = WorkspaceRouteNetwork(host: route.host)
@@ -309,10 +321,12 @@ public enum WorkspaceRouteProbe {
             }
             let decision = try document.verifyHostKey(forRouteID: route.id,
                 presented: identity.key, hostCertificate: identity.certificate,
+                rawHostIdentity: identity.rawIdentity,
                 negotiatedHostSignature: peer.hostSignature,
                 reviewedTrustIDs: Set(document.hostTrust.map(\.id)),
                 support: WorkspaceNativeSSHAuthentication.routeSupport,
-                hostAlgorithmPoliciesByTrustScope: [trust.canonicalTrustScope: algorithmPolicy])
+                hostAlgorithmPoliciesByTrustScope: [trust.canonicalTrustScope: algorithmPolicy],
+                hostRevocationSourcesByTrustScope: [trust.canonicalTrustScope: revocationSources])
             return .init(network: network, hostKey: decision, peer: peer, failure: nil)
         } catch { return .init(network: network, hostKey: nil, peer: peer, failure: error) }
     }

@@ -2184,6 +2184,7 @@ final class MobileWorkspaceModel {
                         support: support, revokedHostKeysByTrustScope: local.revokedHostKeysByTrustScope,
                         requiredHostCapabilitiesByTrustScope: local.requiredHostCapabilitiesByTrustScope,
                         hostAlgorithmPoliciesByTrustScope: local.hostAlgorithmPoliciesByTrustScope,
+                        hostRevocationSourcesByTrustScope: local.hostRevocationSourcesByTrustScope,
                         transitForRouteID: route.id) else { return false }
                 return transit.isLocallyReady
             }
@@ -2248,6 +2249,10 @@ final class MobileWorkspaceModel {
                     routeID: routeID, replacing: review.replacingPin)
                 try Task.checkCancellation()
                 if let failure = probe.failure { throw failure }
+                if probe.hostKey == .revoked {
+                    credentialMessage = "This server's host key is revoked. It cannot be trusted on this phone."
+                    return
+                }
                 guard let identity = probe.observedIdentity else { throw FTError.stale }
                 // No network resource remains while an OS authentication sheet
                 // finishes its brief inactive -> active transition.
@@ -3546,7 +3551,8 @@ struct OfflineRestoreSheet: View {
             ForEach(Array(review.includedFingerprints.enumerated()), id: \.offset) { _, fingerprint in
                 Text(verbatim: fingerprint).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
             }
-            ImportHostPolicyReview(document: review.document, routeReadiness: review.routeReadiness)
+            ImportHostPolicyReview(document: review.document, routeReadiness: review.routeReadiness,
+                historicalSources: review.preservedHostRevocationSourcesByTrustScope)
             if let changes = review.changeReview {
                 WorkspaceReplacementReview(changes: changes, existingName: review.existingWorkspaceName ?? review.document.name)
             }
@@ -3559,6 +3565,9 @@ struct OfflineRestoreSheet: View {
             }
             if review.preservedHostRevocationCount > 0 {
                 Text("\(review.preservedHostRevocationCount) previously accepted host-key denials remain in force.").font(.caption)
+            }
+            if review.preservedHostRevocationSourceCount > 0 {
+                Text("\(review.preservedHostRevocationSourceCount) previously accepted public revocation sources remain in force.").font(.caption)
             }
             if review.preservedHostRequirementCount > 0 {
                 Text("\(review.preservedHostRequirementCount) mandatory host-trust requirements remain in force, even if this export omits them.").font(.caption)
@@ -3700,6 +3709,65 @@ struct WorkspaceHostAlgorithmPresentation: Sendable {
     }
 }
 
+/// Resource provenance and the exact current-plus-retained denial policy used
+/// by authentication. A KRL version or timestamp describes a source; neither
+/// removes a denial already accepted on this phone.
+struct WorkspaceHostRevocationPresentation: Sendable {
+    let trustID: String
+    let sources: [WorkspaceHostRevocationSource]
+    let retainedSourceCount: Int
+    let policy: WorkspaceHostRevocationPolicy
+    var isVisible: Bool { !sources.isEmpty }
+
+    init(document: WorkspaceDocument, trustID: String,
+         historicalSources: [String: [WorkspaceHostRevocationSource]] = [:]) throws {
+        self.trustID = trustID
+        let current = try document.hostRevocationSources(forTrustID: trustID)
+        sources = try document.hostRevocationSources(forTrustID: trustID, additional: historicalSources)
+        let currentKeys = Set(current.map { $0.sourceKind + ":" + $0.sourceSHA256 })
+        retainedSourceCount = sources.filter { !currentKeys.contains($0.sourceKind + ":" + $0.sourceSHA256) }.count
+        policy = try document.hostRevocationPolicy(forTrustID: trustID, additional: historicalSources)
+    }
+
+    func deniesKnownKey(_ key: WorkspaceDocument.HostKey) -> Bool { policy.denies(presented: key) }
+}
+
+@MainActor
+private struct WorkspaceHostRevocationPolicyView: View {
+    let presentation: WorkspaceHostRevocationPresentation
+
+    var body: some View {
+        if presentation.isVisible {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Host revocation policy").font(.caption.bold())
+                Text("\(presentation.sources.count) public revocation sources apply before sign-in.").font(.caption)
+                if presentation.retainedSourceCount > 0 {
+                    Text("\(presentation.retainedSourceCount) sources retained from earlier imports still apply.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                DisclosureGroup("Revocation source details") {
+                    ForEach(Array(presentation.sources.enumerated()), id: \.offset) { _, source in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(source.sourceKind == "openssh_krl_v1" ? "OpenSSH key revocation list" : "OpenSSH revoked public keys")
+                                .font(.caption.bold())
+                            Text(verbatim: source.sourceSHA256).font(.system(.caption2, design: .monospaced))
+                                .textSelection(.enabled)
+                            if let version = source.krlVersion { Text("KRL version \(String(version))").font(.caption) }
+                            if let seconds = source.generatedAt {
+                                Text(verbatim: "Source generation timestamp: \(seconds) (Unix seconds)").font(.caption)
+                            }
+                            Text("\(source.policy.revokedSHA256.count + source.policy.revokedSHA1.count) revoked key hashes · \(source.policy.certificates.count) certificate rules")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }.padding(.vertical, 4)
+                    }
+                    Text("Source timestamps do not prove freshness. Previously accepted denials remain in force after a replacement or rollback.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }.font(.caption)
+            }.accessibilityIdentifier("host.revocations.\(presentation.trustID)")
+        }
+    }
+}
+
 @MainActor
 private struct WorkspaceHostAlgorithmPolicyView: View {
     let policy: WorkspaceHostAlgorithmPresentation
@@ -3747,6 +3815,7 @@ private struct WorkspaceHostAlgorithmPolicyView: View {
 private struct ImportHostPolicyReview: View {
     let document: WorkspaceDocument
     let routeReadiness: [WorkspaceDocument.RouteReadiness]
+    let historicalSources: [String: [WorkspaceHostRevocationSource]]
     var body: some View {
         DisclosureGroup("All host identities and jump-route policy") {
             VStack(alignment: .leading, spacing: 16) {
@@ -3769,11 +3838,15 @@ private struct ImportHostPolicyReview: View {
                         if let policy = try? WorkspaceHostAlgorithmPresentation(document: document, trustID: trust.id) {
                             WorkspaceHostAlgorithmPolicyView(policy: policy)
                         }
+                        if let policy = try? WorkspaceHostRevocationPresentation(document: document, trustID: trust.id,
+                            historicalSources: historicalSources) {
+                            WorkspaceHostRevocationPolicyView(presentation: policy)
+                        }
                         if !trust.revokedKeys.isEmpty {
                             Text("\(trust.revokedKeys.count) explicitly revoked host identities remain blocked.").font(.caption)
                         }
                         ForEach(trust.requiredPolicyRequirements.subtracting([WorkspaceDocument.hostCertificateCapability,
-                            WorkspaceDocument.hostAlgorithmPolicyCapability]).sorted(), id: \.self) { requirement in
+                            WorkspaceDocument.hostAlgorithmPolicyCapability, WorkspaceDocument.hostRevocationCapability]).sorted(), id: \.self) { requirement in
                             Text(verbatim: "Required policy: \(requirement)").font(.caption)
                         }
                     }
@@ -4640,7 +4713,7 @@ private struct WorkspaceKeysSheet: View {
                             if !document.hostTrust.isEmpty {
                                 Section {
                                     ForEach(Self.endpoints(document)) { endpoint in
-                                        hostRow(endpoint)
+                                        hostRow(endpoint, document: document)
                                     }
                                 } header: {
                                     Text("Host Keys")
@@ -4923,12 +4996,16 @@ private struct WorkspaceKeysSheet: View {
         }
     }
 
-    private func hostRow(_ endpoint: HostEndpoint) -> some View {
+    private func hostRow(_ endpoint: HostEndpoint, document: WorkspaceDocument) -> some View {
         let scopes = model.localPolicies[workspaceID]?.revokedHostKeysByTrustScope ?? [:]
         let blocked = Set(endpoint.trusts.flatMap { (scopes[$0.canonicalTrustScope] ?? []).map(\.fingerprint) })
         let unsavedScopes = model.localPolicies[workspaceID]?.unsavedHostKeysByTrustScope ?? [:]
         let unsaved = Set(endpoint.trusts.flatMap { (unsavedScopes[$0.canonicalTrustScope] ?? []).map(\.fingerprint) })
         let revoked = Set(endpoint.trusts.flatMap { $0.revokedKeys.map(\.fingerprint) })
+        let sourceHistory = model.localPolicies[workspaceID]?.hostRevocationSourcesByTrustScope ?? [:]
+        let sourcePolicies = endpoint.trusts.compactMap {
+            try? WorkspaceHostRevocationPresentation(document: document, trustID: $0.id, historicalSources: sourceHistory)
+        }
         return VStack(alignment: .leading, spacing: 10) {
             Text(verbatim: "\(endpoint.trusts[0].displayHost) port \(endpoint.trusts[0].port)").font(.headline)
             ForEach(endpoint.trusts.filter { !$0.hasConfiguredIdentity }) { trust in
@@ -4972,7 +5049,9 @@ private struct WorkspaceKeysSheet: View {
                         }.accessibilityIdentifier("hostkeys.save.\(pin.trustID)")
                     } else if blocked.contains(pin.key.fingerprint) {
                         Label("Blocked on this phone", systemImage: "xmark.shield").font(.callout)
-                    } else if revoked.contains(pin.key.fingerprint) {
+                    } else if revoked.contains(pin.key.fingerprint) || sourcePolicies.contains(where: {
+                        $0.trustID == pin.trustID && $0.deniesKnownKey(pin.key)
+                    }) {
                         Label("Revoked by this workspace", systemImage: "xmark.shield").font(.callout)
                     } else {
                         Label("Trusted for this host", systemImage: "checkmark.shield").font(.callout)
@@ -4983,6 +5062,9 @@ private struct WorkspaceKeysSheet: View {
                         }.accessibilityIdentifier("hostkeys.block.\(pin.trustID)")
                     }
                 }
+            }
+            ForEach(sourcePolicies.filter(\.isVisible), id: \.trustID) { policy in
+                WorkspaceHostRevocationPolicyView(presentation: policy)
             }
             ForEach(endpoint.trusts.filter { !$0.pins.isEmpty }) { trust in
                 if let route = model.hostKeyVerificationRoute(workspaceID: workspaceID, trustID: trust.id) {
@@ -5414,11 +5496,13 @@ private struct WorkspaceRouteChoiceScreen: View {
             let blocked = Set(trust.revokedKeys.map(\.fingerprint))
                 .union((context.local.revokedHostKeysByTrustScope[trust.canonicalTrustScope] ?? []).map(\.fingerprint))
                 .union((context.local.unsavedHostKeysByTrustScope[trust.canonicalTrustScope] ?? []).map(\.fingerprint))
-            ForEach(trust.pins.filter { !blocked.contains($0.fingerprint) }, id: \.self) { pin in
+            let revocations = try? WorkspaceHostRevocationPresentation(document: context.document, trustID: trust.id,
+                historicalSources: context.local.hostRevocationSourcesByTrustScope)
+            ForEach(trust.pins.filter { !blocked.contains($0.fingerprint) && revocations?.deniesKnownKey($0) != true }, id: \.self) { pin in
                 Text(verbatim: "Trusted host key · \(pin.algorithm) · \(pin.fingerprint)")
                     .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
             }
-            ForEach(trust.certificateAuthorities.filter { !blocked.contains($0.fingerprint) }, id: \.self) { authority in
+            ForEach(trust.certificateAuthorities.filter { !blocked.contains($0.fingerprint) && revocations?.deniesKnownKey($0) != true }, id: \.self) { authority in
                 Text(verbatim: "Trusted host certificate authority · \(authority.algorithm) · \(authority.fingerprint)")
                     .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
             }
@@ -5426,6 +5510,7 @@ private struct WorkspaceRouteChoiceScreen: View {
                 historicalPolicies: context.local.hostAlgorithmPoliciesByTrustScope) {
                 WorkspaceHostAlgorithmPolicyView(policy: policy)
             }
+            if let revocations { WorkspaceHostRevocationPolicyView(presentation: revocations) }
         }
     }
 
@@ -5913,6 +5998,17 @@ private struct MachineWorkspaceView: View {
                     }
                 }.font(.caption)
             }
+            let revocations = revocationPolicies(for: route)
+            if !revocations.isEmpty {
+                DisclosureGroup("Host revocation sources") {
+                    ForEach(Array(revocations.enumerated()), id: \.offset) { _, entry in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(verbatim: entry.endpoint).font(.caption.bold())
+                            WorkspaceHostRevocationPolicyView(presentation: entry.policy)
+                        }.padding(.vertical, 4)
+                    }
+                }.font(.caption)
+            }
             ForEach(Array((model.localPolicies[workspaceID]?.routes.first { $0.routeID == route.id }?.issues ?? []).enumerated()),
                     id: \.offset) { _, issue in
                 Label(issue.message, systemImage: "exclamationmark.circle").font(.caption)
@@ -5933,6 +6029,21 @@ private struct MachineWorkspaceView: View {
                 historicalPolicies: historical), policy.isVisible else { return nil }
             return .init(routeID: peer.id,
                 endpoint: LocalHostKeyCheckReview.endpoint(host: peer.host, port: peer.port, user: peer.user), policy: policy)
+        }
+    }
+
+    private struct RouteRevocationPolicy {
+        let endpoint: String
+        let policy: WorkspaceHostRevocationPresentation
+    }
+
+    private func revocationPolicies(for route: WorkspaceDocument.Route) -> [RouteRevocationPolicy] {
+        let peers = ((try? document.orderedJumpRoutes(forRouteID: route.id)) ?? []) + [route]
+        let historical = model.localPolicies[workspaceID]?.hostRevocationSourcesByTrustScope ?? [:]
+        return peers.compactMap { peer in
+            guard let policy = try? WorkspaceHostRevocationPresentation(document: document, trustID: peer.trustID,
+                historicalSources: historical), policy.isVisible else { return nil }
+            return .init(endpoint: LocalHostKeyCheckReview.endpoint(host: peer.host, port: peer.port, user: peer.user), policy: policy)
         }
     }
 

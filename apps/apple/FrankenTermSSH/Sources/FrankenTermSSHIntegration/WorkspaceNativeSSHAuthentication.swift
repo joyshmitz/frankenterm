@@ -56,6 +56,7 @@ public actor WorkspaceNativeSSHPasswordAuthentication: NativeSSHPasswordAuthenti
             let host = try validatePeer(peer)
             let selected = try await broker.passwordIdentity(workspaceID: workspaceID, expectedRevision: revision,
                 routeID: routeID, presentedHostKey: host.key, hostCertificate: host.certificate,
+                rawHostIdentity: host.rawIdentity,
                 negotiatedHostSignature: peer.hostSignature,
                 transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
             try checkCurrent()
@@ -202,6 +203,7 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
             try await validatePrerequisite(peer: peer)
             let selected = try await broker.keyboardInteractiveIdentity(workspaceID: workspaceID,
                 expectedRevision: revision, routeID: routeID, presentedHostKey: host.key, hostCertificate: host.certificate,
+                rawHostIdentity: host.rawIdentity,
                 negotiatedHostSignature: peer.hostSignature,
                 transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
             do {
@@ -366,7 +368,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
     /// explicit keyboard-interactive policy. Each supported method permits three jumps. A mux route
     /// authenticates like a direct one; only the destination channel differs.
     public static let routeSupport: WorkspaceDocument.RouteSupport = {
-        var capabilities: Set<String> = [WorkspaceDocument.userCertificateCapability]
+        var capabilities: Set<String> = [WorkspaceDocument.userCertificateCapability, WorkspaceDocument.hostRevocationCapability]
         if NativeSSHSession.supportsHostCertificates { capabilities.insert(WorkspaceDocument.hostCertificateCapability) }
         if NativeSSHSession.supportsHostAlgorithmPolicy { capabilities.insert(WorkspaceDocument.hostAlgorithmPolicyCapability) }
         let profile: NativeSSHHostKeyPolicy = NativeSSHSession.supportsHostCertificates ? .certificatesAndRawKeys : .rawKeys
@@ -453,6 +455,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
             try checkCurrent()
             let authorization = try await broker.authorization(workspaceID: workspaceID, expectedRevision: revision,
                 routeID: routeID, credentialID: credentialID, presentedHostKey: host.key, hostCertificate: host.certificate,
+                rawHostIdentity: host.rawIdentity,
                 negotiatedHostSignature: peer.hostSignature,
                 transitForRouteID: transitForRouteID,
                 hostKeyProbe: hostKeyProbe)
@@ -460,6 +463,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
             try checkCurrent(); try validateRoute(authorization)
             let value = try await broker.publicIdentity(workspaceID: workspaceID, expectedRevision: revision,
                 routeID: routeID, credentialID: credentialID, presentedHostKey: host.key, hostCertificate: host.certificate,
+                rawHostIdentity: host.rawIdentity,
                 negotiatedHostSignature: peer.hostSignature,
                 transportID: transportID,
                 transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
@@ -506,6 +510,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
             let request = try await broker.prepare(workspaceID: workspaceID, expectedRevision: revision,
                 routeID: routeID, credentialID: credentialID, presentedHostKey: selected.authorization.presentedHostKey,
                 hostCertificate: selected.authorization.hostCertificate,
+                rawHostIdentity: selected.authorization.rawHostIdentity,
                 negotiatedHostSignature: selected.authorization.negotiatedHostSignature,
                 transportID: transportID, sessionIdentifier: challenge.sessionIdentifier, publicBlob: selected.authenticationBlob,
                 signatureAlgorithm: challenge.algorithm,
