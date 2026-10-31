@@ -418,6 +418,11 @@ write_services() {
       local env=""
       while IFS= read -r -d '' pair; do env="$env${env:+
 }Environment=\"$pair\""; done < <(service_env)
+      # The open-file headroom the launchd plists give (NumberOfFiles). The
+      # broker holds 6 descriptors for every pane it has run (ft-9ojeh), so
+      # under the binaries' own 2048 it hits EMFILE after ~330 panes. systemd
+      # lowers a limit above the user manager's hard limit to that limit.
+      local nofile=LimitNOFILE=65536:524288
       cat > "$d/$(unit pty-broker).partial" <<EOF
 [Unit]
 Description=FrankenTerm PTY broker$SUFFIX (owns guardian-backed panes; restarting it ends them)
@@ -428,6 +433,7 @@ $env
 ExecStart=$host_script run-broker
 Restart=no
 KillMode=control-group
+$nofile
 [Install]
 WantedBy=default.target
 EOF
@@ -442,6 +448,7 @@ UMask=0077
 $env
 ExecStart=$host_script run-guardian
 Restart=no
+$nofile
 [Install]
 WantedBy=default.target
 EOF
@@ -460,6 +467,7 @@ Restart=on-failure
 RestartSec=5
 KillMode=mixed
 TimeoutStopSec=30
+$nofile
 [Install]
 WantedBy=default.target
 EOF
