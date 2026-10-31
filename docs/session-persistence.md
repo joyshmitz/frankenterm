@@ -534,6 +534,13 @@ proven:
    for those identities to coincide; it never combines an older ground offset
    with newer screen state, because replaying that suffix would duplicate
    already-applied terminal effects.
+
+   A checkpoint names its pane's position by an output record, so a pane that
+   had never printed (`sleep`, `ssh -N`, a quiet server) gave its root nothing
+   to name, and one such pane kept every pane of the host out of recovery. The
+   broker's exec bootstrap therefore writes one NUL byte to the terminal before
+   it runs the command: every broker journal starts with it, and terminals
+   ignore NUL.
 7. `Attach` returns only the exact pane, generation, and next-mutation-sequence
    identity; that reply is not continuity evidence. After claiming the observed
    generation, the mux opens an explicit authenticated `Replay` using the
@@ -587,6 +594,11 @@ The last verified checkpoint and raw-log prefix remain untouched for recovery.
 8. Guardian census is the post-crash process authority; the last committed mux
    topology manifest supplies window/tab/workspace placement. Reconciliation is
    by durable pane UUID, never by mux-local numeric pane ID or PID.
+   A pane whose child ended after the last root named it can no longer be
+   claimed (the guardian answers `PaneTerminal`). Restore leaves that pane out
+   and restores the rest. A mux that lets go of a pane whose child has exited
+   closes it in the guardian at lease sequence zero, and the guardian then
+   releases the pane. The broker still keeps every pane's journals (ft-9ojeh).
 9. Guardian shutdown is a separate, explicit operator transaction. Stopping or
    upgrading the mux must not imply guardian shutdown, child termination, log
    truncation, or retention reclamation.

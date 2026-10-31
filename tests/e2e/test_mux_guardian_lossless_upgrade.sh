@@ -14,7 +14,9 @@
 #      binary running, and every line printed before the upgrade readable
 #      exactly once, with no gap and no duplicate.
 #   3. rollback new -> old: same pane process, pane ids and history again.
-#   4. power loss (everything killed) + install: a fresh pane comes up.
+#   4. mux crashes: after SIGKILL and a restart (a service manager's), the same
+#      pane processes and history, and recovery publishes again.
+#   5. power loss (everything killed) + install: a fresh pane comes up.
 #
 # SOAK_SECONDS=N adds a soak before the upgrade: the pane first prints a
 # 3,000-line burst and then a line a second while recovery captures run
@@ -49,6 +51,14 @@
 # rollback. A reader in the pane records what reached its PTY: every line must
 # arrive exactly once and in order, and recovery must go on publishing, as one
 # input that met a busy guardian once stopped its pane's captures for good.
+#
+# E2E_MUX_CRASHES=N (default 2) kills the mux N times. A guardian serves every
+# mux that ever owned a pane, so N of 2 is already more muxes than one used to
+# outlive. Every third round dies with a line being typed at it, and every
+# third round's successor dies too, part way through its restore. With more
+# than three panes, the last one never prints and the one before it ends just
+# before the first crash; with more than four, another ends while no mux runs.
+# One pane ending must cost nothing but that pane.
 set -uo pipefail
 # The guardian refuses group- or world-writable directories on its paths
 # (a umask of 002 on some hosts); keep any stricter umask.
@@ -102,6 +112,7 @@ BURST=""
 # ticking "$MARK pk tick". The guardian's stage, catalog and replay limits
 # are per guardian, so one pane alone never meets them.
 PANES=${E2E_PANES:-1}
+PANES_AT_START=$PANES
 IMAGES=${E2E_IMAGES:-0}
 INPUT_LINES=${E2E_INPUT_LINES:-40}
 RECEIVED=$S/input-received
@@ -141,8 +152,16 @@ images() {  # -> shell commands showing and storing the images
   [ "$SCROLL" -gt 0 ] && echo "sleep 3; printf '\\033]1337;File=inline=1:'; cat '$HOME/scroll-image.b64'; printf '\\007\\n'; j=0; while [ \$j -lt $SCROLL ]; do echo scroll \$j; j=\$((j+1)); done; "
 }
 PROTECTED=${E2E_PROTECTED:-0}
+# With more than three panes the last one never prints, as a pane running
+# sleep, ssh -N or a quiet server does, and the one before it ends part way
+# through: its child dies just before the first mux crash.
+SILENT=/bin/sleep\ 9$$
 prog() {  # <pane index> -> its shell program
   local tag="" burst="" shown=""
+  if [ "$PANES" -gt 3 ] && [ "$1" = $((PANES - 1)) ]; then
+    echo "exec $SILENT"
+    return
+  fi
   [ "$1" -gt 0 ] && tag="p$1 "
   [ "$1" = 0 ] && burst=$READER$BURST
   [ "$IMAGES" = 1 ] && [ $(( $1 % 2 )) = 1 ] && shown=$(images | tr -d '\n')
@@ -195,7 +214,7 @@ for p in json.load(sys.stdin).get("data") or []: print(p["pane_id"])' 2>/dev/nul
 # ticks exactly once, from 0 with no gap.
 check_other_panes() {
   [ "$PANES" -gt 1 ] || return 0
-  local id text tag t n last dups good=0
+  local id text tag t n last dups good=0 silent=0
   for id in $(pane_ids "$2"); do
     text=$(ft_text "$2" "$id")
     tag=$(echo "$text" | grep -o "$MARK p[0-9]* tick" | head -1 | awk '{print $2}')
@@ -203,6 +222,17 @@ check_other_panes() {
       # Pane 0 ticks untagged (check_history reads it); any other pane
       # without a tick row lost its history or could not be read.
       echo "$text" | grep -q "$MARK tick" && continue
+      # The one silent pane: a read that worked and found nothing. A failed
+      # read is empty too, and must not pass for it.
+      if [ "$PANES_AT_START" -gt 3 ] && [ "$silent" = 0 ] \
+        && [ "$(echo "$text" | python3 -c 'import json,sys
+print("text" if json.load(sys.stdin)["data"]["text"].strip() else "empty")' 2>/dev/null)" = empty ]; then
+        silent=1
+        SEEN_SILENT=$(pgrep -f "^$SILENT\$")
+        if [ -n "$SEEN_SILENT" ] && [ "$SEEN_SILENT" = "$SILENT_PID" ]; then good=$((good + 1)); continue; fi
+        fail "the silent pane's process changed after $1: ${SILENT_PID:-none} -> ${SEEN_SILENT:-none}"
+        continue
+      fi
       fail "pane $id shows no tick rows after $1 (get-text: $(echo "$text" | head -c 900); read: $(text_read_diagnostics))"
       continue
     fi
@@ -297,6 +327,21 @@ if "$TOOL" install --family "$OLD" --manager direct; then pass "install"; else f
 sleep 4
 PID1=$(child_pid)
 [ -n "$PID1" ] && pass "pane process $PID1 running" || fail "no pane process"
+# Every later step counts panes: say plainly if the startup hook's spawns fell
+# short, and go on with the panes that came up.
+UP=0
+for _ in $(seq 120); do
+  UP=$(pane_ids "$OLD" | grep -c .)
+  [ "$UP" -ge "$PANES" ] && break
+  sleep 1
+done
+if [ "$UP" = "$PANES" ]; then
+  pass "all $PANES panes up"
+else
+  fail "only $UP of $PANES panes came up at startup"
+  PANES=$UP
+fi
+SILENT_PID=$(pgrep -f "^$SILENT\$")
 "$TOOL" status
 
 if [ "$SOAK" -gt 0 ]; then
@@ -407,6 +452,93 @@ check_history rollback "$OLD"
 check_other_panes rollback "$OLD"
 check_image_restores rollback "$RESTORES"
 [ "$INPUT_LINES" -gt 0 ] && check_one_input rollback "$OLD"
+
+end_pane() {  # <pane index>
+  local child
+  child=$(pgrep -f "^/bin/bash -c .*echo \"$MARK p$1 tick" | head -1)
+  if [ -z "$child" ]; then
+    fail "pane p$1 has no child to end"
+    return
+  fi
+  kill -KILL "$child" && pass "pane p$1's child killed"
+  PANES=$((PANES - 1))
+}
+# The guardian's reason to exist: the mux dies at a moment nobody chose, here
+# in the middle of a capture, and its service manager starts it again.
+for round in $(seq "${E2E_MUX_CRASHES:-2}"); do
+  step "mux crash $round"
+  LOG=$STATE/logs/mux-server.log
+  RESTORES=$(image_restores)
+  # The second round of every three dies with a line being typed at it.
+  SENDER=""
+  if [ "$INPUT_LINES" -gt 0 ] && [ $(( round % 3 )) = 2 ]; then
+    ( k=0; while :; do ft_send "$OLD" "e2e-race-$round-$k" > /dev/null; k=$((k + 1)); done ) &
+    SENDER=$!
+    sleep 2
+  fi
+  # A pane's child can die just after the last recovery root named the pane.
+  if [ "$round" = 1 ] && [ "$PANES_AT_START" -gt 3 ]; then
+    end_pane $((PANES_AT_START - 2))
+    sleep 1
+  fi
+  MUX=$(cat "$STATE/run.mux-server.pid")
+  ps -o pid=,command= -p "$MUX" | cut -c1-120
+  kill -KILL "$MUX" && pass "mux $MUX killed"
+  for _ in $(seq 40); do kill -0 "$MUX" 2>/dev/null || break; sleep 0.25; done
+  if [ -n "$SENDER" ]; then
+    kill "$SENDER" 2>/dev/null
+    wait "$SENDER" 2>/dev/null
+  fi
+  # Or while no mux runs at all.
+  [ "$round" = 2 ] && [ "$PANES_AT_START" -gt 4 ] && end_pane $((PANES_AT_START - 3))
+  # Output printed while no mux runs must not be lost either.
+  sleep 5
+  # Every third round's successor dies too, part way through its restore.
+  if [ $(( round % 3 )) = 0 ]; then
+    "$TOOL" install --family "$OLD" --manager direct > /dev/null 2>&1 &
+    RESTARTER=$!
+    sleep $(( 1 + round / 3 ))
+    MUX=$(cat "$STATE/run.mux-server.pid")
+    grep -c . "$LOG" | sed 's/^/log lines at the second kill: /'
+    kill -KILL "$MUX" && pass "restoring mux $MUX killed"
+    for _ in $(seq 40); do kill -0 "$MUX" 2>/dev/null || break; sleep 0.25; done
+    kill "$RESTARTER" 2>/dev/null
+    wait "$RESTARTER" 2>/dev/null
+    sleep 1
+  fi
+  CRASH_BEFORE=$(grep -c "published local generation" "$LOG")
+  CRASH_T0=$(date +%s)
+  if "$TOOL" install --family "$OLD" --manager direct; then pass "the mux came back"; else fail "the mux did not come back"; fi
+  IDS=""
+  for _ in $(seq 120); do
+    IDS=$(pane_ids "$OLD" | grep -c .)
+    [ "$IDS" = "$PANES" ] && break
+    sleep 1
+  done
+  echo "restored $IDS of $PANES panes in $(( $(date +%s) - CRASH_T0 )) s"
+  [ "$IDS" = "$PANES" ] && pass "all $PANES panes back after crash $round" \
+    || fail "only ${IDS:-0} of $PANES panes after crash $round"
+  PIDC=$(child_pid)
+  [ "$PID1" = "$PIDC" ] && pass "same pane process after crash $round" \
+    || fail "pane process changed across crash $round: $PID1 -> ${PIDC:-none}"
+  check_history "crash-$round" "$OLD"
+  check_other_panes "crash-$round" "$OLD"
+  check_image_restores "crash-$round" "$RESTORES"
+  [ "$INPUT_LINES" -gt 0 ] && check_one_input "crash-$round" "$OLD"
+  if [ "$INPUT_LINES" -gt 0 ]; then
+    REPEATED=$(sort "$RECEIVED" | uniq -d | grep -c .)
+    [ "$REPEATED" = 0 ] && pass "no line reached pane 0 twice ($(grep -c . "$RECEIVED") so far)" \
+      || fail "$REPEATED line(s) reached pane 0 twice after crash $round"
+  fi
+  AFTER=$CRASH_BEFORE
+  for _ in $(seq 150); do
+    [ "$AFTER" -gt "$CRASH_BEFORE" ] && break
+    sleep 1
+    AFTER=$(grep -c "published local generation" "$LOG")
+  done
+  [ "$AFTER" -gt "$CRASH_BEFORE" ] && pass "recovery published again after crash $round" \
+    || fail "recovery published nothing in the 150 s after crash $round"
+done
 
 step "power loss + reinstall"
 for f in "$STATE"/run.*.pid; do kill -KILL "$(cat "$f")" 2>/dev/null; done
