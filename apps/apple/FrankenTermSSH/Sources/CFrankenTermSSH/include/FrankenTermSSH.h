@@ -74,6 +74,12 @@ int ftssh_create(int connected_fd, size_t max_allocated, ftssh_session **result)
 enum { FTSSH_HOST_RAW = 0, FTSSH_HOST_CERTIFICATE = 1, FTSSH_HOST_MIXED = 2 };
 int ftssh_supports_host_certificates(void);
 int ftssh_set_host_key_policy(ftssh_session *session, int policy);
+/* An exact ordered subset of the qualified host-signature names, never key
+ * blob labels or OpenSSH list expressions. Nonempty CSV, at most 1023 bytes;
+ * duplicate/unknown names and mutation after handshake admission are refused.
+ * The caller still verifies the negotiated method and mutable trust policy. */
+int ftssh_supports_host_algorithm_policy(void);
+int ftssh_set_host_key_algorithms(ftssh_session *session, const uint8_t *algorithms, size_t length);
 /* FTSSH_NEGOTIATION: the server answered, and no exchange both accept was
  * agreed. A transport that failed or closed first, with no disconnect message
  * from the server, is FTSSH_IO. */
