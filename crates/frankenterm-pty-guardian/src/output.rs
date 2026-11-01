@@ -6396,6 +6396,14 @@ fn guardian_replay_capture_output(
         bookmarks
             .try_reserve_exact(2)
             .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+        // A live tail resumes where the previous snapshot ended, the end of
+        // the prefix this reader was opened after. Start there instead of
+        // walking the segment from its first record (ft-6wm86).
+        if let Some(cursor) = opened
+            .frozen_replay_cursor_after_prefix(authority.policy.journal_limits.max_record_bytes)?
+        {
+            bookmarks.push_back(cursor.bookmark()?);
+        }
         segments.push(GuardianReplayOutputSegmentPin {
             authority: segment.clone(),
             committed_bytes: opened.committed_bytes(),
@@ -20433,6 +20441,27 @@ mod tests {
             .replay_prefixes
             .clear();
         let whole = guardian_replay_capture_output(&journal, descriptor, Some(&origin))?;
+        // A live tail's page after the first snapshot's terminal record starts
+        // where the resumed reader's prefix ends and walks none of it; the
+        // whole snapshot walks to it from the segment start (ft-6wm86).
+        for (pin, walked) in [(&resumed, 0), (&whole, 1)] {
+            let (records, receipt) =
+                guardian_replay_output_page(pin, 2, alpha.record_digest(), 64, 8)?;
+            assert_eq!(receipt, last);
+            let mut text = Vec::new();
+            for record in records.into_records() {
+                record.write_all_bounded(&mut text, 64)?;
+            }
+            assert_eq!(text, b"betagamma");
+            assert_eq!(
+                pin.segments[0]
+                    .read_work
+                    .lock()
+                    .map_err(|_| "poisoned read work")?
+                    .historical_frames,
+                walked
+            );
+        }
         for pin in [&resumed, &whole] {
             assert_eq!(pin.terminal_sequence, 3);
             assert_eq!(pin.terminal_record_digest, last.record_digest());

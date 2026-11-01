@@ -3363,6 +3363,8 @@ pub struct GuardianOutputJournal {
 #[cfg(unix)]
 pub struct GuardianOutputJournalReader {
     authenticated: GuardianOutputJournal,
+    /// The prefix [`Self::open_existing_after`] continued authenticating from.
+    opened_after: Option<GuardianOutputAuthenticatedPrefix>,
 }
 
 #[cfg(unix)]
@@ -4463,6 +4465,7 @@ impl GuardianOutputJournalReader {
             authenticated: GuardianOutputJournal::authenticate_existing(
                 file, identity, cipher, limits, false,
             )?,
+            opened_after: None,
         })
     }
 
@@ -4519,7 +4522,37 @@ impl GuardianOutputJournalReader {
             authenticated: GuardianOutputJournal::authenticate_existing_after(
                 file, identity, cipher, limits, prefix,
             )?,
+            opened_after: Some(*prefix),
         })
+    }
+
+    /// A [`Self::frozen_replay_cursor`] positioned just past the prefix
+    /// [`Self::open_existing_after`] opened this reader after, without reading
+    /// that prefix's records again: they were authenticated when the prefix
+    /// was proved, and this view's authentication continued from its chain
+    /// state. Records past it are authenticated as they are read, and the end
+    /// of this view is checked as always. None for a reader opened whole.
+    ///
+    /// A live tail resumes where its previous snapshot ended, which is that
+    /// prefix's end. Reaching it by walking the segment from its first record
+    /// grew with the segment (ft-6wm86).
+    pub fn frozen_replay_cursor_after_prefix(
+        &self,
+        max_record_plaintext_bytes: u32,
+    ) -> Result<Option<GuardianOutputRecoveryCursor>, GuardianOutputJournalError> {
+        let prefix = match self.opened_after {
+            Some(prefix) => prefix.scanned,
+            None => return Ok(None),
+        };
+        let mut cursor = self
+            .frozen_replay_cursor(self.identity().first_sequence(), max_record_plaintext_bytes)?;
+        cursor.offset = prefix.committed_bytes;
+        cursor.record_count = prefix.record_count;
+        cursor.cumulative_plaintext_bytes = prefix.cumulative_plaintext_bytes;
+        cursor.next_sequence = prefix.next_sequence;
+        cursor.terminal_receipt = prefix.terminal_receipt;
+        cursor.authenticated_prefix_digest = prefix.authenticated_prefix_digest;
+        Ok(Some(cursor))
     }
 
     #[must_use]
@@ -7450,6 +7483,118 @@ mod tests {
             ),
             Err(GuardianOutputJournalError::ExternalLengthChange { .. })
         ));
+    }
+
+    /// A reader opened after a prefix starts replay at that prefix's end
+    /// without verifying its records again, serves what was appended exactly
+    /// as a walk from the segment start does, and still checks this view's
+    /// end. A reader opened whole has no such cursor (ft-6wm86).
+    #[cfg(unix)]
+    #[test]
+    fn cursor_after_an_authenticated_prefix_starts_at_its_end_without_rereading_it() {
+        let directory = tempfile::tempdir().expect("create resume directory");
+        let path = directory.path().join("resume.ftgout");
+        let parent = File::open(directory.path()).expect("open resume parent");
+        let limits = GuardianOutputJournalLimits::default();
+        let mut journal = create_new_test_journal(&parent, &path, identity(), cipher(), limits)
+            .expect("create resume journal");
+        journal
+            .sync_parent_directory_and_activate()
+            .expect("activate resume journal");
+        journal.append_and_sync(b"first").expect("append first");
+        let second = journal.append_and_sync(b"second").expect("append second");
+        let open = || {
+            GuardianOutputJournalReader::open_existing(
+                open_read_only_journal_file(&path),
+                identity(),
+                cipher(),
+                limits,
+            )
+            .expect("authenticate the whole segment")
+        };
+        let resume_after = |prefix: &GuardianOutputAuthenticatedPrefix| {
+            GuardianOutputJournalReader::open_existing_after(
+                open_read_only_journal_file(&path),
+                identity(),
+                cipher(),
+                limits,
+                prefix,
+            )
+            .expect("authenticate only the appended records")
+        };
+        let prefix = open()
+            .authenticated_prefix()
+            .expect("read the prefix header")
+            .expect("a clean tail has a prefix");
+        let third = journal.append_and_sync(b"third").expect("append third");
+        let fourth = journal.append_and_sync(b"fourth").expect("append fourth");
+        let full = open();
+        assert!(full
+            .frozen_replay_cursor_after_prefix(1024)
+            .expect("ask a whole reader")
+            .is_none());
+
+        let resumed = resume_after(&prefix);
+        let mut cursor = resumed
+            .frozen_replay_cursor_after_prefix(1024)
+            .expect("mint the prefix-end cursor")
+            .expect("a reader opened after a prefix has one");
+        assert_eq!(cursor.next_sequence(), Some(3));
+        let bookmark = cursor.bookmark().expect("bookmark the prefix end");
+        assert_eq!(
+            resumed
+                .receipt_before_bookmark(&bookmark)
+                .expect("recover the prefix's last receipt"),
+            Some(second)
+        );
+        let mut walked = full
+            .frozen_replay_cursor(1, 1024)
+            .expect("walk from the segment start");
+        for _ in 0..2 {
+            walked
+                .next_record()
+                .expect("walk a prefix record")
+                .expect("a prefix record");
+        }
+        for expected in [third, fourth] {
+            for reading in [&mut cursor, &mut walked] {
+                let record = reading
+                    .next_record()
+                    .expect("read an appended record")
+                    .expect("an appended record");
+                assert_eq!(record.receipt(), expected);
+            }
+        }
+        assert!(cursor
+            .next_record()
+            .expect("this view's end checks out")
+            .is_none());
+        assert_eq!(cursor.verified_record_count(), 2);
+        assert_eq!(walked.verified_record_count(), 4);
+        let mut again = resumed
+            .cursor_from_bookmark(&bookmark)
+            .expect("resume the prefix-end bookmark");
+        assert_eq!(
+            again
+                .next_record()
+                .expect("read after the bookmark")
+                .expect("the third record")
+                .receipt(),
+            third
+        );
+
+        // Nothing appended since the prefix: the cursor starts at the end.
+        let latest = full
+            .authenticated_prefix()
+            .expect("latest prefix header")
+            .expect("latest prefix");
+        let mut idle = resume_after(&latest)
+            .frozen_replay_cursor_after_prefix(1024)
+            .expect("mint the idle cursor")
+            .expect("an idle reader opened after a prefix has one");
+        assert_eq!(idle.next_sequence(), Some(5));
+        assert!(idle.next_record().expect("the idle view's end").is_none());
+        assert_eq!(idle.verified_record_count(), 0);
     }
 
     #[cfg(unix)]
