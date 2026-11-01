@@ -580,6 +580,13 @@ const CHECKPOINT_CATALOG_SUMMARY_SETTLE: std::time::Duration = std::time::Durati
 /// store open before it forgets those.
 const CHECKPOINT_CATALOG_VALIDATED_MEMO_SCOPES: usize = 64;
 
+/// Replay censuses a memo remembers before it starts over.
+const CHECKPOINT_CATALOG_CENSUS_ENTRIES: usize = 1024;
+
+/// Scopes whose catalog changes `CheckpointCatalogEpochs` tracks one by one
+/// before it starts over.
+const CHECKPOINT_CATALOG_EPOCH_ENTRIES: usize = 16 * 1024;
+
 /// What every store of this process shares about one output directory's
 /// catalogs under one key.
 #[derive(Default)]
@@ -591,6 +598,104 @@ struct CheckpointCatalogMemo {
     /// of the file they were read from (see
     /// `checkpoint_catalog_read_published_candidate`).
     summaries: Mutex<BTreeMap<CheckpointCatalogFileStamp, Arc<CheckpointCatalogCandidateSummary>>>,
+    /// Replay Opens' scans by scope, each with the catalog epoch read before
+    /// its listing began (see `checkpoint_catalog_replay_census`).
+    censuses: Mutex<BTreeMap<CheckpointCatalogScope, (u64, Arc<CheckpointCatalogScan>)>>,
+}
+
+/// Which catalog files this process has created, renamed or unlinked, as
+/// epochs by output directory (device, inode) and scope. Every change takes
+/// a new epoch, larger than any before it, so a scan whose listing began at
+/// the scope's current epoch still describes the scope. Only this guardian
+/// changes catalog files: they are written by its checkpoint worker alone,
+/// and the stores other processes open write custody and claim files.
+struct CheckpointCatalogEpochs {
+    /// The last epoch handed out.
+    last: u64,
+    /// The epoch every scope is at least: raised when the maps start over.
+    floor: u64,
+    /// By directory, after a change to a catalog name of no parsed scope.
+    directories: BTreeMap<(u64, u64), u64>,
+    scopes: BTreeMap<((u64, u64), CheckpointCatalogScope), u64>,
+}
+
+static CHECKPOINT_CATALOG_EPOCHS: Mutex<CheckpointCatalogEpochs> =
+    Mutex::new(CheckpointCatalogEpochs {
+        last: 0,
+        floor: 0,
+        directories: BTreeMap::new(),
+        scopes: BTreeMap::new(),
+    });
+
+impl CheckpointCatalogEpochs {
+    fn current(&self, directory: (u64, u64), scope: CheckpointCatalogScope) -> u64 {
+        let in_directory = self.directories.get(&directory).copied().unwrap_or(0);
+        let in_scope = self.scopes.get(&(directory, scope)).copied().unwrap_or(0);
+        self.floor.max(in_directory).max(in_scope)
+    }
+
+    /// A change in `scope` of `directory`; `None` stands for every scope of
+    /// the directory, or for every directory.
+    fn advance(&mut self, directory: Option<(u64, u64)>, scope: Option<CheckpointCatalogScope>) {
+        // At a billion changes a second this lasts five centuries.
+        self.last += 1;
+        match (directory, scope) {
+            (Some(directory), Some(scope)) => {
+                if self.scopes.len() >= CHECKPOINT_CATALOG_EPOCH_ENTRIES
+                    && !self.scopes.contains_key(&(directory, scope))
+                {
+                    self.scopes.clear();
+                    self.floor = self.last;
+                }
+                self.scopes.insert((directory, scope), self.last);
+            }
+            (Some(directory), None) => {
+                if self.directories.len() >= CHECKPOINT_CATALOG_EPOCH_ENTRIES
+                    && !self.directories.contains_key(&directory)
+                {
+                    self.directories.clear();
+                    self.floor = self.last;
+                }
+                self.directories.insert(directory, self.last);
+            }
+            (None, _) => {
+                self.scopes.clear();
+                self.directories.clear();
+                self.floor = self.last;
+            }
+        }
+    }
+}
+
+fn checkpoint_catalog_epoch(directory: DirectoryIdentity, scope: CheckpointCatalogScope) -> u64 {
+    CHECKPOINT_CATALOG_EPOCHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .current((directory.device, directory.inode), scope)
+}
+
+/// Record that the entry `name` of `directory` was just created, renamed or
+/// unlinked, if it is a catalog file. Called after the change, so a scan
+/// that read the epoch before it began listing sees the change or is
+/// outdated by it. Every create, rename and unlink of a catalog file goes
+/// through `open_private_file_at`, `checkpoint_catalog_publish_noreplace`,
+/// `checkpoint_unlink_record_path` or `unlink_owned_output_file`.
+fn checkpoint_catalog_note_entry_change(directory: &File, name: &OsStr) {
+    let Some(name) = name.to_str() else {
+        return;
+    };
+    if !name.starts_with(CHECKPOINT_CATALOG_FILE_PREFIX) {
+        return;
+    }
+    let directory = directory
+        .metadata()
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()));
+    let scope = checkpoint_catalog_parse_path(name).map(|(identity, _)| identity.scope);
+    CHECKPOINT_CATALOG_EPOCHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .advance(directory, scope);
 }
 
 /// The memo every store of this process shares for one output directory
@@ -5810,6 +5915,49 @@ fn guardian_replay_retry_page(
     }
 }
 
+/// The scan a replay Open selects from. Live tails open a snapshot for every
+/// burst of output, about 100 a second at 60 panes, and a scan lists the
+/// whole output directory (every pane's journals, uploads and custody files)
+/// and opens every catalog file of its scope: the larger part of the
+/// checkpoint worker's time, which captures queued behind (ft-6wm86). A scan
+/// is remembered while its scope's catalog epoch (`CheckpointCatalogEpochs`)
+/// stays where it was before the listing began, unless `fresh`. Its stamps
+/// come from an earlier lock hold, so `remembered` tells the caller to read
+/// candidates as pinned ones; every page re-reads its pins by identity.
+fn checkpoint_catalog_replay_census(
+    inner: &GuardianCheckpointStageStoreInner,
+    scope: CheckpointCatalogScope,
+    fresh: bool,
+    remembered: &mut bool,
+) -> Result<Arc<CheckpointCatalogScan>, GuardianCheckpointStageStoreError> {
+    let epoch = checkpoint_catalog_epoch(inner.persistence.directory_identity, scope);
+    if !fresh {
+        let census = inner
+            .catalog_memo
+            .censuses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&scope)
+            .filter(|(at, _)| *at == epoch)
+            .map(|(_, scan)| Arc::clone(scan));
+        if let Some(scan) = census {
+            *remembered = true;
+            return Ok(scan);
+        }
+    }
+    let scan = Arc::new(checkpoint_catalog_scan(inner, scope)?);
+    let mut censuses = inner
+        .catalog_memo
+        .censuses
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if censuses.len() >= CHECKPOINT_CATALOG_CENSUS_ENTRIES && !censuses.contains_key(&scope) {
+        censuses.clear();
+    }
+    censuses.insert(scope, (epoch, Arc::clone(&scan)));
+    Ok(scan)
+}
+
 fn guardian_replay_open_snapshot(
     inner: &GuardianCheckpointStageStoreInner,
     request: &AuthenticatedGuardianRequest,
@@ -5820,12 +5968,58 @@ fn guardian_replay_open_snapshot(
     genesis_origin: Option<&GuardianGenesisReplayOriginV1>,
     access_epoch: u64,
 ) -> Result<GuardianReplaySnapshot, GuardianCheckpointStageStoreError> {
+    let open = |fresh, remembered: &mut bool| {
+        guardian_replay_open_snapshot_from(
+            inner,
+            request,
+            selector,
+            max_plaintext_bytes,
+            max_records,
+            journal,
+            genesis_origin,
+            access_epoch,
+            fresh,
+            remembered,
+        )
+    };
+    let mut remembered = false;
+    match open(false, &mut remembered) {
+        // A remembered census is exact unless a catalog change escaped its
+        // epoch; should one have, the Open fails closed on the files it
+        // names, and runs once more from a fresh listing.
+        Err(error) if remembered => {
+            log::debug!(
+                "guardian replay open from a remembered catalog census failed ({error:?}); listing afresh"
+            );
+            open(true, &mut remembered)
+        }
+        opened => opened,
+    }
+}
+
+fn guardian_replay_open_snapshot_from(
+    inner: &GuardianCheckpointStageStoreInner,
+    request: &AuthenticatedGuardianRequest,
+    selector: GuardianReplaySelectorV1,
+    max_plaintext_bytes: u32,
+    max_records: u16,
+    journal: Option<&GuardianPaneOutputJournal>,
+    genesis_origin: Option<&GuardianGenesisReplayOriginV1>,
+    access_epoch: u64,
+    fresh: bool,
+    remembered: &mut bool,
+) -> Result<GuardianReplaySnapshot, GuardianCheckpointStageStoreError> {
     let pane_id = request
         .header()
         .pane_id
         .ok_or(GuardianCheckpointStageStoreError::Conflict)?;
     let generation = request.header().lease_generation;
-    let mut scan = checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id })?;
+    let mut scan = checkpoint_catalog_replay_census(
+        inner,
+        CheckpointCatalogScope::Pane { pane_id },
+        fresh,
+        remembered,
+    )?;
     checkpoint_catalog_require_settled_for_generic_restore(&scan)?;
     checkpoint_catalog_validate_generic_restore_evidence(&scan)?;
     let has_evidence = |member: &PublishedCheckpointCatalogMember| {
@@ -5875,11 +6069,13 @@ fn guardian_replay_open_snapshot(
         {
             return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
         }
-        scan = checkpoint_catalog_scan(
+        scan = checkpoint_catalog_replay_census(
             inner,
             CheckpointCatalogScope::Genesis {
                 spawn_effect_id: origin.reservation.spawn_effect_id,
             },
+            fresh,
+            remembered,
         )?;
         checkpoint_catalog_require_settled_for_generic_restore(&scan)?;
         let [member] = scan.published.as_slice() else {
@@ -5937,6 +6133,7 @@ fn guardian_replay_open_snapshot(
         inner,
         &catalog.selected,
         catalog.genesis_origin.as_ref(),
+        *remembered,
     )?;
     if (catalog.genesis_origin.is_none() && descriptor.durable_pane_id() != Some(pane_id))
         || descriptor.capture_generation() > generation
@@ -6026,10 +6223,13 @@ fn guardian_replay_open_snapshot(
     Ok(snapshot)
 }
 
+/// `pinned` when `member` comes from a census listed under an earlier lock
+/// hold, whose stamp may no longer describe the file.
 fn guardian_replay_open_catalog_descriptor(
     inner: &GuardianCheckpointStageStoreInner,
     member: &PublishedCheckpointCatalogMember,
     genesis_origin: Option<&GuardianGenesisReplayOriginV1>,
+    pinned: bool,
 ) -> Result<GuardianCheckpointDescriptorV1, GuardianCheckpointStageStoreError> {
     if member.format != CheckpointCatalogFormat::ProtectedV3
         || (genesis_origin.is_none()
@@ -6040,12 +6240,20 @@ fn guardian_replay_open_catalog_descriptor(
     {
         return Err(GuardianCheckpointStageStoreError::Conflict);
     }
-    let (candidate, source) = checkpoint_catalog_read_published_candidate(
-        inner,
-        &member.candidate_path,
-        member.candidate_file_identity,
-        member.candidate_file_stamp,
-    )?;
+    let (candidate, source) = if pinned {
+        checkpoint_catalog_reread_published_candidate(
+            inner,
+            &member.candidate_path,
+            member.candidate_file_identity,
+        )?
+    } else {
+        checkpoint_catalog_read_published_candidate(
+            inner,
+            &member.candidate_path,
+            member.candidate_file_identity,
+            member.candidate_file_stamp,
+        )?
+    };
     if candidate.format != CheckpointCatalogFormat::ProtectedV3
         || candidate.metadata != member.metadata
         || candidate.checksum != member.candidate_checksum
@@ -8457,9 +8665,11 @@ fn checkpoint_unlink_record_path(
     let identity = FileIdentity::capture(&metadata, Some(metadata.len()));
     drop(file);
     let name = output_child_name(&inner.directory_path, path)?;
-    rustix::fs::unlinkat(&inner.directory, name, rustix::fs::AtFlags::empty()).map_err(
-        |error| GuardianCheckpointStageStoreError::io("checkpoint-reclaim-unlink", error.into()),
-    )?;
+    let unlinked = rustix::fs::unlinkat(&inner.directory, name, rustix::fs::AtFlags::empty());
+    checkpoint_catalog_note_entry_change(&inner.directory, name);
+    unlinked.map_err(|error| {
+        GuardianCheckpointStageStoreError::io("checkpoint-reclaim-unlink", error.into())
+    })?;
     inner
         .durable_records
         .lock()
@@ -12200,14 +12410,16 @@ fn open_private_file_at(
     if create_new {
         flags |= rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL;
     }
-    rustix::fs::openat(
+    let opened = rustix::fs::openat(
         directory,
         name,
         flags,
         rustix::fs::Mode::from_raw_mode(0o600),
-    )
-    .map(File::from)
-    .map_err(|error| {
+    );
+    if create_new {
+        checkpoint_catalog_note_entry_change(directory, name);
+    }
+    opened.map(File::from).map_err(|error| {
         GuardianOutputError::io("output-private-file-open-at", std::io::Error::from(error))
     })
 }
@@ -12306,8 +12518,9 @@ fn unlink_owned_output_file(
 ) -> Result<u64, GuardianOutputError> {
     let bytes = owned_output_file_len(directory, directory_path, path, identity)?;
     let name = output_child_name(directory_path, path)?;
-    rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty())
-        .map_err(|error| GuardianOutputError::io("output-reclaim-unlink", error.into()))?;
+    let unlinked = rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty());
+    checkpoint_catalog_note_entry_change(directory, name);
+    unlinked.map_err(|error| GuardianOutputError::io("output-reclaim-unlink", error.into()))?;
     Ok(bytes)
 }
 
@@ -14881,14 +15094,16 @@ fn checkpoint_catalog_publish_noreplace(
     staging_name: &OsStr,
     canonical_name: &OsStr,
 ) -> std::io::Result<()> {
-    rustix::fs::renameat_with(
+    let renamed = rustix::fs::renameat_with(
         directory,
         staging_name,
         directory,
         canonical_name,
         rustix::fs::RenameFlags::NOREPLACE,
-    )
-    .map_err(std::io::Error::from)
+    );
+    checkpoint_catalog_note_entry_change(directory, staging_name);
+    checkpoint_catalog_note_entry_change(directory, canonical_name);
+    renamed.map_err(std::io::Error::from)
 }
 
 #[cfg(not(any(
@@ -18840,7 +19055,7 @@ mod tests {
                     checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
                 let member = &scan.published[0];
                 checkpoint_catalog_require_existing_ack(inner, member)?;
-                guardian_replay_open_catalog_descriptor(inner, member, None)
+                guardian_replay_open_catalog_descriptor(inner, member, None, false)
             })
         };
 
@@ -19302,6 +19517,270 @@ mod tests {
                 "member {catalog_generation}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_epochs_advance_for_each_catalog_change_in_its_scope_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first = CheckpointCatalogScope::Pane {
+            pane_id: Uuid::from_u128(0xd3001),
+        };
+        let second = CheckpointCatalogScope::Pane {
+            pane_id: Uuid::from_u128(0xd3002),
+        };
+        let mut epochs = CheckpointCatalogEpochs {
+            last: 0,
+            floor: 0,
+            directories: BTreeMap::new(),
+            scopes: BTreeMap::new(),
+        };
+        let (left, right) = ((1, 1), (1, 2));
+        let start = epochs.current(left, first);
+        epochs.advance(Some(left), Some(first));
+        let changed = epochs.current(left, first);
+        assert!(changed > start);
+        assert_eq!(epochs.current(left, second), start);
+        assert_eq!(epochs.current(right, first), start);
+        // A catalog name of no parsed scope outdates the whole directory.
+        epochs.advance(Some(left), None);
+        assert!(epochs.current(left, first) > changed);
+        assert!(epochs.current(left, second) > start);
+        assert_eq!(epochs.current(right, first), start);
+        // Starting over puts every scope past every epoch handed out before.
+        let before = epochs.last;
+        for pane in 0..=u128::try_from(CHECKPOINT_CATALOG_EPOCH_ENTRIES)? {
+            epochs.advance(
+                Some(right),
+                Some(CheckpointCatalogScope::Pane {
+                    pane_id: Uuid::from_u128(0xd4000 + pane),
+                }),
+            );
+        }
+        assert!(epochs.scopes.len() <= CHECKPOINT_CATALOG_EPOCH_ENTRIES);
+        for (directory, scope) in [(left, first), (left, second), (right, first)] {
+            assert!(epochs.current(directory, scope) > before);
+        }
+        epochs.advance(None, None);
+        assert_eq!(epochs.current(right, second), epochs.last);
+
+        // Every create, rename and unlink of a catalog file advances its
+        // scope's epoch; other files of the directory leave it alone.
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-epochs-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let inner = &store.inner;
+        let identity = CheckpointCatalogIdentity {
+            scope: first,
+            generation: 1,
+            candidate_id: Uuid::from_u128(0xd3003),
+        };
+        let canonical =
+            checkpoint_catalog_path(inner, identity, CheckpointCatalogPathRole::Candidate)?;
+        let staging = checkpoint_catalog_staging_path(inner, &canonical)?;
+        let epoch = |scope| checkpoint_catalog_epoch(inner.persistence.directory_identity, scope);
+        let untouched = epoch(second);
+        let mut at = epoch(first);
+        let mut advanced = |step: &str| -> Result<(), Box<dyn std::error::Error>> {
+            let now = epoch(first);
+            if now <= at {
+                return Err(format!("{step} left the scope at epoch {now}").into());
+            }
+            at = now;
+            Ok(())
+        };
+        drop(create_private_file_new_at(
+            &inner.directory,
+            &inner.directory_path,
+            &staging,
+        )?);
+        advanced("staging create")?;
+        checkpoint_catalog_publish_noreplace(
+            &inner.directory,
+            output_child_name(&inner.directory_path, &staging)?,
+            output_child_name(&inner.directory_path, &canonical)?,
+        )?;
+        advanced("publication rename")?;
+        let metadata = std::fs::metadata(&canonical)?;
+        unlink_owned_output_file(
+            &inner.directory,
+            &inner.directory_path,
+            &canonical,
+            FileIdentity::capture(&metadata, Some(metadata.len())),
+        )?;
+        advanced("reclamation unlink")?;
+        drop(create_private_file_new_at(
+            &inner.directory,
+            &inner.directory_path,
+            &canonical,
+        )?);
+        advanced("create")?;
+        checkpoint_unlink_record_path(inner, &canonical)?;
+        advanced("record unlink")?;
+        let unrelated = inner.directory_path.join("unrelated-output-file");
+        drop(create_private_file_new_at(
+            &inner.directory,
+            &inner.directory_path,
+            &unrelated,
+        )?);
+        assert_eq!(epoch(first), at);
+        assert_eq!(epoch(second), untouched);
+        Ok(())
+    }
+
+    #[test]
+    fn replay_census_is_remembered_until_a_catalog_file_of_its_scope_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let segments = CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS + 4;
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-replay-census-",
+            one_record_segment_policy(segments),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xd2100);
+        let mux = Uuid::from_u128(0xd2101);
+        let pane = Uuid::from_u128(0xd2102);
+        let other = Uuid::from_u128(0xd2103);
+        let generation = 1;
+        let census = |pane_id| {
+            store.with_exclusive_directory(|inner| {
+                let mut remembered = false;
+                let scan = checkpoint_catalog_replay_census(
+                    inner,
+                    CheckpointCatalogScope::Pane { pane_id },
+                    false,
+                    &mut remembered,
+                )?;
+                Ok((scan, remembered))
+            })
+        };
+        let listed = |pane_id| {
+            store.with_exclusive_directory(|inner| {
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id })
+            })
+        };
+        let members = |scan: &CheckpointCatalogScan| {
+            scan.published
+                .iter()
+                .map(|member| (member.metadata.identity, member.candidate_checksum))
+                .collect::<Vec<_>>()
+        };
+
+        let other_journal = pipeline.prepare_pane(guardian, other)?;
+        let mut other_state = checkpoint_catalog_claimed_protocol_state(guardian, mux, other)?;
+        checkpoint_catalog_stage_and_publish(
+            &pipeline,
+            &store,
+            &other_journal,
+            &mut other_state,
+            guardian,
+            mux,
+            other,
+            generation,
+            1,
+            0xd2_8000,
+            b"other;",
+            b"other;",
+        )?;
+        let (other_census, _) = census(other)?;
+
+        // Publications, ACKs and reclamation of the oldest members, each
+        // through its own create, rename and unlink paths.
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        let mut output = Vec::new();
+        for capture in 0..u64::try_from(CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS + 3)? {
+            let appended = format!("c{capture:02};");
+            output.extend_from_slice(appended.as_bytes());
+            checkpoint_catalog_stage_and_publish(
+                &pipeline,
+                &store,
+                &journal,
+                &mut state,
+                guardian,
+                mux,
+                pane,
+                generation,
+                capture + 1,
+                0xd2_0000 + u128::from(capture) * 0x10,
+                appended.as_bytes(),
+                &output,
+            )?;
+            let (published, remembered) = census(pane)?;
+            assert!(
+                !remembered,
+                "capture {capture}: a publication outdates the census"
+            );
+            assert_eq!(members(&published), members(&listed(pane)?));
+            let (begin, completion) = checkpoint_catalog_newest_begin(&store, pane)?;
+            store.apply_ack_from_committed_catalog(
+                GuardianCheckpointStageRequestV1::ack(
+                    begin.scope(),
+                    begin.upload_id(),
+                    begin.descriptor(),
+                    begin.chunk_bytes(),
+                    completion,
+                )?,
+                mux,
+            )?;
+            journal.release_through_sequence(store.pane_output_reclaim_floor(pane)?);
+            let (acked, _) = census(pane)?;
+            assert_eq!(
+                members(&acked),
+                members(&listed(pane)?),
+                "capture {capture}"
+            );
+            let (again, remembered) = census(pane)?;
+            assert!(remembered && Arc::ptr_eq(&again, &acked));
+            let (other_again, remembered) = census(other)?;
+            assert!(
+                remembered && Arc::ptr_eq(&other_again, &other_census),
+                "capture {capture}: another pane's catalog changes left this census alone"
+            );
+        }
+        assert_eq!(
+            listed(pane)?.published.len(),
+            CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS
+        );
+
+        // An Open from the remembered census selects the newest member.
+        assert!(census(pane)?.1);
+        let newest = listed(pane)?
+            .published
+            .last()
+            .map(|member| member.metadata.identity)
+            .ok_or("the pane has no member")?;
+        let maximum_plaintext_bytes = 64 * 1024;
+        let request = checkpoint_catalog_replay_request(
+            guardian,
+            mux,
+            Uuid::from_u128(0xd2_f000),
+            pane,
+            generation,
+            GuardianReplayRequestV1::Open {
+                selector: GuardianReplaySelectorV1::LatestCompatible,
+                max_plaintext_bytes: maximum_plaintext_bytes,
+                max_records: 4,
+                wait_millis: 0,
+            },
+        )?;
+        let opened = observe_replay_page(
+            store.apply_replay(&request, state.preflight_replay(&request)?, Some(&journal))?,
+            maximum_plaintext_bytes,
+        )?;
+        let selected = store
+            .inner
+            .replay
+            .lock()
+            .map_err(|_| "replay state was poisoned")?
+            .snapshots[&opened.snapshot_id]
+            .catalog
+            .selected
+            .metadata
+            .identity;
+        assert_eq!(selected, newest);
         Ok(())
     }
 
