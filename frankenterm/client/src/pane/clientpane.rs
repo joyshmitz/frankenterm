@@ -10619,14 +10619,28 @@ mod tests {
         let mut snapshot = pane.capture_user_vars_snapshot(1024, 1024 * 1024).unwrap();
         {
             let mut ready = Box::pin(snapshot.wait_ready());
-            let progress = promise::spawn::block_on(std::future::poll_fn(|context| {
-                Poll::Ready(ready.as_mut().poll(context))
-            }));
-            assert!(
-                matches!(progress, Poll::Ready(())),
-                "metadata snapshot must not await Lua historical completion"
-            );
+            // State publication passes through a background admission task
+            // before reaching this executor. Draining it once cannot prove
+            // that the background task has been scheduled. Keep the first
+            // historical callback held throughout the bounded readiness wait.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                while executor.try_tick().unwrap() {}
+                let progress = promise::spawn::block_on(std::future::poll_fn(|context| {
+                    Poll::Ready(ready.as_mut().poll(context))
+                }));
+                if matches!(progress, Poll::Ready(())) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "metadata snapshot must not await Lua historical completion"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
+        assert!(held.lock().unwrap().is_some());
+        assert_eq!(&*names.lock().unwrap(), &["first"]);
         assert_eq!(
             snapshot.take_user_vars().get("legacy").map(String::as_str),
             Some("value")
