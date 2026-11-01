@@ -10,7 +10,8 @@
 //! The check is deliberately syntactic and conservative: a file `dir/name.rs`
 //! is reachable when `mod name` (any visibility, inline or file-backed) is
 //! declared in `dir.rs`, `dir/mod.rs`, or when some file names it through a
-//! `#[path = "..."]` attribute. `cfg`-gated declarations count as reachable:
+//! `#[path = "..."]` attribute or a literal `include!("...")` invocation.
+//! `cfg`-gated declarations count as reachable:
 //! the point is ownership, not the active feature set.
 
 use std::collections::{BTreeSet, HashSet};
@@ -39,6 +40,17 @@ fn declared_modules(contents: &str) -> (HashSet<String>, HashSet<String>) {
     let mut paths = HashSet::new();
     for raw_line in contents.lines() {
         let line = raw_line.trim_start();
+        // Rust compiles literal includes in the containing module's scope.
+        // Accept only a complete invocation, never comments, include_str!, or
+        // a dynamic expression whose target this syntactic check cannot prove.
+        if let Some(rest) = line.strip_prefix("include!(\"") {
+            if let Some((path, suffix)) = rest.split_once('"') {
+                if !path.contains('\\') && matches!(suffix.trim(), ")" | ");") {
+                    paths.insert(path.to_string());
+                }
+            }
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("#[path") {
             if let Some(start) = rest.find('"') {
                 if let Some(end) = rest[start + 1..].find('"') {
@@ -74,6 +86,24 @@ fn declared_modules(contents: &str) -> (HashSet<String>, HashSet<String>) {
         }
     }
     (names, paths)
+}
+
+#[test]
+fn literal_includes_are_owned_but_comments_and_other_macros_are_not() {
+    let (_, paths) = declared_modules(
+        r#"
+        include!("mux_client/terminal_snapshot_tests.rs");
+        // include!("comment.rs");
+        include_str!("data.rs");
+        include!(concat!("dynamic", ".rs"));
+        include!("incomplete.rs"
+        include!("trailing.rs"); unexpected
+        "#,
+    );
+    assert_eq!(
+        paths,
+        HashSet::from(["mux_client/terminal_snapshot_tests.rs".to_string()])
+    );
 }
 
 #[test]

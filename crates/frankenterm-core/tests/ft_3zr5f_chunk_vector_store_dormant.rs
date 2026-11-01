@@ -67,12 +67,9 @@ const TRIPWIRE_PATTERNS: &[&str] = &[
 /// Tracked symlinks the scan deliberately leaves out, each with its reason.
 /// Every other symlink still fails the scan, so coverage cannot be lost
 /// silently and a directory cycle cannot be followed.
-const SYMLINK_SCOPE_EXCLUSIONS: &[&str] = &[
-    // Upstream HarfBuzz ships CLAUDE.md as a link to its AGENTS.md; it came in
-    // with the HarfBuzz 14.6.0 import (267710265). A documentation alias, not
-    // Rust source.
-    "frankenterm/deps-harfbuzz/harfbuzz/CLAUDE.md",
-];
+// The HarfBuzz documentation alias became a regular pointer file in
+// f3f2d3101 for portable release exports. No symlink exclusions remain.
+const SYMLINK_SCOPE_EXCLUSIONS: &[&str] = &[];
 
 fn workspace_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
