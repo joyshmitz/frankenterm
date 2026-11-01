@@ -22,10 +22,10 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(all(test, unix))]
+use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::RwLock;
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -5607,60 +5607,33 @@ fn run_bounded_command_stdout(
         return Err(BoundedCommandError::Timeout { timeout_ms });
     }
 
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    // Drain both pipes while the command runs. Waiting for exit before reading
+    // deadlocks when a process snapshot exceeds the operating-system pipe size.
+    // The shared supervisor also bounds capture memory and reaps timed-out children.
+    let mut command = crate::runtime_async::process::Command::new(program);
+    command.args(args).kill_on_drop(true);
+    let output = command
+        .output_blocking(Duration::from_millis(timeout_ms))
         .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
+            if crate::runtime_async::process::CommandTimedOut::from_io_error(&error).is_some() {
+                BoundedCommandError::Timeout { timeout_ms }
+            } else if error.kind() == std::io::ErrorKind::NotFound {
                 BoundedCommandError::Unavailable(format!("{program} command was unavailable"))
             } else {
-                BoundedCommandError::Failed(format!("failed to start {program}: {error}"))
+                BoundedCommandError::Failed(format!("failed to collect {program} output: {error}"))
             }
         })?;
-
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => {
-                let output = child.wait_with_output().map_err(|error| {
-                    BoundedCommandError::Failed(format!(
-                        "failed to collect {program} output: {error}"
-                    ))
-                })?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(BoundedCommandError::Failed(format!(
-                        "{program} exited with status {}: {}",
-                        output.status,
-                        stderr.trim()
-                    )));
-                }
-                return String::from_utf8(output.stdout).map_err(|error| {
-                    BoundedCommandError::Failed(format!(
-                        "{program} output was not valid UTF-8: {error}"
-                    ))
-                });
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(BoundedCommandError::Timeout { timeout_ms });
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(BoundedCommandError::Failed(format!(
-                    "failed while waiting for {program}: {error}"
-                )));
-            }
-        }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(BoundedCommandError::Failed(format!(
+            "{program} exited with status {}: {}",
+            output.status,
+            stderr.trim()
+        )));
     }
+    String::from_utf8(output.stdout).map_err(|error| {
+        BoundedCommandError::Failed(format!("{program} output was not valid UTF-8: {error}"))
+    })
 }
 
 fn warnings_jsonl(warnings: &[IncidentBundleWarning]) -> std::io::Result<String> {
@@ -6616,78 +6589,17 @@ fn run_process_sampler(
     config: &IncidentProcessSamplerConfig,
     sampled_at: &str,
 ) -> Result<IncidentProcessSample, ProcessSamplerError> {
-    if config.timeout_ms == 0 {
-        return Err(ProcessSamplerError::Timeout { timeout_ms: 0 });
-    }
-
-    let mut command = match config.program {
-        IncidentProcessSamplerProgram::Ps => Command::new("ps"),
-        IncidentProcessSamplerProgram::MissingToolForTest => {
-            Command::new("__ft_missing_process_sampler__")
-        }
-    };
-    command
-        .args(config.command_args())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            ProcessSamplerError::Unavailable(format!(
-                "process sampler command was unavailable: {}",
-                config.program.label()
-            ))
-        } else {
-            ProcessSamplerError::Failed(format!(
-                "failed to start process sampler command {}: {error}",
-                config.program.label()
-            ))
-        }
+    let stdout = run_bounded_command_stdout(
+        config.program.label(),
+        config.command_args(),
+        config.timeout_ms,
+    )
+    .map_err(|error| match error {
+        BoundedCommandError::Unavailable(message) => ProcessSamplerError::Unavailable(message),
+        BoundedCommandError::Timeout { timeout_ms } => ProcessSamplerError::Timeout { timeout_ms },
+        BoundedCommandError::Failed(message) => ProcessSamplerError::Failed(message),
     })?;
-
-    let deadline = Instant::now() + Duration::from_millis(config.timeout_ms);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => {
-                let output = child.wait_with_output().map_err(|error| {
-                    ProcessSamplerError::Failed(format!(
-                        "failed to collect process sampler output: {error}"
-                    ))
-                })?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(ProcessSamplerError::Failed(format!(
-                        "process sampler exited with status {}: {}",
-                        output.status,
-                        stderr.trim()
-                    )));
-                }
-                let stdout = String::from_utf8(output.stdout).map_err(|error| {
-                    ProcessSamplerError::Failed(format!(
-                        "process sampler output was not valid UTF-8: {error}"
-                    ))
-                })?;
-                return Ok(build_process_sample(config, sampled_at, &stdout));
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(ProcessSamplerError::Timeout {
-                        timeout_ms: config.timeout_ms,
-                    });
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ProcessSamplerError::Failed(format!(
-                    "failed while waiting for process sampler command: {error}"
-                )));
-            }
-        }
-    }
+    Ok(build_process_sample(config, sampled_at, &stdout))
 }
 
 fn build_process_sample(
@@ -8492,6 +8404,32 @@ impl CaptureCheckpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_drains_output_larger_than_pipe_capacity() {
+        let output = run_bounded_command_stdout(
+            "sh",
+            &[
+                "-c",
+                "awk 'BEGIN { for (i = 0; i < 8192; i++) print \"0123456789abcdef\" }'; awk 'BEGIN { for (i = 0; i < 8192; i++) print \"0123456789abcdef\" }' >&2",
+            ],
+            1_000,
+        )
+        .expect("both output pipes must drain before the child exits");
+        assert_eq!(output, "0123456789abcdef\n".repeat(8192));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_retains_timeout_classification() {
+        let error = run_bounded_command_stdout("sh", &["-c", "exec sleep 5"], 20)
+            .expect_err("a blocked sampler must retain its finite deadline");
+        assert!(matches!(
+            error,
+            BoundedCommandError::Timeout { timeout_ms: 20 }
+        ));
+    }
 
     static INCIDENT_ROBOT_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
