@@ -8138,6 +8138,52 @@ steps:
                 .await
                 .unwrap();
 
+            // Step logs are audit evidence, not resume authority. Simulate the
+            // durable admission/completion transitions for the two completed
+            // steps as well, without refunding the original execution budget.
+            let cx = crate::cx::for_testing();
+            let mut budget = storage
+                .get_workflow_budget_with_cx(&cx, &execution_id)
+                .await
+                .unwrap()
+                .expect("started workflow has a durable budget");
+            assert_eq!(
+                budget.current_step, 0,
+                "logs alone cannot advance authority"
+            );
+            for completed_step in 0..2 {
+                assert_eq!(budget.current_step, completed_step);
+                let previous_revision = budget.revision;
+                budget.revision += 1;
+                budget.phase = crate::storage::WorkflowAttemptPhase::InFlight;
+                assert!(
+                    storage
+                        .compare_exchange_workflow_budget_with_cx(
+                            &cx,
+                            &execution_id,
+                            previous_revision,
+                            budget.clone(),
+                        )
+                        .await
+                        .unwrap()
+                );
+                let previous_revision = budget.revision;
+                budget.revision += 1;
+                budget.current_step = completed_step + 1;
+                budget.phase = crate::storage::WorkflowAttemptPhase::Ready;
+                assert!(
+                    storage
+                        .compare_exchange_workflow_budget_with_cx(
+                            &cx,
+                            &execution_id,
+                            previous_revision,
+                            budget.clone(),
+                        )
+                        .await
+                        .unwrap()
+                );
+            }
+
             // Release the lock to simulate a restart scenario
             lock_manager.force_release(pane_id);
 
@@ -11556,6 +11602,7 @@ codex resume 11111111-2222-3333-4444-555555555555";
 Token usage: total=100 input=50
 You've hit your usage limit. Try again at 5:00 PM.";
 
+    // ubs:ignore[rust.security.hardcoded-secrets] -- Synthetic parser session UUID, not an auth token.
     const FIXTURE_MISSING_TOKEN_USAGE: &str =
         "codex resume 11111111-2222-3333-4444-555555555555\nSome other output";
 

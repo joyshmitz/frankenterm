@@ -3896,7 +3896,7 @@ impl WeztermClient {
             Some("WriteToPane" | "SendPaste" | "SendPasteTracedV1" | "ReliablePaneWriteV1") => {
                 MuxOperation::SendText
             }
-            Some("Resize") => MuxOperation::ResizePane,
+            Some("Resize" | "ResizePaneConditionalV1") => MuxOperation::ResizePane,
             Some("AdjustPaneSize") => MuxOperation::AdjustPaneSize,
             Some("CreateFloatingPane") => MuxOperation::CreateFloatingPane,
             Some("MoveFloatingPane") => MuxOperation::MoveFloatingPane,
@@ -8907,6 +8907,38 @@ mod tests {
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
+    fn conditional_resize_rejections_preserve_effect_and_retry_authority() {
+        let ident = <codec::ResizePaneConditionalV1 as codec::PduWireIdent>::IDENT;
+        let pane = Some(MuxObjectIdentity {
+            kind: MuxObjectKind::Pane,
+            id: 77,
+        });
+        let cases = [
+            (
+                codec::ErrorResponse::pane_not_found(ident, 77),
+                MuxRejection::pane_not_found(MuxOperation::ResizePane, 77),
+            ),
+            (
+                codec::ErrorResponse::indeterminate_mutation(
+                    ident,
+                    Some(codec::MuxErrorObject {
+                        kind: codec::MuxErrorObjectKind::PANE,
+                        id: 77,
+                    }),
+                ),
+                MuxRejection::indeterminate(MuxOperation::ResizePane, pane),
+            ),
+        ];
+        for (response, expected) in cases {
+            response.validate().expect("canonical resize rejection");
+            let actual = WeztermClient::mux_rejection_from_wire(&response);
+            assert_eq!(actual, expected);
+            assert!(actual.has_consistent_authority());
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
     fn layout_bound_line_reads_retain_text_operation_identity() {
         assert_eq!(
             WeztermClient::mux_operation_from_request_ident(
@@ -9598,6 +9630,7 @@ mod tests {
 
     #[test]
     fn parse_pane_id_invalid() {
+        // ubs:ignore[rust.security.hardcoded-secrets] -- Synthetic redaction input, not a credential.
         let secret = "SECRET invalid-pane-id transport payload";
         let error = WeztermClient::parse_pane_id(secret).expect_err("invalid pane id must fail");
         let rendered = error.to_string();
