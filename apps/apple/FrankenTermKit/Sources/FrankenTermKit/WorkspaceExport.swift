@@ -219,6 +219,7 @@ public struct WorkspaceExportSelection: Sendable {
             // policies into immutable source blockers during offline export.
             required.remove(WorkspaceDocument.hostCertificateCapability)
             required.remove(WorkspaceDocument.hostAlgorithmPolicyCapability)
+            required.remove(WorkspaceDocument.transportAlgorithmPolicyCapability)
             required.remove(WorkspaceDocument.hostRevocationCapability)
             var reasons: [String] = []
             let lacksSessionPolicy = destinations.contains(route.id)

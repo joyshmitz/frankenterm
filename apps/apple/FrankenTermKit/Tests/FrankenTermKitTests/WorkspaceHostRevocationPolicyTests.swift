@@ -416,7 +416,7 @@ final class WorkspaceHostRevocationPolicyTests: XCTestCase {
             routeID: "route", support: support)
         XCTAssertEqual(policy.hostKeyAlgorithms, ["ssh-ed25519"])
         let upgraded = try catalog(f.disk)
-        XCTAssertEqual(upgraded["version"] as? Int, 11)
+        XCTAssertEqual(upgraded["version"] as? Int, 12)
         XCTAssertEqual((upgraded["hostRevocationSources"] as? [Any])?.count, 0)
         XCTAssertEqual((upgraded["hostRevocationSourceScopes"] as? [Any])?.count, 0)
         XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(upgraded["acceptedImports"]), options: [.sortedKeys]), history)

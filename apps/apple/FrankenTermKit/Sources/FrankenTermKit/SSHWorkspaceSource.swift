@@ -1161,7 +1161,18 @@ public struct SSHWorkspaceSource: Sendable {
                     if !trustCapabilities.contains(capability) { trustCapabilities.append(capability) }
                 }
             }
-            if problems.contains(where: { $0.setting == "revokedhostkeys" && $0.required }) {
+            for (keyword, field) in [("kexalgorithms", "kex_algorithms"), ("ciphers", "ciphers"), ("macs", "macs")] {
+                if let arguments = resolved.options[keyword],
+                   case let .allowlist(algorithms) = Self.transportAlgorithmSelection(arguments, keyword: keyword) {
+                    trust[field] = .array(algorithms.map(JSONValue.string))
+                    let capability = JSONValue.string(WorkspaceDocument.transportAlgorithmPolicyCapability)
+                    if !trustCapabilities.contains(capability) { trustCapabilities.append(capability) }
+                }
+            }
+            if problems.contains(where: {
+                ["revokedhostkeys", "hostkeyalgorithms", "casignaturealgorithms", "kexalgorithms", "ciphers", "macs"]
+                    .contains($0.setting) && $0.required
+            }) {
                 // This incomplete negative policy belongs to the canonical
                 // host identity. Dropping its route or selecting another alias
                 // must not make the same endpoint eligible for authentication.
@@ -1377,6 +1388,14 @@ public struct SSHWorkspaceSource: Sendable {
                 case .unresolved:
                     problems.append(Problem(key, "This algorithm expression is not a qualified literal allowlist. Default-dependent additions/removals, patterns, unknown names and malformed lists remain unresolved; no source defaults were guessed."))
                 }
+            case "kexalgorithms", "ciphers", "macs":
+                switch Self.transportAlgorithmSelection(arguments, keyword: key) {
+                case .allowlist: break
+                case .preferenceOnly:
+                    problems.append(Problem(key, "The source's prepended algorithm preference is inactive on the phone. The phone keeps its qualified modern algorithms and does not enable additional or weaker algorithms from this preference.", required: false))
+                case .unresolved:
+                    problems.append(Problem(key, "This transport algorithm expression is not a qualified literal allowlist. Default-dependent additions/removals, patterns, unknown names and malformed lists remain unresolved; no source defaults were guessed."))
+                }
             case "sessiontype":
                 if arguments != ["default"] { problems.append(Problem(key, "This non-shell session type is not implemented by the mobile route.")) }
             case "loglevel", "hashknownhosts", "addkeystoagent", "usekeychain", "visualhostkey":
@@ -1406,7 +1425,7 @@ public struct SSHWorkspaceSource: Sendable {
         return Resolution(options: options, identities: identities, certificates: certificates, problems: problems)
     }
 
-    private enum HostAlgorithmSelection {
+    private enum AlgorithmSelection {
         case allowlist([String]), preferenceOnly, unresolved
     }
 
@@ -1421,13 +1440,7 @@ public struct SSHWorkspaceSource: Sendable {
     /// expressions remain blocked. A qualified ^ list stays explicitly inert
     /// (as in the desktop exporter); it creates no guessed effective allowlist
     /// and cannot add a weaker algorithm to the phone's baseline.
-    private static func hostAlgorithmSelection(_ arguments: [String], certificateAuthority: Bool) -> HostAlgorithmSelection {
-        guard arguments.count == 1, let expression = arguments.first, !expression.isEmpty,
-              expression.utf8.count <= 64 * 129 else { return .unresolved }
-        let preference = expression.first == "^"
-        let text = preference ? String(expression.dropFirst()) : expression
-        let names = text.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
-        guard (1...64).contains(names.count) else { return .unresolved }
+    private static func hostAlgorithmSelection(_ arguments: [String], certificateAuthority: Bool) -> AlgorithmSelection {
         let raw: Set<String> = ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
             "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com",
             "webauthn-sk-ecdsa-sha2-nistp256@openssh.com", "rsa-sha2-512", "rsa-sha2-256",
@@ -1439,6 +1452,40 @@ public struct SSHWorkspaceSource: Sendable {
             "rsa-sha2-256-cert-v01@openssh.com", "ssh-rsa-cert-v01@openssh.com", "ssh-dss-cert-v01@openssh.com",
             "ssh-mldsa44-ed25519-cert"]
         let allowed = certificateAuthority ? raw : raw.union(certificates)
+        return literalAlgorithmSelection(arguments, allowed: allowed)
+    }
+
+    /// OpenSSH's public transport names at revision 1fbdcb402516aacce59b4cc7b7d98f06820a1e44
+    /// (kex.h/kex-names.c, cipher.c and mac.c). This describes source syntax,
+    /// not the phone's qualified transport profile. Retaining a known but
+    /// unavailable name cannot widen the separately enforced native policy.
+    private static let transportAlgorithmNames: [String: Set<String>] = [
+        "kexalgorithms": ["diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1",
+            "diffie-hellman-group14-sha256", "diffie-hellman-group16-sha512", "diffie-hellman-group18-sha512",
+            "diffie-hellman-group-exchange-sha1", "diffie-hellman-group-exchange-sha256",
+            "ecdh-sha2-nistp256", "ecdh-sha2-nistp384", "ecdh-sha2-nistp521",
+            "curve25519-sha256", "curve25519-sha256@libssh.org", "sntrup761x25519-sha512",
+            "sntrup761x25519-sha512@openssh.com", "mlkem768x25519-sha256", "mlkem768nistp256-sha256"],
+        "ciphers": ["3des-cbc", "aes128-cbc", "aes192-cbc", "aes256-cbc", "aes128-ctr", "aes192-ctr",
+            "aes256-ctr", "aes128-gcm@openssh.com", "aes256-gcm@openssh.com", "chacha20-poly1305@openssh.com"],
+        "macs": ["hmac-sha1", "hmac-sha1-96", "hmac-sha2-256", "hmac-sha2-512", "hmac-md5", "hmac-md5-96",
+            "umac-64@openssh.com", "umac-128@openssh.com", "hmac-sha1-etm@openssh.com", "hmac-sha1-96-etm@openssh.com",
+            "hmac-sha2-256-etm@openssh.com", "hmac-sha2-512-etm@openssh.com", "hmac-md5-etm@openssh.com",
+            "hmac-md5-96-etm@openssh.com", "umac-64-etm@openssh.com", "umac-128-etm@openssh.com"]
+    ]
+
+    private static func transportAlgorithmSelection(_ arguments: [String], keyword: String) -> AlgorithmSelection {
+        guard let allowed = transportAlgorithmNames[keyword] else { return .unresolved }
+        return literalAlgorithmSelection(arguments, allowed: allowed)
+    }
+
+    private static func literalAlgorithmSelection(_ arguments: [String], allowed: Set<String>) -> AlgorithmSelection {
+        guard arguments.count == 1, let expression = arguments.first, !expression.isEmpty,
+              expression.utf8.count <= 64 * 129 else { return .unresolved }
+        let preference = expression.first == "^"
+        let text = preference ? String(expression.dropFirst()) : expression
+        let names = text.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+        guard (1...64).contains(names.count) else { return .unresolved }
         guard names.allSatisfy({ allowed.contains($0) }) else { return .unresolved }
         if preference { return .preferenceOnly }
         var seen = Set<String>()

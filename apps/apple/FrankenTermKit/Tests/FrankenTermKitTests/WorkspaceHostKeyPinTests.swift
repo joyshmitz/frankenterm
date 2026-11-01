@@ -887,7 +887,7 @@ final class WorkspaceHostKeyPinTests: XCTestCase {
         XCTAssertTrue(saved.hostKeyPins.isEmpty)
         XCTAssertTrue(try saved.document().hostTrust[0].pins.isEmpty)
         let migrated = try catalog(f.disk)
-        XCTAssertEqual(migrated["version"] as? Int, 11)
+        XCTAssertEqual(migrated["version"] as? Int, 12)
         XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(migrated["acceptedImports"]), options: [.sortedKeys]), history)
         let stable = f.disk.bytes(.catalog)
         _ = try await WorkspaceStore(persistence: f.disk, vault: f.vault).load()

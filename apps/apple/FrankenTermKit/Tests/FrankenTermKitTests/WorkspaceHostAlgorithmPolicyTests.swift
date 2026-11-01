@@ -362,7 +362,7 @@ final class WorkspaceHostAlgorithmPolicyTests: XCTestCase {
             let effective = try await policy(f, store: reopened)
             XCTAssertFalse(effective.isConstrained)
             let migrated = try catalog(f.disk)
-            XCTAssertEqual(migrated["version"] as? Int, 11)
+            XCTAssertEqual(migrated["version"] as? Int, 12)
             XCTAssertEqual((migrated["hostAlgorithmPolicies"] as? [Any])?.count, 0)
             XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(migrated["acceptedImports"]), options: [.sortedKeys]), history)
             XCTAssertEqual(f.vault.creates, 1)

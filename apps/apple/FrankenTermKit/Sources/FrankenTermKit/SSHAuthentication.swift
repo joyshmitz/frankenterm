@@ -277,6 +277,7 @@ public struct WorkspaceSSHAuthorization: Equatable, Sendable, CustomDebugStringC
     /// Certificate peers retain their subject and issuer in hostCertificate.
     public let rawHostIdentity: SSHPublicIdentity?
     public let negotiatedHostSignature: String?
+    public let negotiatedTransport: SSHTransportAlgorithms?
     public var debugDescription: String { "WorkspaceSSHAuthorization([redacted])" }
 }
 
@@ -292,6 +293,7 @@ public struct WorkspaceSSHPasswordAuthorization: Equatable, Sendable, CustomDebu
     public let hostCertificate: SSHHostCertificate?
     public let rawHostIdentity: SSHPublicIdentity?
     public let negotiatedHostSignature: String?
+    public let negotiatedTransport: SSHTransportAlgorithms?
     public var debugDescription: String { "WorkspaceSSHPasswordAuthorization([redacted])" }
 }
 
@@ -328,6 +330,7 @@ public struct WorkspaceSSHKeyboardInteractiveAuthorization: Equatable, Sendable,
     public let hostCertificate: SSHHostCertificate?
     public let rawHostIdentity: SSHPublicIdentity?
     public let negotiatedHostSignature: String?
+    public let negotiatedTransport: SSHTransportAlgorithms?
     public var debugDescription: String { "WorkspaceSSHKeyboardInteractiveAuthorization([redacted])" }
 }
 
@@ -638,6 +641,7 @@ public actor SSHAuthenticationBroker {
                               hostCertificate: SSHHostCertificate? = nil,
                               rawHostIdentity: SSHPublicIdentity? = nil,
                               negotiatedHostSignature: String? = nil,
+                              negotiatedTransport: SSHTransportAlgorithms? = nil,
                               transitForRouteID: String? = nil,
                               hostKeyProbe: WorkspaceHostKeyProbe? = nil) async throws -> WorkspaceSSHAuthorization {
         guard foreground else { throw SSHAuthenticationError.unavailable }
@@ -647,7 +651,8 @@ public actor SSHAuthenticationBroker {
             expectedRevision: expectedRevision, routeID: routeID, credentialID: credentialID,
             presentedHostKey: presentedHostKey, hostCertificate: hostCertificate,
             rawHostIdentity: rawHostIdentity,
-            negotiatedHostSignature: negotiatedHostSignature, support: support, transitForRouteID: transitForRouteID,
+            negotiatedHostSignature: negotiatedHostSignature, negotiatedTransport: negotiatedTransport,
+            support: support, transitForRouteID: transitForRouteID,
             hostKeyProbe: hostKeyProbe)
         guard foreground, foregroundGeneration == generation else { throw SSHAuthenticationError.unavailable }
         try Task.checkCancellation()
@@ -662,6 +667,7 @@ public actor SSHAuthenticationBroker {
                                  hostCertificate: SSHHostCertificate? = nil,
                                  rawHostIdentity: SSHPublicIdentity? = nil,
                                  negotiatedHostSignature: String? = nil,
+                                 negotiatedTransport: SSHTransportAlgorithms? = nil,
                                  transitForRouteID: String? = nil,
                                  hostKeyProbe: WorkspaceHostKeyProbe? = nil) async throws -> WorkspaceSSHPasswordIdentity {
         let lease = try foregroundLease()
@@ -670,6 +676,7 @@ public actor SSHAuthenticationBroker {
         let authorization = try await store.authorizeSSHPasswordAuthentication(workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, presentedHostKey: presentedHostKey,
             hostCertificate: hostCertificate, rawHostIdentity: rawHostIdentity, negotiatedHostSignature: negotiatedHostSignature,
+            negotiatedTransport: negotiatedTransport,
             support: support, transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
         try validateForeground(lease)
         guard passwordForeground, passwordGeneration == passwordEpoch else { throw SSHAuthenticationError.stale }
@@ -735,6 +742,7 @@ public actor SSHAuthenticationBroker {
                                             hostCertificate: SSHHostCertificate? = nil,
                                             rawHostIdentity: SSHPublicIdentity? = nil,
                                             negotiatedHostSignature: String? = nil,
+                                            negotiatedTransport: SSHTransportAlgorithms? = nil,
                                             transitForRouteID: String? = nil,
                                             hostKeyProbe: WorkspaceHostKeyProbe? = nil) async throws -> WorkspaceSSHKeyboardInteractiveIdentity {
         let lease = try foregroundLease()
@@ -743,6 +751,7 @@ public actor SSHAuthenticationBroker {
         let authorization = try await store.authorizeSSHKeyboardInteractiveAuthentication(workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, presentedHostKey: presentedHostKey,
             hostCertificate: hostCertificate, rawHostIdentity: rawHostIdentity, negotiatedHostSignature: negotiatedHostSignature,
+            negotiatedTransport: negotiatedTransport,
             support: support, transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
         try validateForeground(lease)
         guard passwordForeground, passwordGeneration == promptEpoch else { throw SSHAuthenticationError.stale }
@@ -856,6 +865,7 @@ public actor SSHAuthenticationBroker {
                                presentedHostKey: WorkspaceDocument.HostKey, hostCertificate: SSHHostCertificate? = nil,
                                rawHostIdentity: SSHPublicIdentity? = nil,
                                negotiatedHostSignature: String? = nil,
+                               negotiatedTransport: SSHTransportAlgorithms? = nil,
                                transportID: UUID,
                                transitForRouteID: String? = nil,
                                hostKeyProbe: WorkspaceHostKeyProbe? = nil) async throws -> WorkspaceSSHIdentity {
@@ -867,7 +877,8 @@ public actor SSHAuthenticationBroker {
             expectedRevision: expectedRevision, routeID: routeID, credentialID: credentialID,
             presentedHostKey: presentedHostKey, hostCertificate: hostCertificate,
             rawHostIdentity: rawHostIdentity,
-            negotiatedHostSignature: negotiatedHostSignature, support: support, transitForRouteID: transitForRouteID,
+            negotiatedHostSignature: negotiatedHostSignature, negotiatedTransport: negotiatedTransport,
+            support: support, transitForRouteID: transitForRouteID,
             hostKeyProbe: hostKeyProbe)
         try checkCurrent(id)
         try validateCertificate(authorization)
@@ -929,6 +940,7 @@ public actor SSHAuthenticationBroker {
                         presentedHostKey: WorkspaceDocument.HostKey, hostCertificate: SSHHostCertificate? = nil,
                         rawHostIdentity: SSHPublicIdentity? = nil,
                         negotiatedHostSignature: String? = nil,
+                        negotiatedTransport: SSHTransportAlgorithms? = nil,
                         transportID: UUID,
                         sessionIdentifier: Data, publicBlob: Data,
                         signatureAlgorithm: String? = nil,
@@ -948,7 +960,8 @@ public actor SSHAuthenticationBroker {
                 expectedRevision: expectedRevision, routeID: routeID, credentialID: credentialID,
                 presentedHostKey: presentedHostKey, hostCertificate: hostCertificate,
                 rawHostIdentity: rawHostIdentity,
-                negotiatedHostSignature: negotiatedHostSignature, support: support, transitForRouteID: transitForRouteID,
+                negotiatedHostSignature: negotiatedHostSignature, negotiatedTransport: negotiatedTransport,
+                support: support, transitForRouteID: transitForRouteID,
                 hostKeyProbe: hostKeyProbe)
             try checkCurrent(id)
             let challenge = try SSHUserAuthenticationChallenge(sessionIdentifier: sessionIdentifier,

@@ -387,6 +387,7 @@ public struct WorkspaceDocument: Sendable {
     }
     public static let hostCertificateCapability = "ssh_host_certificate_v1"
     public static let hostAlgorithmPolicyCapability = "ssh_host_algorithm_policy_v1"
+    public static let transportAlgorithmPolicyCapability = "ssh_transport_algorithm_policy_v1"
     public static let hostRevocationCapability = "ssh_host_revocation_v1"
     public enum HostTrustDecision: Equatable, Sendable {
         case trusted, reviewRequired, unconfigured, mismatch, revoked, requiredPolicyUnavailable
@@ -406,6 +407,9 @@ public struct WorkspaceDocument: Sendable {
         public let revocationSourceIDs: [String]
         public var hostKeyAlgorithms: [String]? { algorithmPolicy.hostKeyAlgorithms }
         public var caSignatureAlgorithms: [String]? { algorithmPolicy.caSignatureAlgorithms }
+        public var keyExchangeAlgorithms: [String]? { algorithmPolicy.transport.keyExchangeAlgorithms }
+        public var ciphers: [String]? { algorithmPolicy.transport.ciphers }
+        public var macs: [String]? { algorithmPolicy.transport.macs }
         public var hasConfiguredIdentity: Bool { !pins.isEmpty || !certificateAuthorities.isEmpty }
         public let requiredCapabilities: [String], requiredExtensions: [String]
         /// Reserved markers preserve mandatory unknown extensions across import.
@@ -413,7 +417,7 @@ public struct WorkspaceDocument: Sendable {
         public var requiredPolicyRequirements: Set<String> {
             Set(requiredCapabilities).union(requiredExtensions.map { "extension:" + $0 })
                 .union(certificateAuthorities.isEmpty ? [] : [WorkspaceDocument.hostCertificateCapability])
-                .union(algorithmPolicy.isConstrained ? [WorkspaceDocument.hostAlgorithmPolicyCapability] : [])
+                .union(algorithmPolicy.requiredCapabilities)
                 .union(revocationSourceIDs.isEmpty ? [] : [WorkspaceDocument.hostRevocationCapability])
         }
         /// OpenSSH HostKeyAlias replaces the hostname for known-host matching.
@@ -426,6 +430,7 @@ public struct WorkspaceDocument: Sendable {
                              additionalRevocations: Set<HostKey> = [],
                              supportedCapabilities: Set<String> = [],
                              negotiatedHostSignature: String? = nil,
+                             negotiatedTransport: SSHTransportAlgorithms? = nil,
                              revocationPolicy: WorkspaceHostRevocationPolicy? = nil,
                              rawHostIdentity: SSHPublicIdentity? = nil) -> HostTrustDecision {
             if revokedKeys.contains(where: { $0.fingerprint == presented.fingerprint })
@@ -441,7 +446,8 @@ public struct WorkspaceDocument: Sendable {
                 if revocationPolicy.requiresRawIdentity && rawHostIdentity == nil { return .requiredPolicyUnavailable }
             }
             if !algorithmPolicy.permits(hostKeyAlgorithm: presented.algorithm,
-                negotiatedHostSignature: negotiatedHostSignature, certificate: nil) { return .requiredPolicyUnavailable }
+                negotiatedHostSignature: negotiatedHostSignature, certificate: nil,
+                negotiatedTransport: negotiatedTransport) { return .requiredPolicyUnavailable }
             if !hasConfiguredIdentity { return .unconfigured }
             if !pins.contains(presented) { return .mismatch }
             return locallyAccepted ? .trusted : .reviewRequired
@@ -450,6 +456,7 @@ public struct WorkspaceDocument: Sendable {
     public enum ReadinessCode: String, Hashable, Sendable {
         case requiredCapabilityUnavailable, hostTrustReviewRequired, hostTrustMissing
         case hostIdentityRevoked, hostKeyAlgorithmUnsupported, authenticationMethodUnsupported
+        case transportAlgorithmUnsupported
         case credentialRequired, credentialAlgorithmUnsupported, credentialCertificateUnavailable
     }
     public struct ReadinessIssue: Hashable, Sendable {
@@ -473,23 +480,26 @@ public struct WorkspaceDocument: Sendable {
         /// Negotiated signature names, distinct from host-key blob families.
         /// An explicit host algorithm policy needs actual qualified support.
         public let hostSignatureAlgorithms: Set<String>
+        public let keyExchangeAlgorithms: Set<String>, ciphers: Set<String>, macs: Set<String>
         /// A working direct transport does not imply nested SSH support. The
         /// profile must explicitly qualify the complete expanded jump chain.
         public let maximumJumpHops: Int
         public init(routeModes: Set<String>, authenticationMethods: Set<AuthenticationMethod>,
                     credentialAlgorithms: Set<String>, hostKeyAlgorithms: Set<String>, capabilities: Set<String> = [],
-                    maximumJumpHops: Int = 0, hostSignatureAlgorithms: Set<String> = []) {
+                    maximumJumpHops: Int = 0, hostSignatureAlgorithms: Set<String> = [],
+                    keyExchangeAlgorithms: Set<String> = [], ciphers: Set<String> = [], macs: Set<String> = []) {
             self.routeModes = routeModes; self.authenticationMethods = authenticationMethods
             self.credentialAlgorithms = credentialAlgorithms; self.hostKeyAlgorithms = hostKeyAlgorithms; self.capabilities = capabilities
             self.maximumJumpHops = max(0, min(maximumJumpHops, 3))
             self.hostSignatureAlgorithms = hostSignatureAlgorithms
+            self.keyExchangeAlgorithms = keyExchangeAlgorithms; self.ciphers = ciphers; self.macs = macs
         }
         public static let offlineOnly = RouteSupport(routeModes: [], authenticationMethods: [], credentialAlgorithms: [], hostKeyAlgorithms: [])
     }
     public enum RouteReadinessIssue: Equatable, Sendable {
         case transportUnavailable, unsupportedRequirement, authenticationUnavailable
         case credentialUnavailable, credentialAlgorithmUnavailable, credentialCertificateUnavailable, hostTrustMissing, hostTrustNeedsReview, hostIdentityRevoked
-        case hostAlgorithmUnavailable, locallyRejectedTrust, sessionPolicyMissing, jumpTransportUnavailable, blockedJumpRoute(String)
+        case hostAlgorithmUnavailable, transportAlgorithmUnavailable, locallyRejectedTrust, sessionPolicyMissing, jumpTransportUnavailable, blockedJumpRoute(String)
         public var message: String {
             switch self {
             case .transportUnavailable: "The terminal transport for this route is not integrated in this build."
@@ -502,6 +512,7 @@ public struct WorkspaceDocument: Sendable {
             case .hostTrustNeedsReview: "Review the imported host identity before authentication."
             case .hostIdentityRevoked: "Every host key this route trusts is revoked or blocked on this phone."
             case .hostAlgorithmUnavailable: "No accepted host-key algorithm is supported by this build."
+            case .transportAlgorithmUnavailable: "No qualified SSH transport satisfies this route's required key exchange, cipher, and MAC algorithms."
             case .locallyRejectedTrust: "A local host-trust rejection blocks this route."
             case .sessionPolicyMissing: "This route needs an explicit session-creation or existing-mux attachment policy."
             case .jumpTransportUnavailable: "This route's jump-host chain is not supported by this build."
@@ -554,6 +565,7 @@ public struct WorkspaceDocument: Sendable {
                                 supportedCapabilities: Set<String> = [],
                                 requiredHostCapabilitiesByTrustScope: [String: Set<String>] = [:],
                                 negotiatedHostSignature: String? = nil,
+                                negotiatedTransport: SSHTransportAlgorithms? = nil,
                                 hostAlgorithmPoliciesByTrustScope: [String: WorkspaceHostAlgorithmPolicy] = [:],
                                 hostRevocationSourcesByTrustScope: [String: [WorkspaceHostRevocationSource]] = [:],
                                 rawHostIdentity: SSHPublicIdentity? = nil) throws -> HostTrustDecision {
@@ -563,8 +575,7 @@ public struct WorkspaceDocument: Sendable {
         if revoked.contains(where: { $0.fingerprint == presented.fingerprint }) { return .revoked }
         let required = Set(related.flatMap(\.requiredPolicyRequirements))
             .union(requiredHostCapabilitiesByTrustScope[selected.canonicalTrustScope] ?? [])
-            .union(hostAlgorithmPoliciesByTrustScope[selected.canonicalTrustScope]?.isConstrained == true
-                ? [Self.hostAlgorithmPolicyCapability] : [])
+            .union(hostAlgorithmPoliciesByTrustScope[selected.canonicalTrustScope]?.requiredCapabilities ?? [])
             .union(hostRevocationSourcesByTrustScope[selected.canonicalTrustScope]?.isEmpty == false
                 ? [Self.hostRevocationCapability] : [])
         if !Self.supports(required, using: supportedCapabilities) { return .requiredPolicyUnavailable }
@@ -577,9 +588,11 @@ public struct WorkspaceDocument: Sendable {
         if revocationPolicy.requiresRawIdentity && rawHostIdentity == nil { return .requiredPolicyUnavailable }
         let algorithms = try hostAlgorithmPolicy(forTrustID: trustID, additional: hostAlgorithmPoliciesByTrustScope)
         if !algorithms.permits(hostKeyAlgorithm: presented.algorithm,
-            negotiatedHostSignature: negotiatedHostSignature, certificate: nil) { return .requiredPolicyUnavailable }
+            negotiatedHostSignature: negotiatedHostSignature, certificate: nil,
+            negotiatedTransport: negotiatedTransport) { return .requiredPolicyUnavailable }
         return selected.evaluate(presented, locallyAccepted: locallyAccepted, additionalRevocations: revoked,
                                  supportedCapabilities: supportedCapabilities, negotiatedHostSignature: negotiatedHostSignature,
+                                 negotiatedTransport: negotiatedTransport,
                                  revocationPolicy: revocationPolicy, rawHostIdentity: rawHostIdentity)
     }
 
@@ -745,7 +758,7 @@ public struct WorkspaceDocument: Sendable {
         var pinCount = 0
         hostTrust = try records("host_trust", cap: 512).map { trust in
             try trust.allowing(["id", "host", "port", "host_key_alias", "claimed_source", "pins", "revoked_keys", "certificate_authorities", "required_capabilities",
-                                "host_key_algorithms", "ca_signature_algorithms", "revocation_source_refs"])
+                                "host_key_algorithms", "ca_signature_algorithms", "revocation_source_refs", "kex_algorithms", "ciphers", "macs"])
             func keys(_ field: String, optional: Bool = false) throws -> [HostKey] {
                 let value: JSONValue
                 if let present = trust[field] { value = present }
@@ -765,10 +778,16 @@ public struct WorkspaceDocument: Sendable {
             let originalHost = try trust.text("host")
             let algorithmPolicy = try WorkspaceHostAlgorithmPolicy(
                 hostKeyAlgorithms: trust["host_key_algorithms"].map { try $0.array().map { try $0.string() } },
-                caSignatureAlgorithms: trust["ca_signature_algorithms"].map { try $0.array().map { try $0.string() } })
+                caSignatureAlgorithms: trust["ca_signature_algorithms"].map { try $0.array().map { try $0.string() } },
+                transport: .init(keyExchangeAlgorithms: trust["kex_algorithms"].map { try $0.array().map { try $0.string() } },
+                                 ciphers: trust["ciphers"].map { try $0.array().map { try $0.string() } },
+                                 macs: trust["macs"].map { try $0.array().map { try $0.string() } }))
             let requiredCapabilities = try Self.capabilities(trust)
-            guard !requiredCapabilities.contains(Self.hostAlgorithmPolicyCapability) || algorithmPolicy.isConstrained else {
+            guard !requiredCapabilities.contains(Self.hostAlgorithmPolicyCapability) || algorithmPolicy.isSignatureConstrained else {
                 throw FTError.malformed("trust.algorithm_policy_missing")
+            }
+            guard !requiredCapabilities.contains(Self.transportAlgorithmPolicyCapability) || algorithmPolicy.transport.isConstrained else {
+                throw FTError.malformed("trust.transport_algorithm_policy_missing")
             }
             let revocationSourceIDs = try trust["revocation_source_refs"].map { try Self.identifiers($0, cap: 64) } ?? []
             guard !requiredCapabilities.contains(Self.hostRevocationCapability) || !revocationSourceIDs.isEmpty else {
@@ -969,7 +988,7 @@ public struct WorkspaceDocument: Sendable {
         let credentialMap = Dictionary(uniqueKeysWithValues: credentials.map { ($0.id, $0) })
         var revocations = revokedHostKeysByTrustScope, requirements = requiredHostCapabilitiesByTrustScope
         for (scope, policy) in hostAlgorithmPoliciesByTrustScope where policy.isConstrained {
-            requirements[scope, default: []].insert(Self.hostAlgorithmPolicyCapability)
+            requirements[scope, default: []].formUnion(policy.requiredCapabilities)
         }
         for (scope, sources) in hostRevocationSourcesByTrustScope where !sources.isEmpty {
             requirements[scope, default: []].insert(Self.hostRevocationCapability)
@@ -1022,6 +1041,8 @@ public struct WorkspaceDocument: Sendable {
             if rejectedScopes.contains(trust.canonicalTrustScope) { add(.locallyRejectedTrust) }
             let revoked = Set((revocations[trust.canonicalTrustScope] ?? []).map(\.fingerprint))
             let algorithms = try hostAlgorithmPolicy(forTrustID: trust.id, additional: hostAlgorithmPoliciesByTrustScope)
+            if !algorithms.transport.hasSupportedAlgorithms(keyExchangeAlgorithms: support.keyExchangeAlgorithms,
+                ciphers: support.ciphers, macs: support.macs) { add(.transportAlgorithmUnavailable) }
             let sourcePolicy = try hostRevocationPolicy(forTrustID: trust.id, additional: hostRevocationSourcesByTrustScope)
             let acceptablePins = trust.pins.filter { !revoked.contains($0.fingerprint)
                 && !sourcePolicy.denies(presented: $0, rawIdentity: nil, certificate: nil) }
@@ -1064,6 +1085,7 @@ public struct WorkspaceDocument: Sendable {
                               hostCertificate: SSHHostCertificate? = nil,
                               rawHostIdentity: SSHPublicIdentity? = nil,
                               negotiatedHostSignature: String? = nil,
+                              negotiatedTransport: SSHTransportAlgorithms? = nil,
                               reviewedTrustIDs: Set<String>, localRevokedFingerprints: Set<String> = [],
                               locallyRejectedTrustIDs: Set<String> = [],
                               locallyRevokedHostKeys: [String: Set<HostKey>] = [:], support: RouteSupport = .offlineOnly,
@@ -1098,8 +1120,7 @@ public struct WorkspaceDocument: Sendable {
         if hostCertificate == nil && sourcePolicy.requiresRawIdentity && rawHostIdentity == nil { return .unsupportedPolicy }
         let required = Set(route.requiredCapabilities).union(related.flatMap(\.requiredPolicyRequirements))
             .union(requiredHostCapabilitiesByTrustScope[trust.canonicalTrustScope] ?? [])
-            .union(hostAlgorithmPoliciesByTrustScope[trust.canonicalTrustScope]?.isConstrained == true
-                ? [Self.hostAlgorithmPolicyCapability] : [])
+            .union(hostAlgorithmPoliciesByTrustScope[trust.canonicalTrustScope]?.requiredCapabilities ?? [])
             .union(hostRevocationSourcesByTrustScope[trust.canonicalTrustScope]?.isEmpty == false
                 ? [Self.hostRevocationCapability] : [])
         if !Self.supports(required, using: support.capabilities) || !route.requiredExtensions.isEmpty { return .unsupportedPolicy }
@@ -1107,8 +1128,12 @@ public struct WorkspaceDocument: Sendable {
         let algorithms = try hostAlgorithmPolicy(forTrustID: trust.id, additional: hostAlgorithmPoliciesByTrustScope)
         if algorithms.hostKeyAlgorithms != nil,
            negotiatedHostSignature.map({ support.hostSignatureAlgorithms.contains($0) }) != true { return .unsupportedAlgorithm }
+        if algorithms.transport.isConstrained,
+           negotiatedTransport?.isSupported(keyExchangeAlgorithms: support.keyExchangeAlgorithms,
+                ciphers: support.ciphers, macs: support.macs) != true { return .unsupportedAlgorithm }
         if !algorithms.permits(hostKeyAlgorithm: presented.algorithm,
-            negotiatedHostSignature: negotiatedHostSignature, certificate: hostCertificate) { return .unsupportedAlgorithm }
+            negotiatedHostSignature: negotiatedHostSignature, certificate: hostCertificate,
+            negotiatedTransport: negotiatedTransport) { return .unsupportedAlgorithm }
         if !reviewedTrustIDs.contains(trust.id) { return .reviewRequired }
         if let certificate = hostCertificate {
             guard support.capabilities.contains(Self.hostCertificateCapability) else { return .unsupportedCertificate }
@@ -1135,13 +1160,15 @@ public struct WorkspaceDocument: Sendable {
                           requiredHostCapabilitiesByTrustScope: [String: Set<String>] = [:],
                           hostAlgorithmPoliciesByTrustScope: [String: WorkspaceHostAlgorithmPolicy] = [:],
                           hostRevocationSourcesByTrustScope: [String: [WorkspaceHostRevocationSource]] = [:],
-                          supportedHostSignatureAlgorithms: Set<String> = []) throws -> RouteReadinessDetail {
+                          supportedHostSignatureAlgorithms: Set<String> = [],
+                          supportedKeyExchangeAlgorithms: Set<String> = [], supportedCiphers: Set<String> = [],
+                          supportedMACs: Set<String> = []) throws -> RouteReadinessDetail {
         let routeMap = Dictionary(uniqueKeysWithValues: routes.map { ($0.id, $0) })
         let trustMap = Dictionary(uniqueKeysWithValues: hostTrust.map { ($0.id, $0) })
         let credentialMap = Dictionary(uniqueKeysWithValues: credentials.map { ($0.id, $0) })
         var revocations = revokedHostKeysByTrustScope, trustRequirements = requiredHostCapabilitiesByTrustScope
         for (scope, policy) in hostAlgorithmPoliciesByTrustScope where policy.isConstrained {
-            trustRequirements[scope, default: []].insert(Self.hostAlgorithmPolicyCapability)
+            trustRequirements[scope, default: []].formUnion(policy.requiredCapabilities)
         }
         for (scope, sources) in hostRevocationSourcesByTrustScope where !sources.isEmpty {
             trustRequirements[scope, default: []].insert(Self.hostRevocationCapability)
@@ -1161,6 +1188,8 @@ public struct WorkspaceDocument: Sendable {
             if let trust = trustMap[route.trustID] {
                 let algorithms = try hostAlgorithmPolicy(forTrustID: trust.id,
                     additional: hostAlgorithmPoliciesByTrustScope)
+                if !algorithms.transport.hasSupportedAlgorithms(keyExchangeAlgorithms: supportedKeyExchangeAlgorithms,
+                    ciphers: supportedCiphers, macs: supportedMACs) { issue(.transportAlgorithmUnsupported) }
                 if !Self.supports(trustRequirements[trust.canonicalTrustScope] ?? [], using: supportedCapabilities) { issue(.requiredCapabilityUnavailable) }
                 if !acceptedTrustIDs.contains(trust.id) { issue(.hostTrustReviewRequired) }
                 let revoked = Set((revocations[trust.canonicalTrustScope] ?? []).map(\.fingerprint))

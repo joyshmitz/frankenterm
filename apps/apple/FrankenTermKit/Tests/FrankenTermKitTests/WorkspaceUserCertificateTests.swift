@@ -390,7 +390,7 @@ final class WorkspaceUserCertificateTests: XCTestCase {
         XCTAssertTrue(migrated.certificateRenewals.isEmpty); XCTAssertEqual(migrated.revision, saved.revision)
         XCTAssertEqual(migrated.manifest, saved.manifest); XCTAssertEqual(migrated.bindings, saved.bindings)
         let upgraded = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(disk.bytes(.catalog))) as? [String: Any])
-        XCTAssertEqual(upgraded["version"] as? Int, 11)
+        XCTAssertEqual(upgraded["version"] as? Int, 12)
         XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(upgraded["acceptedImports"]), options: [.sortedKeys]), history)
         let review = try await store.reviewCertificateRenewal(workspaceID: saved.id, expectedRevision: saved.revision,
             credentialID: "key", certificateFile: certificateFile(workspaceTestCertificate(serial: 2)))

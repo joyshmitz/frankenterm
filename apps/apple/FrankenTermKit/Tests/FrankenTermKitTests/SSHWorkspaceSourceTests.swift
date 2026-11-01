@@ -1099,7 +1099,7 @@ final class SSHWorkspaceSourceTests: XCTestCase {
         Include /unreadable/config-fragment
         Host build
           IdentityFile none
-          Ciphers aes256-gcm@openssh.com
+          Ciphers -aes256-gcm@openssh.com
           RevokedHostKeys /required/host-revocations
           ProxyCommand sh -c "echo SENSITIVE_VALUE > \(marker)"
         Match exec "touch \(marker)"
@@ -1132,7 +1132,7 @@ final class SSHWorkspaceSourceTests: XCTestCase {
           IdentityFile none
         Host restricted
           HostKeyAlgorithms ssh-ed25519
-          KexAlgorithms curve25519-sha256
+          KexAlgorithms +curve25519-sha256
           IdentityFile none
         """)
         let routes = try records(result, "routes")
@@ -1333,9 +1333,8 @@ final class SSHWorkspaceSourceTests: XCTestCase {
             let result = try exported("Host build\nIdentityFile none\n\(policy)\n", known: Data(known.utf8))
             XCTAssertEqual(result.workspace.hostTrust[0].certificateAuthorities.count, 1, policy)
             XCTAssertEqual(result.workspace.hostTrust[0].pins.count, 1)
-            var expected = [WorkspaceDocument.hostCertificateCapability]
-            if policy.hasPrefix("RevokedHostKeys ") { expected.append("ssh_config.unresolved_policy") }
-            XCTAssertEqual(result.workspace.hostTrust[0].requiredCapabilities, expected, policy)
+            XCTAssertEqual(result.workspace.hostTrust[0].requiredCapabilities,
+                [WorkspaceDocument.hostCertificateCapability, "ssh_config.unresolved_policy"], policy)
             XCTAssertFalse(result.workspace.routes[0].requiredCapabilities.isEmpty, policy)
             XCTAssertTrue(result.portability.contains { $0.disposition == 1 }, policy)
         }
@@ -1455,6 +1454,177 @@ final class SSHWorkspaceSourceTests: XCTestCase {
         XCTAssertEqual(trust.algorithmPolicy.caSignatureAlgorithms, ["ssh-rsa", "ssh-mldsa44-ed25519"])
         XCTAssertEqual(trust.requiredCapabilities, [WorkspaceDocument.hostAlgorithmPolicyCapability])
         XCTAssertFalse(trust.algorithmPolicy.hostKeyAlgorithms?.contains("ssh-ed25519") ?? true)
+    }
+
+    func testLiteralTransportListsKeepFirstAssignmentOrderAndEncryptedRoundTrip() throws {
+        let result = try exported("""
+        Host build
+          IdentityFile none
+          PubkeyAuthentication no
+          PreferredAuthentications password
+          HostKeyAlgorithms ssh-ed25519-cert-v01@openssh.com
+          CASignatureAlgorithms ssh-ed25519
+          KexAlgorithms ecdh-sha2-nistp256,curve25519-sha256,ecdh-sha2-nistp256
+          Ciphers aes128-ctr,aes256-ctr,aes128-ctr
+          MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com
+        Host *
+          KexAlgorithms +unknown
+          Ciphers -aes128-ctr
+          MACs unknown
+        """, known: Data(try hostLine("build", marker: "@cert-authority").utf8))
+        let trust = try XCTUnwrap(result.workspace.hostTrust.first)
+        XCTAssertEqual(trust.algorithmPolicy.transport.keyExchangeAlgorithms, ["ecdh-sha2-nistp256", "curve25519-sha256"])
+        XCTAssertEqual(trust.algorithmPolicy.transport.ciphers, ["aes128-ctr", "aes256-ctr"])
+        XCTAssertEqual(trust.algorithmPolicy.transport.macs, ["hmac-sha2-512-etm@openssh.com", "hmac-sha2-256-etm@openssh.com"])
+        XCTAssertEqual(trust.requiredCapabilities, [WorkspaceDocument.hostCertificateCapability,
+            WorkspaceDocument.hostAlgorithmPolicyCapability, WorkspaceDocument.transportAlgorithmPolicyCapability])
+        XCTAssertTrue(result.workspace.routes[0].requiredCapabilities.isEmpty)
+        XCTAssertFalse(result.portability.contains { $0.disposition == 1 })
+        let archive = try AirGapArchive(workspace: result.workspace, keys: [], portability: result.portability, using: crypto)
+        let sealed = try FTAG.seal(archive, using: crypto)
+        let restored = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+        XCTAssertEqual(restored.workspace.raw, result.workspace.raw)
+        XCTAssertEqual(restored.workspace.hostTrust[0].algorithmPolicy, trust.algorithmPolicy)
+    }
+
+    func testTransportPoliciesKeepDestinationJumpAndUnrelatedHostOwnership() throws {
+        let result = try exported("""
+        Host build
+          HostName app.example.invalid
+          ProxyJump operator@gate:2200
+          KexAlgorithms ecdh-sha2-nistp256
+          Ciphers aes128-ctr
+          MACs hmac-sha2-256-etm@openssh.com
+        Host gate
+          HostName gate.example.invalid
+          KexAlgorithms curve25519-sha256
+          Ciphers aes256-ctr
+          MACs hmac-sha2-512-etm@openssh.com
+        Host ordinary
+          HostName plain.example.invalid
+        Host *
+          IdentityFile none
+          PubkeyAuthentication no
+          PreferredAuthentications password
+        """, aliases: ["build", "ordinary"], known: Data(try (
+            hostLine("app.example.invalid") + hostLine("[gate.example.invalid]:2200", seed: 8)
+                + hostLine("plain.example.invalid", seed: 16)).utf8))
+        let build = try destination("build", in: result.workspace)
+        let gate = try XCTUnwrap(hops(build, in: result.workspace).first)
+        let destinationPolicy = try trust("build", in: result.workspace).algorithmPolicy.transport
+        let gateTrust = try XCTUnwrap(result.workspace.hostTrust.first { $0.id == gate.trustID })
+        XCTAssertEqual(gate.port, 2200)
+        XCTAssertEqual(gate.user, "operator")
+        XCTAssertEqual(destinationPolicy, try .init(keyExchangeAlgorithms: ["ecdh-sha2-nistp256"],
+            ciphers: ["aes128-ctr"], macs: ["hmac-sha2-256-etm@openssh.com"]))
+        XCTAssertEqual(gateTrust.algorithmPolicy.transport, try .init(keyExchangeAlgorithms: ["curve25519-sha256"],
+            ciphers: ["aes256-ctr"], macs: ["hmac-sha2-512-etm@openssh.com"]))
+        XCTAssertEqual(gateTrust.requiredCapabilities, [WorkspaceDocument.transportAlgorithmPolicyCapability])
+        let ordinary = try trust("ordinary", in: result.workspace)
+        XCTAssertEqual(ordinary.algorithmPolicy, .unconstrained)
+        XCTAssertTrue(ordinary.requiredCapabilities.isEmpty)
+        XCTAssertTrue(result.workspace.routes.allSatisfy { $0.requiredCapabilities.isEmpty })
+    }
+
+    func testTransportExpressionsRejectUnknownRelativePatternsAndWholeListOverflow() throws {
+        for (keyword, name) in [("KexAlgorithms", "curve25519-sha256"), ("Ciphers", "aes256-ctr"),
+                                ("MACs", "hmac-sha2-256-etm@openssh.com")] {
+            let bad = ["+" + name, "-" + name, "-*", name + "*", "!" + name, name + ",", "," + name,
+                name + ",," + name, "unknown," + name, name + " unknown", "^unknown," + name,
+                "^", "^" + name + ",", "none", "++" + name, Array(repeating: name, count: 65).joined(separator: ",")]
+            for expression in bad {
+                let result = try exported("Host build\nIdentityFile none\n\(keyword) \(expression)\n\(keyword) \(name)\n",
+                    known: Data(try hostLine("build").utf8))
+                let trust = try XCTUnwrap(result.workspace.hostTrust.first)
+                XCTAssertEqual(trust.algorithmPolicy.transport, .unconstrained, expression)
+                XCTAssertEqual(trust.requiredCapabilities, ["ssh_config.unresolved_policy"], expression)
+                XCTAssertEqual(result.workspace.routes[0].requiredCapabilities, ["ssh_config.unresolved_policy"], expression)
+                XCTAssertTrue(result.portability.contains {
+                    $0.setting == "ssh_config." + keyword.lowercased() && $0.disposition == 1
+                }, expression)
+            }
+        }
+    }
+
+    func testPrependedTransportPreferencesRemainVisibleAndNeverGuessDefaultLists() throws {
+        let result = try exported("""
+        Host build
+          IdentityFile none
+          KexAlgorithms ^ecdh-sha2-nistp256
+          Ciphers ^aes128-gcm@openssh.com,aes256-gcm@openssh.com
+          MACs ^hmac-sha2-256-etm@openssh.com,hmac-sha2-256
+        """, known: Data(try hostLine("build").utf8))
+        let trust = try XCTUnwrap(result.workspace.hostTrust.first)
+        XCTAssertEqual(trust.algorithmPolicy.transport, .unconstrained)
+        XCTAssertTrue(trust.requiredCapabilities.isEmpty)
+        XCTAssertTrue(result.workspace.routes[0].requiredCapabilities.isEmpty)
+        for keyword in ["kexalgorithms", "ciphers", "macs"] {
+            XCTAssertTrue(result.portability.contains {
+                $0.setting == "ssh_config." + keyword && $0.disposition == 0 && $0.reason.contains("inactive")
+            })
+        }
+    }
+
+    func testKnownUnsupportedTransportAlgorithmsSurviveWithoutMobileDefaults() throws {
+        let result = try exported("""
+        Host build
+          IdentityFile none
+          KexAlgorithms mlkem768nistp256-sha256,mlkem768x25519-sha256,sntrup761x25519-sha512,diffie-hellman-group1-sha1
+          Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,3des-cbc
+          MACs umac-128-etm@openssh.com,hmac-sha1
+        """, known: Data(try hostLine("build").utf8))
+        let trust = try XCTUnwrap(result.workspace.hostTrust.first)
+        let policy = trust.algorithmPolicy.transport
+        XCTAssertEqual(policy.keyExchangeAlgorithms,
+            ["mlkem768nistp256-sha256", "mlkem768x25519-sha256", "sntrup761x25519-sha512", "diffie-hellman-group1-sha1"])
+        XCTAssertEqual(policy.ciphers, ["chacha20-poly1305@openssh.com", "aes256-gcm@openssh.com", "3des-cbc"])
+        XCTAssertEqual(policy.macs, ["umac-128-etm@openssh.com", "hmac-sha1"])
+        XCTAssertEqual(trust.requiredCapabilities, [WorkspaceDocument.transportAlgorithmPolicyCapability])
+        XCTAssertTrue(policy.filterKeyExchangeAlgorithms(["curve25519-sha256"]).isEmpty)
+        XCTAssertTrue(policy.filterCiphers(["aes256-ctr", "aes128-ctr"]).isEmpty)
+        XCTAssertTrue(policy.filterMACs(["hmac-sha2-256-etm@openssh.com"]).isEmpty)
+        XCTAssertFalse(result.portability.contains { $0.disposition == 1 })
+    }
+
+    func testSameScopeTransportConstraintsAndUnresolvedDenialsSurviveSelection() throws {
+        let config = """
+        IdentityFile none
+        PubkeyAuthentication no
+        PreferredAuthentications password
+        Host selected
+          HostName shared.example.invalid
+          Ciphers aes128-ctr,aes256-ctr
+        Host constrained-alias
+          HostName shared.example.invalid
+          Ciphers aes256-ctr
+          KexAlgorithms curve25519-sha256
+        """
+        let result = try exported(config, known: Data(try hostLine("shared.example.invalid").utf8))
+        let machine = try XCTUnwrap(result.workspace.machines.first { $0.name == "selected" })
+        let selection = try WorkspaceExportSelection(workspace: result.workspace, groupIDs: [result.workspace.initialGroupID],
+            machineIDs: [machine.id], findings: result.portability)
+        XCTAssertEqual(selection.workspace.hostTrust.count, 2)
+        let route = try XCTUnwrap(selection.workspace.routes.first)
+        let policy = try selection.workspace.hostAlgorithmPolicy(forTrustID: route.trustID).transport
+        XCTAssertEqual(policy.ciphers, ["aes256-ctr"])
+        XCTAssertEqual(policy.keyExchangeAlgorithms, ["curve25519-sha256"])
+        let archive = try selection.archive(including: [], using: crypto)
+        let sealed = try FTAG.seal(archive, using: crypto), restored = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+        XCTAssertEqual(try restored.workspace.hostAlgorithmPolicy(forTrustID: route.trustID).transport, policy)
+        let publicDocument = try selection.publicDocument(bundleID: "selected-transport-policy")
+        XCTAssertEqual(try publicDocument.hostAlgorithmPolicy(forTrustID: route.trustID).transport, policy)
+
+        for directive in ["Ciphers -aes128-ctr", "HostKeyAlgorithms -ssh-rsa", "CASignatureAlgorithms +ssh-rsa"] {
+            let blocked = try exported(config.replacingOccurrences(of: "Ciphers aes256-ctr\n", with: directive + "\n"),
+                known: Data(try hostLine("shared.example.invalid").utf8))
+            let retained = try XCTUnwrap(blocked.workspace.machines.first { $0.name == "selected" })
+            let incomplete = try WorkspaceExportSelection(workspace: blocked.workspace, groupIDs: [blocked.workspace.initialGroupID],
+                machineIDs: [retained.id], findings: blocked.portability)
+            XCTAssertTrue(incomplete.workspace.routes[0].requiredCapabilities.isEmpty, directive)
+            XCTAssertTrue(incomplete.workspace.hostTrust.contains { $0.requiredCapabilities.contains("ssh_config.unresolved_policy") }, directive)
+            XCTAssertEqual(try incomplete.review(decisions: [:], loadedFingerprints: []).blockedRouteIDs,
+                incomplete.workspace.routes.map(\.id), directive)
+        }
     }
 
     func testHashedCertificateAuthoritiesNeedOriginalLookupAndRetainCanonicalRevocations() throws {
@@ -1996,7 +2166,8 @@ final class SSHWorkspaceSourceTests: XCTestCase {
         let trust = try XCTUnwrap(result.workspace.hostTrust.first { $0.id == gate.trustID })
         XCTAssertEqual(trust.pins, trust.revokedKeys)
         XCTAssertEqual(trust.evaluate(try XCTUnwrap(trust.pins.first), locallyAccepted: true), .revoked)
-        for setting in ["ciphers", "revokedhostkeys"] {
+        XCTAssertEqual(trust.algorithmPolicy.transport.ciphers, ["aes256-gcm@openssh.com"])
+        for setting in ["revokedhostkeys"] {
             XCTAssertTrue(result.portability.contains { $0.entityID == gate.id && $0.setting == "ssh_config." + setting && $0.disposition == 1 })
         }
         let selection = try WorkspaceExportSelection(workspace: result.workspace, groupIDs: [result.workspace.initialGroupID], findings: result.portability)

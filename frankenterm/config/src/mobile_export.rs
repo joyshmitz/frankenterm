@@ -44,6 +44,7 @@ const MAX_EXPORTED_CERTIFICATE_BYTES: usize = 1024 * 1024;
 const USER_CERTIFICATE_CAPABILITY: &str = "ssh_user_certificate_v1";
 const HOST_CERTIFICATE_CAPABILITY: &str = "ssh_host_certificate_v1";
 const HOST_ALGORITHM_POLICY_CAPABILITY: &str = "ssh_host_algorithm_policy_v1";
+const TRANSPORT_ALGORITHM_POLICY_CAPABILITY: &str = "ssh_transport_algorithm_policy_v1";
 const HOST_REVOCATION_CAPABILITY: &str = "ssh_host_revocation_v1";
 const MAX_REVOCATION_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_REVOCATION_ENTRIES: usize = 8192;
@@ -2620,14 +2621,47 @@ struct Endpoint {
     certificates: Vec<UserCertificate>,
     identity_policy_complete: bool,
     host_key_alias: Option<String>,
-    host_key_algorithms: Option<Vec<String>>,
-    ca_signature_algorithms: Option<Vec<String>>,
+    algorithms: EndpointAlgorithmPolicy,
     known_hosts: Vec<PathBuf>,
     revocation_files: Vec<PathBuf>,
     unresolved_policy: bool,
 }
 
-enum HostAlgorithmSelection {
+#[derive(Clone, Default)]
+struct EndpointAlgorithmPolicy {
+    host_key_algorithms: Option<Vec<String>>,
+    ca_signature_algorithms: Option<Vec<String>>,
+    kex_algorithms: Option<Vec<String>>,
+    ciphers: Option<Vec<String>>,
+    macs: Option<Vec<String>>,
+}
+
+impl EndpointAlgorithmPolicy {
+    /// A second alias may narrow a host's policy, never widen it. Keep this
+    /// endpoint's preference order and represent an empty intersection as an
+    /// explicit empty list, rather than reverting to native defaults.
+    fn intersect_with(&mut self, other: &Self) {
+        for (current, additional) in [
+            (&mut self.host_key_algorithms, &other.host_key_algorithms),
+            (
+                &mut self.ca_signature_algorithms,
+                &other.ca_signature_algorithms,
+            ),
+            (&mut self.kex_algorithms, &other.kex_algorithms),
+            (&mut self.ciphers, &other.ciphers),
+            (&mut self.macs, &other.macs),
+        ] {
+            if let Some(additional) = additional {
+                match current {
+                    Some(current) => current.retain(|name| additional.contains(name)),
+                    None => *current = Some(additional.clone()),
+                }
+            }
+        }
+    }
+}
+
+enum AlgorithmSelection {
     Allowlist(Vec<String>),
     PreferenceOnly,
     Unresolved,
@@ -2642,16 +2676,7 @@ enum HostAlgorithmSelection {
 /// source snapshot cannot guess those defaults. Add/remove expressions remain
 /// blocked. A qualified ^ list remains an explicitly inactive preference, with
 /// no guessed effective allowlist and no added mobile algorithms.
-fn host_algorithm_selection(value: &str, certificate_authority: bool) -> HostAlgorithmSelection {
-    if value.is_empty() || value.len() > 64 * 129 {
-        return HostAlgorithmSelection::Unresolved;
-    }
-    let preference = value.starts_with('^');
-    let list = value.strip_prefix('^').unwrap_or(value);
-    let names: Vec<&str> = list.split(',').collect();
-    if names.is_empty() || names.len() > 64 {
-        return HostAlgorithmSelection::Unresolved;
-    }
+fn host_algorithm_selection(value: &str, certificate_authority: bool) -> AlgorithmSelection {
     let known = |name: &str| {
         matches!(
             name,
@@ -2684,14 +2709,86 @@ fn host_algorithm_selection(value: &str, certificate_authority: bool) -> HostAlg
                     | "ssh-mldsa44-ed25519-cert"
             ))
     };
-    if !names.iter().all(|name| known(name)) {
-        return HostAlgorithmSelection::Unresolved;
+    literal_algorithm_selection(value, known)
+}
+
+/// OpenSSH's public transport names at revision
+/// 1fbdcb402516aacce59b4cc7b7d98f06820a1e44 (kex.h/kex-names.c, cipher.c,
+/// mac.c). These are accepted source names, not an expanded mobile profile.
+/// In particular, preserving a legacy or post-quantum name must not enable it
+/// in a backend that has not independently qualified that algorithm.
+fn transport_algorithm_selection(value: &str, keyword: &str) -> AlgorithmSelection {
+    literal_algorithm_selection(value, |name| match keyword {
+        "kexalgorithms" => matches!(
+            name,
+            "diffie-hellman-group1-sha1"
+                | "diffie-hellman-group14-sha1"
+                | "diffie-hellman-group14-sha256"
+                | "diffie-hellman-group16-sha512"
+                | "diffie-hellman-group18-sha512"
+                | "diffie-hellman-group-exchange-sha1"
+                | "diffie-hellman-group-exchange-sha256"
+                | "ecdh-sha2-nistp256"
+                | "ecdh-sha2-nistp384"
+                | "ecdh-sha2-nistp521"
+                | "curve25519-sha256"
+                | "curve25519-sha256@libssh.org"
+                | "sntrup761x25519-sha512"
+                | "sntrup761x25519-sha512@openssh.com"
+                | "mlkem768x25519-sha256"
+                | "mlkem768nistp256-sha256"
+        ),
+        "ciphers" => matches!(
+            name,
+            "3des-cbc"
+                | "aes128-cbc"
+                | "aes192-cbc"
+                | "aes256-cbc"
+                | "aes128-ctr"
+                | "aes192-ctr"
+                | "aes256-ctr"
+                | "aes128-gcm@openssh.com"
+                | "aes256-gcm@openssh.com"
+                | "chacha20-poly1305@openssh.com"
+        ),
+        "macs" => matches!(
+            name,
+            "hmac-sha1"
+                | "hmac-sha1-96"
+                | "hmac-sha2-256"
+                | "hmac-sha2-512"
+                | "hmac-md5"
+                | "hmac-md5-96"
+                | "umac-64@openssh.com"
+                | "umac-128@openssh.com"
+                | "hmac-sha1-etm@openssh.com"
+                | "hmac-sha1-96-etm@openssh.com"
+                | "hmac-sha2-256-etm@openssh.com"
+                | "hmac-sha2-512-etm@openssh.com"
+                | "hmac-md5-etm@openssh.com"
+                | "hmac-md5-96-etm@openssh.com"
+                | "umac-64-etm@openssh.com"
+                | "umac-128-etm@openssh.com"
+        ),
+        _ => false,
+    })
+}
+
+fn literal_algorithm_selection(value: &str, known: impl Fn(&str) -> bool) -> AlgorithmSelection {
+    if value.is_empty() || value.len() > 64 * 129 {
+        return AlgorithmSelection::Unresolved;
+    }
+    let preference = value.starts_with('^');
+    let list = value.strip_prefix('^').unwrap_or(value);
+    let names: Vec<&str> = list.split(',').collect();
+    if names.is_empty() || names.len() > 64 || !names.iter().all(|name| known(name)) {
+        return AlgorithmSelection::Unresolved;
     }
     if preference {
-        return HostAlgorithmSelection::PreferenceOnly;
+        return AlgorithmSelection::PreferenceOnly;
     }
     let mut seen = BTreeSet::new();
-    HostAlgorithmSelection::Allowlist(
+    AlgorithmSelection::Allowlist(
         names
             .into_iter()
             .filter(|name| seen.insert(*name))
@@ -2833,8 +2930,7 @@ fn resolve_endpoint(
             certificates: Vec::new(),
             identity_policy_complete: true,
             host_key_alias: None,
-            host_key_algorithms: None,
-            ca_signature_algorithms: None,
+            algorithms: EndpointAlgorithmPolicy::default(),
             known_hosts: sources.default_known_hosts.clone(),
             revocation_files: Vec::new(),
             unresolved_policy: false,
@@ -2982,22 +3078,34 @@ fn resolve_endpoint(
             }
             let mut host_key_algorithms = None;
             let mut ca_signature_algorithms = None;
+            let mut kex_algorithms = None;
+            let mut ciphers = None;
+            let mut macs = None;
             for (keyword, target) in [
                 ("hostkeyalgorithms", &mut host_key_algorithms),
                 ("casignaturealgorithms", &mut ca_signature_algorithms),
+                ("kexalgorithms", &mut kex_algorithms),
+                ("ciphers", &mut ciphers),
+                ("macs", &mut macs),
             ] {
                 if let Some(value) = options.get(keyword) {
-                    match host_algorithm_selection(value, keyword == "casignaturealgorithms") {
-                        HostAlgorithmSelection::Allowlist(algorithms) => {
+                    let selected = match keyword {
+                        "hostkeyalgorithms" | "casignaturealgorithms" => {
+                            host_algorithm_selection(value, keyword == "casignaturealgorithms")
+                        }
+                        _ => transport_algorithm_selection(value, keyword),
+                    };
+                    match selected {
+                        AlgorithmSelection::Allowlist(algorithms) => {
                             *target = Some(algorithms);
                         }
-                        HostAlgorithmSelection::PreferenceOnly => note(
+                        AlgorithmSelection::PreferenceOnly => note(
                             notes,
                             format!(
                                 "{keyword}: the source's prepended algorithm preference is inactive on the phone; the phone keeps its qualified modern algorithms and does not enable additional or weaker algorithms from this preference"
                             ),
                         ),
-                        HostAlgorithmSelection::Unresolved => {
+                        AlgorithmSelection::Unresolved => {
                             unresolved_policy = true;
                             note(
                                 notes,
@@ -3018,9 +3126,6 @@ fn resolve_endpoint(
                 "requiredrsasize",
                 "pubkeyacceptedalgorithms",
                 "pubkeyacceptedkeytypes",
-                "kexalgorithms",
-                "ciphers",
-                "macs",
                 "verifyhostkeydns",
                 "checkhostip",
                 "canonicalizehostname",
@@ -3033,16 +3138,13 @@ fn resolve_endpoint(
                         | "checkhostip"
                         | "canonicalizehostname"
                         | "refuseconnection" => value.eq_ignore_ascii_case("no"),
-                        // `^` puts the listed algorithms first and removes
-                        // none of OpenSSH's defaults: no constraint for the
-                        // phone to enforce. macOS sets Ciphers, KexAlgorithms
-                        // and MACs this way in /etc/ssh/crypto.conf
-                        // (ft-5qgrk). `+`, `-` and a full list still block.
-                        "pubkeyacceptedalgorithms"
-                        | "pubkeyacceptedkeytypes"
-                        | "kexalgorithms"
-                        | "ciphers"
-                        | "macs" => value.starts_with('^'),
+                        // Authentication-signature policy is separate from
+                        // the qualified host/transport policies above. Its
+                        // existing nonrestrictive preference remains inactive;
+                        // `+`, `-` and a full list still block.
+                        "pubkeyacceptedalgorithms" | "pubkeyacceptedkeytypes" => {
+                            value.starts_with('^')
+                        }
                         _ => false,
                     };
                     if !disabled {
@@ -3074,8 +3176,13 @@ fn resolve_endpoint(
                 host_key_alias: options
                     .get("hostkeyalias")
                     .map(|alias| alias.to_ascii_lowercase()),
-                host_key_algorithms,
-                ca_signature_algorithms,
+                algorithms: EndpointAlgorithmPolicy {
+                    host_key_algorithms,
+                    ca_signature_algorithms,
+                    kex_algorithms,
+                    ciphers,
+                    macs,
+                },
                 known_hosts,
                 revocation_files,
                 unresolved_policy,
@@ -3365,13 +3472,31 @@ impl EndpointRecords {
             trust_capabilities.push(HOST_CERTIFICATE_CAPABILITY);
         }
         for (field, algorithms) in [
-            ("host_key_algorithms", &endpoint.host_key_algorithms),
-            ("ca_signature_algorithms", &endpoint.ca_signature_algorithms),
+            (
+                "host_key_algorithms",
+                &endpoint.algorithms.host_key_algorithms,
+            ),
+            (
+                "ca_signature_algorithms",
+                &endpoint.algorithms.ca_signature_algorithms,
+            ),
         ] {
             if let Some(algorithms) = algorithms {
                 trust[field] = json!(algorithms);
                 if !trust_capabilities.contains(&HOST_ALGORITHM_POLICY_CAPABILITY) {
                     trust_capabilities.push(HOST_ALGORITHM_POLICY_CAPABILITY);
+                }
+            }
+        }
+        for (field, algorithms) in [
+            ("kex_algorithms", &endpoint.algorithms.kex_algorithms),
+            ("ciphers", &endpoint.algorithms.ciphers),
+            ("macs", &endpoint.algorithms.macs),
+        ] {
+            if let Some(algorithms) = algorithms {
+                trust[field] = json!(algorithms);
+                if !trust_capabilities.contains(&TRANSPORT_ALGORITHM_POLICY_CAPABILITY) {
+                    trust_capabilities.push(TRANSPORT_ALGORITHM_POLICY_CAPABILITY);
                 }
             }
         }
@@ -3577,6 +3702,8 @@ pub fn export(
     let mut revoked_by_scope: BTreeMap<(String, u16), Vec<PublicKey>> = BTreeMap::new();
     let mut revocation_ids_by_scope: BTreeMap<(String, u16), BTreeSet<String>> = BTreeMap::new();
     let mut revocation_paths_by_scope: BTreeMap<(String, u16), BTreeSet<PathBuf>> = BTreeMap::new();
+    let mut algorithm_policies_by_scope: BTreeMap<(String, u16), EndpointAlgorithmPolicy> =
+        BTreeMap::new();
     let mut unresolved_scopes = BTreeSet::new();
     let mut resolved_routes = BTreeMap::new();
     anyhow::ensure!(
@@ -3632,6 +3759,10 @@ pub fn export(
                     &mut route_notes,
                 );
                 let scope = endpoint_trust_scope(&resolved.endpoint);
+                algorithm_policies_by_scope
+                    .entry(scope.clone())
+                    .or_default()
+                    .intersect_with(&resolved.endpoint.algorithms);
                 revocation_paths_by_scope
                     .entry(scope.clone())
                     .or_default()
@@ -3683,6 +3814,18 @@ pub fn export(
     }
     for revoked in revoked_by_scope.values_mut() {
         revoked.sort_by_key(PublicKey::fingerprint);
+    }
+    // A group selection cannot remove an applicable restriction declared by
+    // another inventory alias, including one that is not exported. Retain each
+    // selected peer's own preference order while applying the complete scope.
+    for family in resolved_routes.values_mut() {
+        for resolved in family {
+            if let Some(policy) =
+                algorithm_policies_by_scope.get(&endpoint_trust_scope(&resolved.endpoint))
+            {
+                resolved.endpoint.algorithms.intersect_with(policy);
+            }
+        }
     }
 
     for machine in inventory
@@ -8688,10 +8831,9 @@ ssh = "right"
             assert!(required(preference).is_null(), "{}", preference);
         }
         for constraint in [
-            "Ciphers aes128-ctr",
             "Ciphers +aes128-cbc",
             "KexAlgorithms -curve25519-sha256",
-            "MACs hmac-sha2-256",
+            "MACs +hmac-sha2-256",
             "HostKeyAlgorithms +ssh-rsa",
         ] {
             assert_eq!(
@@ -8892,6 +9034,306 @@ ssh = "right"
             trust["required_capabilities"],
             json!([HOST_ALGORITHM_POLICY_CAPABILITY])
         );
+    }
+
+    #[test]
+    fn literal_transport_lists_keep_first_assignment_order_and_companion_round_trip() {
+        let mut sources = sources(Some(
+            "Host left right\n HostName box\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n HostKeyAlgorithms ssh-ed25519-cert-v01@openssh.com\n CASignatureAlgorithms ssh-ed25519\n KexAlgorithms ecdh-sha2-nistp256,curve25519-sha256,ecdh-sha2-nistp256\n Ciphers aes128-ctr,aes256-ctr,aes128-ctr\n MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com\nHost *\n KexAlgorithms +unknown\n Ciphers -aes128-ctr\n MACs unknown\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/keys",
+            format!("@cert-authority box {}\n", fake_key(50)),
+        );
+        let exported = trust_export(&sources);
+        for route in ["r.left.ssh", "r.right.ssh"] {
+            let trust = route_trust(&exported, route);
+            assert_eq!(
+                trust["kex_algorithms"],
+                json!(["ecdh-sha2-nistp256", "curve25519-sha256"])
+            );
+            assert_eq!(trust["ciphers"], json!(["aes128-ctr", "aes256-ctr"]));
+            assert_eq!(
+                trust["macs"],
+                json!([
+                    "hmac-sha2-512-etm@openssh.com",
+                    "hmac-sha2-256-etm@openssh.com"
+                ])
+            );
+            assert_eq!(
+                trust["required_capabilities"],
+                json!([
+                    HOST_CERTIFICATE_CAPABILITY,
+                    HOST_ALGORITHM_POLICY_CAPABILITY,
+                    TRANSPORT_ALGORITHM_POLICY_CAPABILITY
+                ])
+            );
+            assert!(exported_route(&exported, route)["required_capabilities"].is_null());
+        }
+        let source = companion_source(&exported, Path::new("/inventory/machines.toml"));
+        assert_eq!(source["document"], exported.document);
+        assert!(
+            !exported
+                .notes
+                .iter()
+                .any(|note| note.message.contains("remains blocked"))
+        );
+    }
+
+    #[test]
+    fn transport_algorithms_keep_exact_destination_and_qualified_jump_ownership() {
+        let mut sources = sources(Some(
+            "Host left\n HostName app.corp\n ProxyJump operator@gate:2200\n KexAlgorithms ecdh-sha2-nistp256\n Ciphers aes128-ctr\n MACs hmac-sha2-256-etm@openssh.com\nHost gate\n HostName gate.corp\n KexAlgorithms curve25519-sha256\n Ciphers aes256-ctr\n MACs hmac-sha2-512-etm@openssh.com\nHost right\n HostName plain.corp\nHost *\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/keys",
+            format!(
+                "app.corp {}\n[gate.corp]:2200 {}\nplain.corp {}\n",
+                fake_key(50),
+                fake_key(51),
+                fake_key(52)
+            ),
+        );
+        let exported = trust_export(&sources);
+        let app = route_trust(&exported, "r.left.ssh");
+        let hop_id = exported_route(&exported, "r.left.ssh")["jump_routes"][0]
+            .as_str()
+            .unwrap();
+        let gate = route_trust(&exported, hop_id);
+        assert_eq!(exported_route(&exported, hop_id)["user"], "operator");
+        assert_eq!(gate["port"], 2200);
+        assert_eq!(app["kex_algorithms"], json!(["ecdh-sha2-nistp256"]));
+        assert_eq!(app["ciphers"], json!(["aes128-ctr"]));
+        assert_eq!(app["macs"], json!(["hmac-sha2-256-etm@openssh.com"]));
+        assert_eq!(gate["kex_algorithms"], json!(["curve25519-sha256"]));
+        assert_eq!(gate["ciphers"], json!(["aes256-ctr"]));
+        assert_eq!(gate["macs"], json!(["hmac-sha2-512-etm@openssh.com"]));
+        for trust in [app, gate] {
+            assert_eq!(
+                trust["required_capabilities"],
+                json!([TRANSPORT_ALGORITHM_POLICY_CAPABILITY])
+            );
+        }
+        let ordinary = route_trust(&exported, "r.right.ssh");
+        for field in ["kex_algorithms", "ciphers", "macs", "required_capabilities"] {
+            assert!(ordinary[field].is_null());
+        }
+    }
+
+    #[test]
+    fn transport_expressions_reject_relative_unknown_patterns_and_whole_list_overflow() {
+        let base = "Host *\n HostName box\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n";
+        for (keyword, name) in [
+            ("KexAlgorithms", "curve25519-sha256"),
+            ("Ciphers", "aes256-ctr"),
+            ("MACs", "hmac-sha2-256-etm@openssh.com"),
+        ] {
+            for expression in [
+                format!("+{name}"),
+                format!("-{name}"),
+                "-*".into(),
+                format!("{name}*"),
+                format!("!{name}"),
+                format!("{name},"),
+                format!(",{name}"),
+                format!("{name},,{name}"),
+                format!("unknown,{name}"),
+                format!("{name} unknown"),
+                format!("^unknown,{name}"),
+                "^".into(),
+                format!("^{name},"),
+                "none".into(),
+                format!("++{name}"),
+                std::iter::repeat_n(name, 65).collect::<Vec<_>>().join(","),
+            ] {
+                let mut sources = sources(Some(&format!(
+                    "{base}{keyword} {expression}\n{keyword} {name}\n"
+                )));
+                supply(
+                    &mut sources,
+                    "/trust/keys",
+                    format!("box {}\n", fake_key(50)),
+                );
+                let exported = trust_export(&sources);
+                let trust = route_trust(&exported, "r.left.ssh");
+                for field in ["kex_algorithms", "ciphers", "macs"] {
+                    assert!(trust[field].is_null(), "{keyword} {expression}");
+                }
+                assert_eq!(
+                    trust["required_capabilities"],
+                    json!([UNRESOLVED_POLICY]),
+                    "{keyword} {expression}"
+                );
+                assert!(
+                    exported
+                        .notes
+                        .iter()
+                        .any(|note| note.message.contains(&keyword.to_ascii_lowercase())
+                            && note.message.contains("remains blocked")),
+                    "{keyword} {expression}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepended_transport_preferences_are_visible_without_guessed_defaults() {
+        let mut sources = sources(Some(
+            "Host *\n HostName box\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n KexAlgorithms ^ecdh-sha2-nistp256\n Ciphers ^aes128-gcm@openssh.com,aes256-gcm@openssh.com\n MACs ^hmac-sha2-256-etm@openssh.com,hmac-sha2-256\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/keys",
+            format!("box {}\n", fake_key(50)),
+        );
+        let exported = trust_export(&sources);
+        let trust = route_trust(&exported, "r.left.ssh");
+        for field in ["kex_algorithms", "ciphers", "macs", "required_capabilities"] {
+            assert!(trust[field].is_null());
+        }
+        for keyword in ["kexalgorithms", "ciphers", "macs"] {
+            assert!(
+                exported
+                    .portability
+                    .iter()
+                    .any(|finding| finding.disposition == 0
+                        && finding.reason.contains(keyword)
+                        && finding.reason.contains("inactive"))
+            );
+        }
+    }
+
+    #[test]
+    fn known_unsupported_transport_lists_survive_without_added_mobile_defaults() {
+        let mut sources = sources(Some(
+            "Host *\n HostName box\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n KexAlgorithms mlkem768nistp256-sha256,mlkem768x25519-sha256,sntrup761x25519-sha512,diffie-hellman-group1-sha1\n Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,3des-cbc\n MACs umac-128-etm@openssh.com,hmac-sha1\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/keys",
+            format!("box {}\n", fake_key(50)),
+        );
+        let exported = trust_export(&sources);
+        let trust = route_trust(&exported, "r.left.ssh");
+        assert_eq!(
+            trust["kex_algorithms"],
+            json!([
+                "mlkem768nistp256-sha256",
+                "mlkem768x25519-sha256",
+                "sntrup761x25519-sha512",
+                "diffie-hellman-group1-sha1"
+            ])
+        );
+        assert_eq!(
+            trust["ciphers"],
+            json!([
+                "chacha20-poly1305@openssh.com",
+                "aes256-gcm@openssh.com",
+                "3des-cbc"
+            ])
+        );
+        assert_eq!(
+            trust["macs"],
+            json!(["umac-128-etm@openssh.com", "hmac-sha1"])
+        );
+        assert_eq!(
+            trust["required_capabilities"],
+            json!([TRANSPORT_ALGORITHM_POLICY_CAPABILITY])
+        );
+    }
+
+    #[test]
+    fn group_selection_intersects_all_unselected_algorithm_dimensions_without_erasing_empty_policy()
+    {
+        let inventory = MachineInventory::parse(
+            &format!("{TRUST_INVENTORY}\n[groups.only_left]\nmachines = [\"left\"]\n"),
+            &context(),
+        )
+        .unwrap();
+        let config = "Host left\n HostName box\n HostKeyAlgorithms rsa-sha2-512,ssh-ed25519\n CASignatureAlgorithms rsa-sha2-512,ssh-ed25519\n Ciphers aes128-ctr,aes256-ctr\nHost right\n HostName box\n HostKeyAlgorithms ssh-ed25519\n CASignatureAlgorithms ssh-ed25519\n Ciphers aes256-ctr\n KexAlgorithms curve25519-sha256\n MACs hmac-sha2-512-etm@openssh.com\nHost *\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n";
+        let mut sources = sources(Some(config));
+        supply(
+            &mut sources,
+            "/trust/keys",
+            format!("box {}\n", fake_key(50)),
+        );
+        let selected = export(&inventory, Some("only_left"), &sources, &context()).unwrap();
+        assert_eq!(selected.machines, 1);
+        let trust = route_trust(&selected, "r.left.ssh");
+        assert_eq!(trust["host_key_algorithms"], json!(["ssh-ed25519"]));
+        assert_eq!(trust["ca_signature_algorithms"], json!(["ssh-ed25519"]));
+        assert_eq!(trust["ciphers"], json!(["aes256-ctr"]));
+        assert_eq!(trust["kex_algorithms"], json!(["curve25519-sha256"]));
+        assert_eq!(trust["macs"], json!(["hmac-sha2-512-etm@openssh.com"]));
+        assert_eq!(
+            trust["required_capabilities"],
+            json!([
+                HOST_ALGORITHM_POLICY_CAPABILITY,
+                TRANSPORT_ALGORITHM_POLICY_CAPABILITY
+            ])
+        );
+
+        sources.config = Some(
+            config
+                .replace(
+                    "Ciphers aes256-ctr\n",
+                    "Ciphers chacha20-poly1305@openssh.com\n",
+                )
+                .replace(
+                    "HostKeyAlgorithms ssh-ed25519\n",
+                    "HostKeyAlgorithms rsa-sha2-256\n",
+                )
+                .replace(
+                    "CASignatureAlgorithms ssh-ed25519\n",
+                    "CASignatureAlgorithms rsa-sha2-256\n",
+                ),
+        );
+        let disjoint = export(&inventory, Some("only_left"), &sources, &context()).unwrap();
+        assert_eq!(
+            route_trust(&disjoint, "r.left.ssh")["host_key_algorithms"],
+            json!([])
+        );
+        assert_eq!(
+            route_trust(&disjoint, "r.left.ssh")["ca_signature_algorithms"],
+            json!([])
+        );
+        assert_eq!(route_trust(&disjoint, "r.left.ssh")["ciphers"], json!([]));
+        assert_eq!(
+            route_trust(&disjoint, "r.left.ssh")["required_capabilities"],
+            json!([
+                HOST_ALGORITHM_POLICY_CAPABILITY,
+                TRANSPORT_ALGORITHM_POLICY_CAPABILITY
+            ])
+        );
+
+        sources.config = Some(config.replace("Ciphers aes256-ctr\n", "Ciphers -aes128-ctr\n"));
+        let unresolved = export(&inventory, Some("only_left"), &sources, &context()).unwrap();
+        assert!(
+            route_trust(&unresolved, "r.left.ssh")["required_capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(UNRESOLVED_POLICY))
+        );
+
+        sources.config = Some(config.replace(
+            "Host right\n HostName box\n",
+            "Host right\n HostName other\n",
+        ));
+        let separate = export(&inventory, Some("only_left"), &sources, &context()).unwrap();
+        let trust = route_trust(&separate, "r.left.ssh");
+        assert_eq!(
+            trust["host_key_algorithms"],
+            json!(["rsa-sha2-512", "ssh-ed25519"])
+        );
+        assert_eq!(
+            trust["ca_signature_algorithms"],
+            json!(["rsa-sha2-512", "ssh-ed25519"])
+        );
+        assert_eq!(trust["ciphers"], json!(["aes128-ctr", "aes256-ctr"]));
+        assert!(trust["kex_algorithms"].is_null());
+        assert!(trust["macs"].is_null());
     }
 
     #[cfg(unix)]

@@ -8,9 +8,16 @@ public struct WorkspaceHostAlgorithmPolicy: Sendable, Equatable, Codable {
     public static let maximumAlgorithms = 64
     public let hostKeyAlgorithms: [String]?
     public let caSignatureAlgorithms: [String]?
-    public var isConstrained: Bool { hostKeyAlgorithms != nil || caSignatureAlgorithms != nil }
+    public let transport: WorkspaceSSHTransportAlgorithmPolicy
+    public var isSignatureConstrained: Bool { hostKeyAlgorithms != nil || caSignatureAlgorithms != nil }
+    public var isConstrained: Bool { isSignatureConstrained || transport.isConstrained }
+    public var requiredCapabilities: Set<String> {
+        (isSignatureConstrained ? [WorkspaceDocument.hostAlgorithmPolicyCapability] : Set<String>())
+            .union(transport.isConstrained ? [WorkspaceDocument.transportAlgorithmPolicyCapability] : [])
+    }
 
-    public init(hostKeyAlgorithms: [String]? = nil, caSignatureAlgorithms: [String]? = nil) throws {
+    public init(hostKeyAlgorithms: [String]? = nil, caSignatureAlgorithms: [String]? = nil,
+                transport: WorkspaceSSHTransportAlgorithmPolicy = .unconstrained) throws {
         func checked(_ values: [String]?) throws -> [String]? {
             guard let values else { return nil }
             guard values.count <= Self.maximumAlgorithms else { throw FTError.limit("trust.algorithms") }
@@ -19,10 +26,12 @@ public struct WorkspaceHostAlgorithmPolicy: Sendable, Equatable, Codable {
         }
         self.hostKeyAlgorithms = try checked(hostKeyAlgorithms)
         self.caSignatureAlgorithms = try checked(caSignatureAlgorithms)
+        self.transport = transport
     }
 
-    private init(validatedHost: [String]?, validatedCA: [String]?) {
+    private init(validatedHost: [String]?, validatedCA: [String]?, transport: WorkspaceSSHTransportAlgorithmPolicy = .unconstrained) {
         hostKeyAlgorithms = validatedHost; caSignatureAlgorithms = validatedCA
+        self.transport = transport
     }
 
     public static let unconstrained = Self(validatedHost: nil, validatedCA: nil)
@@ -30,7 +39,8 @@ public struct WorkspaceHostAlgorithmPolicy: Sendable, Equatable, Codable {
     public init(from decoder: any Decoder) throws {
         let fields = try decoder.container(keyedBy: CodingKeys.self)
         try self.init(hostKeyAlgorithms: fields.decodeIfPresent([String].self, forKey: .hostKeyAlgorithms),
-                      caSignatureAlgorithms: fields.decodeIfPresent([String].self, forKey: .caSignatureAlgorithms))
+                      caSignatureAlgorithms: fields.decodeIfPresent([String].self, forKey: .caSignatureAlgorithms),
+                      transport: fields.decodeIfPresent(WorkspaceSSHTransportAlgorithmPolicy.self, forKey: .transport) ?? .unconstrained)
     }
 
     /// Constraints only become stronger. The receiver's preference order stays
@@ -43,7 +53,8 @@ public struct WorkspaceHostAlgorithmPolicy: Sendable, Equatable, Codable {
             return lhs.filter(accepted.contains)
         }
         return .init(validatedHost: intersection(hostKeyAlgorithms, other.hostKeyAlgorithms),
-                     validatedCA: intersection(caSignatureAlgorithms, other.caSignatureAlgorithms))
+                     validatedCA: intersection(caSignatureAlgorithms, other.caSignatureAlgorithms),
+                     transport: transport.intersecting(other.transport))
     }
 
     /// Use before key exchange. A qualified native profile is narrowed and
@@ -55,7 +66,8 @@ public struct WorkspaceHostAlgorithmPolicy: Sendable, Equatable, Codable {
     }
 
     public func permits(hostKeyAlgorithm: String, negotiatedHostSignature: String?,
-                        certificate: SSHHostCertificate?) -> Bool {
+                        certificate: SSHHostCertificate?, negotiatedTransport: SSHTransportAlgorithms? = nil) -> Bool {
+        guard transport.permits(negotiatedTransport) else { return false }
         if let certificate {
             guard certificate.algorithm == hostKeyAlgorithm else { return false }
         } else if hostKeyAlgorithm.hasSuffix("-cert-v01@openssh.com") { return false }
@@ -107,5 +119,6 @@ public struct WorkspaceHostAlgorithmPolicy: Sendable, Equatable, Codable {
         }
         return contains(hostKeyAlgorithms, other.hostKeyAlgorithms)
             && contains(caSignatureAlgorithms, other.caSignatureAlgorithms)
+            && transport.isAtLeastAsRestrictive(as: other.transport)
     }
 }

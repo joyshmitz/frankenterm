@@ -296,7 +296,7 @@ public actor WorkspaceStore {
         let machineIDs: [String]
     }
     private struct Catalog: Codable {
-        var version = 11
+        var version = 12
         var workspaces: [InstalledWorkspace] = []
         var revokedFingerprints: Set<String> = []
         var acceptedImports: [AcceptedImport] = []
@@ -320,7 +320,7 @@ public actor WorkspaceStore {
         init(from decoder: Decoder) throws {
             let fields = try decoder.container(keyedBy: CodingKeys.self)
             let storedVersion = try fields.decode(Int.self, forKey: .version)
-            guard (1...11).contains(storedVersion) else { throw WorkspaceStoreError.corruptStore }
+            guard (1...12).contains(storedVersion) else { throw WorkspaceStoreError.corruptStore }
             workspaces = try fields.decode([InstalledWorkspace].self, forKey: .workspaces)
             revokedFingerprints = try fields.decode(Set<String>.self, forKey: .revokedFingerprints)
             guard workspaces.count <= 32, revokedFingerprints.count <= 4096 else { throw WorkspaceStoreError.corruptStore }
@@ -405,6 +405,13 @@ public actor WorkspaceStore {
                 }
             }
             guard hostAlgorithmPolicies.count <= WorkspaceStore.hostAlgorithmPolicyLimit else { throw WorkspaceStoreError.corruptStore }
+            if storedVersion < 12 {
+                guard !hostAlgorithmPolicies.contains(where: { $0.policy.transport.isConstrained }),
+                      !hostRequirements.contains(where: { $0.capability == WorkspaceDocument.transportAlgorithmPolicyCapability }),
+                      try !workspaces.contains(where: {
+                          try $0.importedDocument().hostTrust.contains(where: { $0.algorithmPolicy.transport.isConstrained })
+                      }) else { throw WorkspaceStoreError.corruptStore }
+            }
             if storedVersion >= 11 {
                 hostRevocationSources = try fields.decode([StoredHostRevocationSource].self, forKey: .hostRevocationSources)
                 hostRevocationSourceScopes = try fields.decode([ScopedHostRevocationSources].self, forKey: .hostRevocationSourceScopes)
@@ -418,7 +425,7 @@ public actor WorkspaceStore {
                   hostRevocationSourceScopes.count <= WorkspaceStore.hostRevocationScopeLimit else {
                 throw WorkspaceStoreError.corruptStore
             }
-            needsSanitizedPublication = storedVersion != 11
+            needsSanitizedPublication = storedVersion != 12
             // Older catalogs could retain opaque desktop annotations. Reuse the
             // wire validator so neither migration nor re-export can preserve an
             // untyped private value in this public configuration store.
@@ -1770,7 +1777,8 @@ public actor WorkspaceStore {
         let states = try readiness(document: document, workspaceID: workspaceID, available: available,
             findings: saved.findings, catalog: catalog, support: support)
         guard let state = states.first(where: { $0.routeID == routeID }),
-              !state.issues.contains(.unsupportedRequirement), !state.issues.contains(.transportUnavailable) else {
+              !state.issues.contains(.unsupportedRequirement), !state.issues.contains(.transportUnavailable),
+              !state.issues.contains(.transportAlgorithmUnavailable) else {
             throw WorkspaceHostKeyPinError.unsupportedPolicy
         }
         for hop in hops {
@@ -1830,7 +1838,7 @@ public actor WorkspaceStore {
             throw WorkspaceHostKeyPinError.revoked
         }
         guard !state.issues.contains(.hostTrustMissing), !state.issues.contains(.hostAlgorithmUnavailable),
-              !state.issues.contains(.unsupportedRequirement) else {
+              !state.issues.contains(.transportAlgorithmUnavailable), !state.issues.contains(.unsupportedRequirement) else {
             throw WorkspaceHostKeyPinError.unsupportedPolicy
         }
     }
@@ -1879,6 +1887,7 @@ public actor WorkspaceStore {
                               hostCertificate: SSHHostCertificate? = nil,
                               rawHostIdentity: SSHPublicIdentity? = nil,
                               negotiatedHostSignature: String? = nil,
+                              negotiatedTransport: SSHTransportAlgorithms? = nil,
                               support: WorkspaceDocument.RouteSupport = .offlineOnly) throws -> WorkspaceDocument.HostVerificationDecision {
         try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
@@ -1908,6 +1917,7 @@ public actor WorkspaceStore {
                 certificateAuthority: certificateAuthority, hostCertificate: hostCertificate,
                 rawHostIdentity: rawHostIdentity,
                 negotiatedHostSignature: negotiatedHostSignature,
+                negotiatedTransport: negotiatedTransport,
                 reviewedTrustIDs: Set(document.hostTrust.map(\.id)),
                 support: support, revokedHostKeysByTrustScope: rejected,
                 requiredHostCapabilitiesByTrustScope: hostRequirements(workspaceID, catalog: catalog),
@@ -1924,11 +1934,13 @@ public actor WorkspaceStore {
         hostCertificate: SSHHostCertificate? = nil,
         rawHostIdentity: SSHPublicIdentity? = nil,
         negotiatedHostSignature: String? = nil,
+        negotiatedTransport: SSHTransportAlgorithms? = nil,
         support: WorkspaceDocument.RouteSupport, transitForRouteID: String? = nil,
         hostKeyProbe: WorkspaceHostKeyProbe? = nil) throws -> WorkspaceSSHAuthorization {
         try authorizeSSHAuthentication(workspaceID: workspaceID, expectedRevision: expectedRevision,
             routeID: routeID, credentialID: credentialID, presentedHostKey: presentedHostKey,
             hostCertificate: hostCertificate, rawHostIdentity: rawHostIdentity, negotiatedHostSignature: negotiatedHostSignature,
+            negotiatedTransport: negotiatedTransport,
             support: support, transitForRouteID: transitForRouteID,
             hostKeyProbe: hostKeyProbe, forAuthentication: true)
     }
@@ -1938,6 +1950,7 @@ public actor WorkspaceStore {
         hostCertificate: SSHHostCertificate?,
         rawHostIdentity: SSHPublicIdentity?,
         negotiatedHostSignature: String?,
+        negotiatedTransport: SSHTransportAlgorithms?,
         support: WorkspaceDocument.RouteSupport, transitForRouteID: String?,
         hostKeyProbe: WorkspaceHostKeyProbe?, forAuthentication: Bool) throws -> WorkspaceSSHAuthorization {
         try persistence.withExclusiveAccess {
@@ -1984,7 +1997,8 @@ public actor WorkspaceStore {
             try requireSSHHostTrust(saved: saved, document: document, route: route,
                 presentedHostKey: presentedHostKey, hostCertificate: hostCertificate,
                 rawHostIdentity: rawHostIdentity,
-                negotiatedHostSignature: negotiatedHostSignature, support: support, catalog: catalog,
+                negotiatedHostSignature: negotiatedHostSignature, negotiatedTransport: negotiatedTransport,
+                support: support, catalog: catalog,
                 transitForRouteID: transitForRouteID, certificateTime: certificateTime)
             return .init(storeOwner: sshAuthorizationOwner, account: binding.account,
                 workspaceID: workspaceID, workspaceRevision: saved.revision, routeID: routeID,
@@ -1994,7 +2008,7 @@ public actor WorkspaceStore {
                 algorithm: credential.algorithm, fingerprint: credential.fingerprint, presentedHostKey: presentedHostKey,
                 userCertificate: credential.userCertificate, hostCertificate: hostCertificate,
                 rawHostIdentity: rawHostIdentity,
-                negotiatedHostSignature: negotiatedHostSignature)
+                negotiatedHostSignature: negotiatedHostSignature, negotiatedTransport: negotiatedTransport)
         }
     }
 
@@ -2009,6 +2023,7 @@ public actor WorkspaceStore {
             credentialID: authorization.credentialID, presentedHostKey: authorization.presentedHostKey,
             hostCertificate: authorization.hostCertificate, rawHostIdentity: authorization.rawHostIdentity,
             negotiatedHostSignature: authorization.negotiatedHostSignature,
+            negotiatedTransport: authorization.negotiatedTransport,
             support: support,
             transitForRouteID: authorization.transitForRouteID, hostKeyProbe: authorization.hostKeyProbe, forAuthentication: false)
         guard current == authorization else { throw SSHAuthenticationError.stale }
@@ -2022,12 +2037,13 @@ public actor WorkspaceStore {
         hostCertificate: SSHHostCertificate? = nil,
         rawHostIdentity: SSHPublicIdentity? = nil,
         negotiatedHostSignature: String? = nil,
+        negotiatedTransport: SSHTransportAlgorithms? = nil,
         support: WorkspaceDocument.RouteSupport, transitForRouteID: String? = nil,
         hostKeyProbe: WorkspaceHostKeyProbe? = nil) throws -> WorkspaceSSHPasswordAuthorization {
         try authorizeSSHPasswordAuthentication(workspaceID: workspaceID, expectedRevision: expectedRevision,
             routeID: routeID, presentedHostKey: presentedHostKey, hostCertificate: hostCertificate,
             rawHostIdentity: rawHostIdentity,
-            negotiatedHostSignature: negotiatedHostSignature, support: support,
+            negotiatedHostSignature: negotiatedHostSignature, negotiatedTransport: negotiatedTransport, support: support,
             transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe, forAuthentication: true)
     }
 
@@ -2036,18 +2052,21 @@ public actor WorkspaceStore {
         hostCertificate: SSHHostCertificate?,
         rawHostIdentity: SSHPublicIdentity?,
         negotiatedHostSignature: String?,
+        negotiatedTransport: SSHTransportAlgorithms?,
         support: WorkspaceDocument.RouteSupport, transitForRouteID: String?,
         hostKeyProbe: WorkspaceHostKeyProbe?, forAuthentication: Bool) throws -> WorkspaceSSHPasswordAuthorization {
         let selected = try authorizeSSHAccountAuthentication(method: .password, workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, presentedHostKey: presentedHostKey,
             hostCertificate: hostCertificate, rawHostIdentity: rawHostIdentity, negotiatedHostSignature: negotiatedHostSignature,
+            negotiatedTransport: negotiatedTransport,
             support: support, transitForRouteID: transitForRouteID,
             hostKeyProbe: hostKeyProbe, forAuthentication: forAuthentication)
         return .init(storeOwner: sshAuthorizationOwner, workspaceID: workspaceID, workspaceRevision: selected.revision,
             routeID: routeID, host: selected.route.host, port: selected.route.port, user: selected.route.user,
             routeMode: selected.route.mode, jumpRouteIDs: selected.route.jumpRoutes,
             transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe, presentedHostKey: presentedHostKey,
-            hostCertificate: hostCertificate, rawHostIdentity: rawHostIdentity, negotiatedHostSignature: negotiatedHostSignature)
+            hostCertificate: hostCertificate, rawHostIdentity: rawHostIdentity, negotiatedHostSignature: negotiatedHostSignature,
+            negotiatedTransport: negotiatedTransport)
     }
 
     /// Keyboard-interactive has its own imported method authorization. Permission
@@ -2057,12 +2076,13 @@ public actor WorkspaceStore {
         hostCertificate: SSHHostCertificate? = nil,
         rawHostIdentity: SSHPublicIdentity? = nil,
         negotiatedHostSignature: String? = nil,
+        negotiatedTransport: SSHTransportAlgorithms? = nil,
         support: WorkspaceDocument.RouteSupport, transitForRouteID: String? = nil,
         hostKeyProbe: WorkspaceHostKeyProbe? = nil) throws -> WorkspaceSSHKeyboardInteractiveAuthorization {
         try authorizeSSHKeyboardInteractiveAuthentication(workspaceID: workspaceID, expectedRevision: expectedRevision,
             routeID: routeID, presentedHostKey: presentedHostKey, hostCertificate: hostCertificate,
             rawHostIdentity: rawHostIdentity,
-            negotiatedHostSignature: negotiatedHostSignature, support: support,
+            negotiatedHostSignature: negotiatedHostSignature, negotiatedTransport: negotiatedTransport, support: support,
             transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe, forAuthentication: true)
     }
 
@@ -2071,18 +2091,21 @@ public actor WorkspaceStore {
         hostCertificate: SSHHostCertificate?,
         rawHostIdentity: SSHPublicIdentity?,
         negotiatedHostSignature: String?,
+        negotiatedTransport: SSHTransportAlgorithms?,
         support: WorkspaceDocument.RouteSupport, transitForRouteID: String?,
         hostKeyProbe: WorkspaceHostKeyProbe?, forAuthentication: Bool) throws -> WorkspaceSSHKeyboardInteractiveAuthorization {
         let selected = try authorizeSSHAccountAuthentication(method: .keyboardInteractive, workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, presentedHostKey: presentedHostKey,
             hostCertificate: hostCertificate, rawHostIdentity: rawHostIdentity, negotiatedHostSignature: negotiatedHostSignature,
+            negotiatedTransport: negotiatedTransport,
             support: support, transitForRouteID: transitForRouteID,
             hostKeyProbe: hostKeyProbe, forAuthentication: forAuthentication)
         return .init(storeOwner: sshAuthorizationOwner, workspaceID: workspaceID, workspaceRevision: selected.revision,
             routeID: routeID, host: selected.route.host, port: selected.route.port, user: selected.route.user,
             routeMode: selected.route.mode, jumpRouteIDs: selected.route.jumpRoutes,
             transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe, presentedHostKey: presentedHostKey,
-            hostCertificate: hostCertificate, rawHostIdentity: rawHostIdentity, negotiatedHostSignature: negotiatedHostSignature)
+            hostCertificate: hostCertificate, rawHostIdentity: rawHostIdentity, negotiatedHostSignature: negotiatedHostSignature,
+            negotiatedTransport: negotiatedTransport)
     }
 
     private func authorizeSSHAccountAuthentication(method: WorkspaceDocument.AuthenticationMethod,
@@ -2090,6 +2113,7 @@ public actor WorkspaceStore {
         hostCertificate: SSHHostCertificate?,
         rawHostIdentity: SSHPublicIdentity?,
         negotiatedHostSignature: String?,
+        negotiatedTransport: SSHTransportAlgorithms?,
         support: WorkspaceDocument.RouteSupport, transitForRouteID: String?,
         hostKeyProbe: WorkspaceHostKeyProbe?, forAuthentication: Bool) throws -> (route: WorkspaceDocument.Route, revision: UUID) {
         guard method == .password || method == .keyboardInteractive else { throw SSHAuthenticationError.denied }
@@ -2134,7 +2158,8 @@ public actor WorkspaceStore {
             try requireSSHHostTrust(saved: saved, document: document, route: route,
                 presentedHostKey: presentedHostKey, hostCertificate: hostCertificate,
                 rawHostIdentity: rawHostIdentity,
-                negotiatedHostSignature: negotiatedHostSignature, support: support, catalog: catalog,
+                negotiatedHostSignature: negotiatedHostSignature, negotiatedTransport: negotiatedTransport,
+                support: support, catalog: catalog,
                 transitForRouteID: transitForRouteID, certificateTime: certificateTime)
             return (route, saved.revision)
         }
@@ -2146,13 +2171,14 @@ public actor WorkspaceStore {
     private func requireSSHHostTrust(saved: InstalledWorkspace, document: WorkspaceDocument,
         route: WorkspaceDocument.Route, presentedHostKey: WorkspaceDocument.HostKey,
         hostCertificate: SSHHostCertificate?, rawHostIdentity: SSHPublicIdentity?,
-        negotiatedHostSignature: String?, support: WorkspaceDocument.RouteSupport,
+        negotiatedHostSignature: String?, negotiatedTransport: SSHTransportAlgorithms?, support: WorkspaceDocument.RouteSupport,
         catalog: Catalog, transitForRouteID: String?, certificateTime: Date?) throws {
         let reviewed = Set(document.hostTrust.map(\.id))
         let revoked = hostRevocations(saved.id, document: document, catalog: catalog)
         let required = hostRequirements(saved.id, catalog: catalog)
         let decision = try document.verifyHostKey(forRouteID: route.id, presented: presentedHostKey,
             hostCertificate: hostCertificate, rawHostIdentity: rawHostIdentity, negotiatedHostSignature: negotiatedHostSignature,
+            negotiatedTransport: negotiatedTransport,
             reviewedTrustIDs: reviewed, support: support, revokedHostKeysByTrustScope: revoked,
             requiredHostCapabilitiesByTrustScope: required,
             hostAlgorithmPoliciesByTrustScope: hostAlgorithmPolicies(saved.id, catalog: catalog),
@@ -2203,7 +2229,8 @@ public actor WorkspaceStore {
             expectedRevision: authorization.workspaceRevision, routeID: authorization.routeID,
             presentedHostKey: authorization.presentedHostKey, hostCertificate: authorization.hostCertificate,
             rawHostIdentity: authorization.rawHostIdentity,
-            negotiatedHostSignature: authorization.negotiatedHostSignature, support: support,
+            negotiatedHostSignature: authorization.negotiatedHostSignature,
+            negotiatedTransport: authorization.negotiatedTransport, support: support,
             transitForRouteID: authorization.transitForRouteID, hostKeyProbe: authorization.hostKeyProbe, forAuthentication: false)
         guard current == authorization else { throw SSHAuthenticationError.stale }
     }
@@ -2215,7 +2242,8 @@ public actor WorkspaceStore {
             expectedRevision: authorization.workspaceRevision, routeID: authorization.routeID,
             presentedHostKey: authorization.presentedHostKey, hostCertificate: authorization.hostCertificate,
             rawHostIdentity: authorization.rawHostIdentity,
-            negotiatedHostSignature: authorization.negotiatedHostSignature, support: support,
+            negotiatedHostSignature: authorization.negotiatedHostSignature,
+            negotiatedTransport: authorization.negotiatedTransport, support: support,
             transitForRouteID: authorization.transitForRouteID, hostKeyProbe: authorization.hostKeyProbe, forAuthentication: false)
         guard current == authorization else { throw SSHAuthenticationError.stale }
     }
@@ -2294,7 +2322,9 @@ public actor WorkspaceStore {
                 routeID: routeID, support: support, catalog: catalog)
             let policy = try context.document.hostAlgorithmPolicy(forTrustID: context.trust.id,
                 additional: hostAlgorithmPolicies(workspaceID, catalog: catalog))
-            guard !policy.isConstrained || support.capabilities.contains(WorkspaceDocument.hostAlgorithmPolicyCapability) else {
+            guard policy.requiredCapabilities.isSubset(of: support.capabilities),
+                  policy.transport.hasSupportedAlgorithms(keyExchangeAlgorithms: support.keyExchangeAlgorithms,
+                    ciphers: support.ciphers, macs: support.macs) else {
                 throw SSHAuthenticationError.denied
             }
             return policy
@@ -2510,7 +2540,7 @@ public actor WorkspaceStore {
     }
     private func readCatalog() throws -> Catalog {
         guard let data = try persistence.read(.catalog, limit: Self.catalogLimit) else { return Catalog() }
-        guard let catalog = try? JSONDecoder().decode(Catalog.self, from: data), catalog.version == 11,
+        guard let catalog = try? JSONDecoder().decode(Catalog.self, from: data), catalog.version == 12,
               catalog.workspaces.count <= 32, catalog.revokedFingerprints.count <= 4096,
               catalog.revokedFingerprints.allSatisfy({ (try? WorkspaceDocument.fingerprint($0)) != nil }),
               catalog.acceptedImports.count <= Self.importHistoryLimit, catalog.hostRevocations.count <= Self.hostRevocationLimit,
@@ -2559,9 +2589,11 @@ public actor WorkspaceStore {
             guard workspaceIDs.contains(requirement.workspaceID), !requirement.scope.isEmpty,
                   requirement.scope.utf8.count <= FTLimit.text + 64,
                   Self.validHostRequirement(requirement.capability) else { throw WorkspaceStoreError.corruptStore }
-            if requirement.capability == WorkspaceDocument.hostAlgorithmPolicyCapability {
+            if requirement.capability == WorkspaceDocument.hostAlgorithmPolicyCapability
+                || requirement.capability == WorkspaceDocument.transportAlgorithmPolicyCapability {
                 guard catalog.hostAlgorithmPolicies.contains(where: {
                     $0.workspaceID == requirement.workspaceID && $0.scope == requirement.scope
+                        && $0.policy.requiredCapabilities.contains(requirement.capability)
                 }) else { throw WorkspaceStoreError.corruptStore }
             }
             if requirement.capability == WorkspaceDocument.hostRevocationCapability {
@@ -2575,8 +2607,10 @@ public actor WorkspaceStore {
             guard workspaceIDs.contains(entry.workspaceID), !entry.scope.isEmpty,
                   entry.scope.utf8.count <= FTLimit.text + 64, entry.policy.isConstrained,
                   algorithmScopes.insert([entry.workspaceID.uuidString, entry.scope]).inserted,
-                  catalog.hostRequirements.contains(.init(workspaceID: entry.workspaceID, scope: entry.scope,
-                    capability: WorkspaceDocument.hostAlgorithmPolicyCapability)) else { throw WorkspaceStoreError.corruptStore }
+                  entry.policy.requiredCapabilities.allSatisfy({ capability in
+                      catalog.hostRequirements.contains(.init(workspaceID: entry.workspaceID, scope: entry.scope,
+                        capability: capability))
+                  }) else { throw WorkspaceStoreError.corruptStore }
         }
         var sourceKeys = Set<[String]>(), sourceScopes = Set<[String]>()
         for entry in catalog.hostRevocationSources {
