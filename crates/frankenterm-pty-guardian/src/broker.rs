@@ -21232,6 +21232,21 @@ mod tests {
         }
     }
 
+    /// What a test child wrote with `printf X >>"$BROKER_SENTINEL"`, once the
+    /// sentinel holds something or `timeout` has passed. The shell creates the
+    /// file before it writes, so the file existing does not mean the write has
+    /// landed, and a loaded worker can show the gap (ft-q1lol).
+    fn read_sentinel_once_written(sentinel: &std::path::Path, timeout: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let written = fs::read(sentinel).unwrap_or_default();
+            if !written.is_empty() || Instant::now() >= deadline {
+                return written;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn command_payload(script: &str, sentinel: &std::path::Path) -> GuardianSpawnPayload {
         let mut command = portable_pty::CommandBuilder::new("/bin/sh");
         command.arg("-c");
@@ -27519,12 +27534,8 @@ mod tests {
             conflict.header.status,
             BrokerControlResponseStatusV1::Quarantined
         );
-        let count_deadline = Instant::now() + Duration::from_secs(3);
-        while !sentinel.exists() && Instant::now() < count_deadline {
-            thread::sleep(Duration::from_millis(1));
-        }
         assert_eq!(
-            fs::read(&sentinel).expect("read control Spawn count"),
+            read_sentinel_once_written(&sentinel, Duration::from_secs(3)),
             b"C",
             "control retry created more than one child"
         );
@@ -28596,8 +28607,8 @@ mod tests {
         drop(secret);
 
         let restart_socket_path = root.join("broker-restart.sock");
-        let restarted = BrokerControlServiceV1::bind(
-            BrokerControlServiceConfigV1::new(
+        let restarted = bind_test_service_after_owner_drop(
+            &BrokerControlServiceConfigV1::new(
                 restart_socket_path.clone(),
                 token_path.clone(),
                 spawn_catalog_path,
@@ -28686,6 +28697,12 @@ mod tests {
         directory
     }
 
+    /// How many 1 ms pauses the test reopen helpers below wait out an
+    /// inherited catalog lock for. 100 (0.1 s) was too short on a loaded RCH
+    /// worker, where a forked child can take longer to reach its pre-exec close
+    /// sweep (ft-q1lol).
+    const TEST_INHERITED_LOCK_ATTEMPTS: usize = 2_000;
+
     fn reopen_test_catalog_after_owner_drop(
         directory: &Path,
     ) -> Result<BrokerSpawnWalCatalogV1, BrokerSpawnWalError> {
@@ -28696,9 +28713,11 @@ mod tests {
         // parent descriptor was explicitly dropped. Production admission must
         // still fail immediately on a real competing owner; only this bounded
         // test restart helper waits for the CLOEXEC/pre-exec handoff to settle.
-        for attempt in 0..100 {
+        for attempt in 1..=TEST_INHERITED_LOCK_ATTEMPTS {
             match BrokerSpawnWalCatalogV1::open(directory.to_path_buf()) {
-                Err(BrokerSpawnWalError::CatalogAlreadyOwned) if attempt < 99 => {
+                Err(BrokerSpawnWalError::CatalogAlreadyOwned)
+                    if attempt < TEST_INHERITED_LOCK_ATTEMPTS =>
+                {
                     thread::sleep(Duration::from_millis(1));
                 }
                 result => return result,
@@ -28710,11 +28729,13 @@ mod tests {
     fn reopen_test_lease_catalog_after_owner_drop(
         directory: &Path,
     ) -> Result<BrokerPaneLeaseWalCatalogV1, BrokerPaneLeaseWalErrorV1> {
-        for attempt in 0..100 {
+        for attempt in 1..=TEST_INHERITED_LOCK_ATTEMPTS {
             match BrokerPaneLeaseWalCatalogV1::open(directory.to_path_buf()) {
                 Err(BrokerPaneLeaseWalErrorV1::CatalogAuthority(
                     BrokerSpawnWalError::CatalogAlreadyOwned,
-                )) if attempt < 99 => thread::sleep(Duration::from_millis(1)),
+                )) if attempt < TEST_INHERITED_LOCK_ATTEMPTS => {
+                    thread::sleep(Duration::from_millis(1));
+                }
                 result => return result,
             }
         }
@@ -28727,18 +28748,22 @@ mod tests {
         // Like direct catalog reopen, service bind can race a parallel test's
         // fork between descriptor inheritance and the pre-exec close sweep.
         // Retry only that transient inherited-lock classification. Any real
-        // competing owner survives the fixed 100 ms ceiling, and every other
-        // startup error remains immediate and unchanged.
-        for attempt in 0..100 {
+        // competing owner survives the fixed ceiling, and every other startup
+        // error remains immediate and unchanged.
+        for attempt in 1..=TEST_INHERITED_LOCK_ATTEMPTS {
             match BrokerControlServiceV1::bind(config.clone()) {
                 Err(BrokerControlServiceError::SpawnCatalog(
                     BrokerSpawnWalError::CatalogAlreadyOwned,
-                )) if attempt < 99 => thread::sleep(Duration::from_millis(1)),
+                )) if attempt < TEST_INHERITED_LOCK_ATTEMPTS => {
+                    thread::sleep(Duration::from_millis(1));
+                }
                 Err(BrokerControlServiceError::LeaseCatalog(
                     BrokerPaneLeaseWalErrorV1::CatalogAuthority(
                         BrokerSpawnWalError::CatalogAlreadyOwned,
                     ),
-                )) if attempt < 99 => thread::sleep(Duration::from_millis(1)),
+                )) if attempt < TEST_INHERITED_LOCK_ATTEMPTS => {
+                    thread::sleep(Duration::from_millis(1));
+                }
                 result => return result,
             }
         }
@@ -31262,12 +31287,8 @@ mod tests {
             }
         }
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !sentinel.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
         assert_eq!(
-            fs::read(&sentinel).expect("read exec-barrier sentinel"),
+            read_sentinel_once_written(&sentinel, Duration::from_secs(2)),
             b"R",
             "durable Release or its lost-reply retry executed the user command incorrectly"
         );
@@ -31481,12 +31502,8 @@ mod tests {
             }
         }
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !sentinel.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
         assert_eq!(
-            fs::read(&sentinel).expect("read durable Spawn sentinel"),
+            read_sentinel_once_written(&sentinel, Duration::from_secs(2)),
             b"S",
             "durable Spawn retry created more than one user child"
         );
@@ -31575,12 +31592,8 @@ mod tests {
         assert!(recovered_status.head_reconciliation_required);
         assert!(recovered_status.append_authority_withheld);
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !sentinel.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
         assert_eq!(
-            fs::read(&sentinel).expect("read observation-cut sentinel"),
+            read_sentinel_once_written(&sentinel, Duration::from_secs(2)),
             b"O",
             "observation crash cut launched or lost the wrong child"
         );
