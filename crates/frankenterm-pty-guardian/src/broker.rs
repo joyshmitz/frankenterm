@@ -9954,11 +9954,16 @@ impl BrokerControlClientV1 {
         let result = self.collect_census_pages(deadline);
         let restore_read = self.stream.set_read_timeout(original_read_timeout);
         let restore_write = self.stream.set_write_timeout(original_write_timeout);
-        if let Err(error) = restore_read.and(restore_write) {
+        let restored = restore_read.and(restore_write);
+        if restored.is_err() {
             self.poisoned = true;
-            return Err(BrokerControlClientError::Io(error));
         }
-        result
+        // A broker may close a failed exchange, and Darwin then refuses the
+        // restoration with EINVAL; that must not replace the census's own
+        // failure.
+        let census = result?;
+        restored.map_err(BrokerControlClientError::Io)?;
+        Ok(census)
     }
 
     fn collect_census_pages(
@@ -24550,6 +24555,9 @@ mod tests {
                         .write_all(response.as_slice())
                         .expect("write duplicate Census response");
                 }
+                // Open until joined: Darwin refuses the client's timeout
+                // changes on a socket whose peer has closed.
+                server_stream
             });
             let mut client = BrokerControlClientV1 {
                 stream: client_stream,
@@ -24562,12 +24570,10 @@ mod tests {
                 recovered_hello: false,
                 poisoned: false,
             };
+            let census = client.census();
             assert!(
-                matches!(
-                    client.census(),
-                    Err(BrokerControlClientError::UnexpectedResponse)
-                ),
-                "cross-page duplicate {namespace} identity was accepted"
+                matches!(census, Err(BrokerControlClientError::UnexpectedResponse)),
+                "cross-page duplicate {namespace} identity was not refused: {census:?}"
             );
             assert!(
                 client.poisoned,

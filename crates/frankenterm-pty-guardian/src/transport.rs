@@ -6014,6 +6014,9 @@ mod tests {
                     .write_all(&encode_guardian_response(&secret, &response).unwrap())
                     .unwrap();
             }
+            // Open until joined: Darwin refuses to restore the client's
+            // timeouts on a socket whose peer has closed.
+            server_stream
         });
 
         let mut client = GuardianClient {
@@ -8528,6 +8531,9 @@ mod tests {
                     .write_all(&encode_guardian_response(&secret, &response).unwrap())
                     .unwrap();
             }
+            // Open until joined: Darwin refuses to restore the client's
+            // timeouts on a socket whose peer has closed.
+            server_stream
         });
 
         let mut client = GuardianClient {
