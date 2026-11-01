@@ -6544,10 +6544,23 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const COMPRESSED_MASK: u64 = 1 << 63;
-    // Stay below the default 4 MiB frame limit while exceeding ordinary Unix
-    // socket send buffers, so timeout/cancellation tests reach transport
-    // backpressure instead of failing at pre-write frame admission.
+    // Stay below the default 4 MiB frame limit. The tests explicitly constrain
+    // their send buffer: tuned hosts may accept this entire payload otherwise.
     const TRANSPORT_BACKPRESSURE_PASTE_BYTES: usize = 3 * 1024 * 1024;
+
+    fn constrain_paste_send_buffer(client: &DirectMuxClient) {
+        let socket = client.stream.as_std();
+        rustix::net::sockopt::set_socket_send_buffer_size(socket, 8192)
+            .expect("constrain the owned test socket send buffer");
+        let actual = rustix::net::sockopt::socket_send_buffer_size(socket)
+            .expect("read back the owned test socket send buffer");
+        assert!(
+            actual <= 64 * 1024,
+            "test send buffer is too large: {actual}"
+        );
+        assert!(actual < TRANSPORT_BACKPRESSURE_PASTE_BYTES);
+        assert_eq!(client.compression_mode, CompressionMode::Never);
+    }
 
     fn decode_u64_leb128_prefix(bytes: &[u8]) -> Option<u64> {
         let mut value = 0u64;
@@ -17528,13 +17541,17 @@ mod tests {
                 direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(200));
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
             client.config.write_timeout = Duration::from_millis(5);
+            constrain_paste_send_buffer(&client);
 
             let payload = "x".repeat(TRANSPORT_BACKPRESSURE_PASTE_BYTES);
             let err = client
                 .send_paste(0, payload)
                 .await
                 .expect_err("send_paste should time out when peer stops reading");
-            assert!(matches!(err, DirectMuxError::WriteTimeout));
+            assert!(
+                matches!(err, DirectMuxError::WriteTimeout),
+                "expected transport write timeout, received {err:?}"
+            );
             assert!(client.connection_poisoned);
             assert_eq!(client.poison_transition_count, 1);
             client.poison_connection("idempotent poison test", false);
@@ -17619,13 +17636,17 @@ mod tests {
                 .await
                 .expect("connect with cx");
             client.config.write_timeout = Duration::from_millis(5);
+            constrain_paste_send_buffer(&client);
 
             let payload = "x".repeat(TRANSPORT_BACKPRESSURE_PASTE_BYTES);
             let err = client
                 .send_paste_with_cx(&cx, 0, payload)
                 .await
                 .expect_err("send_paste_with_cx should time out when peer stops reading");
-            assert!(matches!(err, DirectMuxError::WriteTimeout));
+            assert!(
+                matches!(err, DirectMuxError::WriteTimeout),
+                "expected explicit-context transport write timeout, received {err:?}"
+            );
             assert!(client.connection_poisoned);
             assert_eq!(client.poison_transition_count, 1);
 
@@ -17717,6 +17738,7 @@ mod tests {
                 .await
                 .expect("connect with cx");
             client.config.write_timeout = Duration::from_millis(40);
+            constrain_paste_send_buffer(&client);
 
             let payload = "x".repeat(TRANSPORT_BACKPRESSURE_PASTE_BYTES);
             let err = client
