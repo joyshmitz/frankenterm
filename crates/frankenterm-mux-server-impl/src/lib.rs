@@ -7230,7 +7230,10 @@ impl LiveScrollbackSpillSink {
         previous: &LiveScrollbackSpillState,
         ledger_pane_id: u64,
     ) -> LiveScrollbackSpillState {
-        let predecessor = previous.snapshot_generation();
+        // A clear succeeds the published manifest, which is what the append
+        // WAL links to: rows commit windows appended past it were never
+        // published, and the clear drops them.
+        let predecessor = previous.published_view().snapshot_generation();
         LiveScrollbackSpillState {
             initial_stable_row: None,
             newest_stable_row_exclusive: None,
@@ -22055,6 +22058,59 @@ mod tests {
             LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
                 .unwrap();
         assert_rows_read_back_from(&reopened, 6, &live);
+    }
+
+    /// A clear arriving while commit windows run ahead of the manifest (the
+    /// ED3 an agent CLI sends mid-output) once named the unpublished window
+    /// generation as its predecessor. The append WAL still linked to the
+    /// published one, so every later supersession failed and the pane's
+    /// store stayed degraded for the mux's life.
+    #[test]
+    fn clears_between_appends_keep_the_append_wal_linked() {
+        const RETENTION: usize = 1000;
+        for windowed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let sink = if windowed {
+                windowed_test_sink(dir.path())
+            } else {
+                LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                    .unwrap()
+            };
+            let mut row = 0;
+            for round in 0..6 {
+                for window in 0..3 {
+                    let lines = digest_only_test_lines(&format!("r{round}w{window}"), 3);
+                    let mut stored = 0;
+                    while stored < lines.len() {
+                        let admitted =
+                            sink.store_scrollback_lines(row, &lines[stored..], RETENTION);
+                        assert!(
+                            admitted > 0,
+                            "windowed {windowed} round {round} window {window} row {row}"
+                        );
+                        stored += admitted;
+                        row += admitted as isize;
+                    }
+                }
+                if round % 3 == 1 {
+                    sink.flush_scrollback().unwrap();
+                }
+                sink.clear_scrollback()
+                    .unwrap_or_else(|error| panic!("windowed {windowed} clear {round}: {error:?}"));
+                sink.advance_authenticated_append_wal_supersession()
+                    .unwrap_or_else(|error| {
+                        panic!("windowed {windowed} append WAL after clear {round}: {error:#}")
+                    });
+            }
+            let after = digest_only_test_lines("after", 1);
+            assert!(sink.store_scrollback_line(row, &after[0], RETENTION));
+            sink.flush_scrollback().unwrap();
+            drop(sink);
+            let reopened =
+                LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                    .unwrap();
+            assert_rows_read_back_from(&reopened, row, &[&after[0]]);
+        }
     }
 
     fn assert_rows_read_back_from(sink: &LiveScrollbackSpillSink, first: isize, rows: &[&Line]) {
