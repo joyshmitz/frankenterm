@@ -191,15 +191,15 @@
         "rename": 2,
         "runtime-swap": 5,
         "security-fix": 1,
-        "test": 84
+        "test": 86
       },
-      "fork_side_commit_count": 257,
+      "fork_side_commit_count": 259,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-10-30T15:34:20-04:00",
-        "sha": "af66ff138b1fb403ddfbacef07360ef19c7fe85f",
-        "subject": "feat(mux): fence mobile resize and rendering to observed pane state"
+        "classification": "test",
+        "committed_at": "2026-10-31T13:07:54-04:00",
+        "sha": "bcbb279df17c9d4ca78699beb0188fbec1c296a4",
+        "subject": "test(codec): pass the PDU case number as a format argument"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -234,22 +234,22 @@
         "cleanup": 1,
         "cosmetic": 7,
         "docs": 1,
-        "feat": 70,
-        "fix": 60,
-        "other": 16,
+        "feat": 75,
+        "fix": 61,
+        "other": 17,
         "refactor": 5,
         "rename": 1,
         "runtime-swap": 8,
         "security-fix": 2,
         "test": 15
       },
-      "fork_side_commit_count": 189,
+      "fork_side_commit_count": 196,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-10-30T15:24:29-04:00",
-        "sha": "f8530c14131ede5986941e17ba2734b9f9ea579c",
-        "subject": "feat(airgap): preserve source omissions through Mac export and workspace import"
+        "classification": "other",
+        "committed_at": "2026-10-31T22:07:12-04:00",
+        "sha": "9e1493d39c0bba896a793bc4049aa0ad4844a575",
+        "subject": "Preserve mandatory SSH transport policy through export and durable authorization"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -319,16 +319,16 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 3,
-        "fix": 7,
+        "fix": 8,
         "test": 1
       },
-      "fork_side_commit_count": 12,
+      "fork_side_commit_count": 13,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-13T21:12:32-04:00",
-        "sha": "267710265875dc555a71e33a1765b3b33c0a34e5",
-        "subject": "fix(font): update vendored HarfBuzz 11.2.1 -> 14.6.0"
+        "committed_at": "2026-10-30T16:51:29-04:00",
+        "sha": "f3f2d31012ddc70fef7e1b3201f0dc91d8310783",
+        "subject": "fix(release): preserve portable source and classify parent-gated imports"
       },
       "name": "harfbuzz",
       "path": "frankenterm/deps-harfbuzz",
@@ -785,7 +785,7 @@
         "cosmetic": 33,
         "docs": 7,
         "feat": 229,
-        "fix": 338,
+        "fix": 339,
         "other": 81,
         "refactor": 12,
         "rename": 2,
@@ -793,13 +793,13 @@
         "security-fix": 7,
         "test": 116
       },
-      "fork_side_commit_count": 841,
+      "fork_side_commit_count": 842,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-10-29T17:01:13-04:00",
-        "sha": "64e796b8cb97e9fc16719eeb1b96c62645d5b7d3",
-        "subject": "test(mux): keep the ssh-agent socket name short and quiet Rust 2018 asserts"
+        "classification": "fix",
+        "committed_at": "2026-10-31T19:20:29-04:00",
+        "sha": "aaf1afef289b6dd09074ffc39fd56f83cb501b5a",
+        "subject": "fix(recovery): a pane that ended after its root costs only that pane; close exited panes"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1041,7 +1041,7 @@
         "cleanup": 3,
         "cosmetic": 21,
         "docs": 4,
-        "feat": 100,
+        "feat": 101,
         "fix": 189,
         "other": 135,
         "refactor": 5,
@@ -1049,13 +1049,13 @@
         "security-fix": 6,
         "test": 87
       },
-      "fork_side_commit_count": 553,
+      "fork_side_commit_count": 554,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "feat",
-        "committed_at": "2026-10-30T15:34:20-04:00",
-        "sha": "af66ff138b1fb403ddfbacef07360ef19c7fe85f",
-        "subject": "feat(mux): fence mobile resize and rendering to observed pane state"
+        "committed_at": "2026-10-30T17:46:42-04:00",
+        "sha": "63b88d16c20e69fccf9dcaea8c233731040f755d",
+        "subject": "feat(mux): publish coherent remote palettes and complete terminal frames"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1210,8 +1210,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3445,
-  "generated_at": "2026-10-30T19:52:39.573061Z",
+  "fork_side_commit_total": 3457,
+  "generated_at": "2026-11-01T03:10:02.235710Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
