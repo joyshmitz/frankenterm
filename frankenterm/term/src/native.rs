@@ -10,7 +10,7 @@ use crate::color::{ColorPalette, SrgbaTuple};
 use crate::config::{GridEngine, NewlineCanon, Osc52WritePolicy, TerminalFeatureProfile};
 use crate::input::{MouseButton, MouseEvent, MouseEventKind};
 use crate::render::{
-    RenderFrameError, RenderFrameLimits, RenderFrameWitness, capture_terminal_frame,
+    capture_terminal_frame, RenderFrameError, RenderFrameLimits, RenderFrameWitness,
 };
 use crate::{
     BoundedOutputLimits, BoundedReplyCopy, BoundedReplyDisposition, KeyCode, KeyModifiers,

@@ -4,7 +4,7 @@ use crate::{
     Config, FontAttributes, FontStretch, FontStyle, FontWeight, FreeTypeLoadTarget, RgbaColor,
     TextStyle,
 };
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use frankenterm_dynamic::{
     FromDynamic, FromDynamicOptions, ToDynamic, UnknownFieldAction, Value as DynValue,
 };
@@ -1557,7 +1557,7 @@ pub fn add_to_config_reload_watch_list(lua: &Lua, args: Variadic<String>) -> mlu
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::Instant;
 
     #[test]
@@ -1832,8 +1832,8 @@ ssh = "css"
     }
 
     #[test]
-    fn time_call_after_retains_callback_across_transient_main_admission_rejection()
-    -> anyhow::Result<()> {
+    fn time_call_after_retains_callback_across_transient_main_admission_rejection(
+    ) -> anyhow::Result<()> {
         let _env = crate::test_env_lock();
         let executor = timer_test_executor();
         let blocker = match promise::spawn::try_reserve_main_thread_with_low_priority(
@@ -1981,8 +1981,8 @@ end
     }
 
     #[test]
-    fn time_call_after_origin_chain_survives_reloads_once_without_multiplication()
-    -> anyhow::Result<()> {
+    fn time_call_after_origin_chain_survives_reloads_once_without_multiplication(
+    ) -> anyhow::Result<()> {
         let _env = crate::test_env_lock();
         let executor = timer_test_executor();
         crate::designate_this_as_the_main_thread();

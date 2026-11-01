@@ -17,12 +17,12 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use crate::native::{
-    BASE_PALETTE_BYTES, MAX_FEED_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_REPLY_BYTES,
-    MAX_TEXT_BYTES, NativeKeyPhase, NativeMouseAction, NativeTerminal, NativeTerminalConfig,
-    NativeTerminalError as Error,
+    NativeKeyPhase, NativeMouseAction, NativeTerminal, NativeTerminalConfig,
+    NativeTerminalError as Error, BASE_PALETTE_BYTES, MAX_FEED_BYTES, MAX_FRAME_BYTES,
+    MAX_INPUT_BYTES, MAX_REPLY_BYTES, MAX_TEXT_BYTES,
 };
 use crate::{BoundedReplyDisposition, TerminalSize};
-use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use std::convert::TryFrom;
 use std::mem::size_of;
 use std::panic::AssertUnwindSafe;

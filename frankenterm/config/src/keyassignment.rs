@@ -3,8 +3,8 @@ use crate::keys::KeyNoAction;
 use crate::window::WindowLevel;
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, Value};
 use frankenterm_input_types::{KeyCode, Modifiers};
-use frankenterm_term::SemanticType;
 use frankenterm_term::input::MouseButton;
+use frankenterm_term::SemanticType;
 #[cfg(feature = "lua")]
 use luahelper::impl_lua_conversion_dynamic;
 use ordered_float::NotNan;

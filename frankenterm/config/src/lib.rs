@@ -25,8 +25,8 @@
 use std::convert::TryFrom as _;
 use std::future::Future;
 
-use anyhow::{Context, Error, anyhow, bail};
-use flume::{Receiver, Sender, unbounded};
+use anyhow::{anyhow, bail, Context, Error};
+use flume::{unbounded, Receiver, Sender};
 #[cfg(feature = "lua")]
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction};
 use frankenterm_dynamic::{ToDynamic, Value};
@@ -997,7 +997,7 @@ impl ConfigWatchDependencies {
     }
 
     fn relevant(&self, event: &notify::Result<notify::Event>) -> bool {
-        use notify::{EventKind, event::ModifyKind};
+        use notify::{event::ModifyKind, EventKind};
         let event = match event {
             Ok(event) => event,
             Err(_) => return true,
@@ -1740,9 +1740,12 @@ mod tests {
         // A removed leaf cannot be canonicalized, but its parent still can.
         std::fs::rename(&config, root.join("saved-config.lua")).unwrap();
         assert!(!config.exists());
-        assert!(dependencies.relevant(&Ok(
-            notify::Event::new(notify::EventKind::Remove(RemoveKind::File,)).add_path(alias)
-        )));
+        assert!(
+            dependencies.relevant(&Ok(notify::Event::new(notify::EventKind::Remove(
+                RemoveKind::File,
+            ))
+            .add_path(alias)))
+        );
         assert!(dependencies.relevant(&rename(config)));
         assert!(!dependencies.relevant(&rename(root.join("links/../saved-config.lua"))));
     }
@@ -2266,7 +2269,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn user_owned_directory_creation_is_private_and_symlink_safe() {
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
 
         let fixture = tempfile::tempdir().expect("private-directory fixture");
         let private = fixture.path().join("state").join("nested");
@@ -2349,7 +2352,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn user_owned_file_io_rejects_symlink_and_hardlink_aliases_without_mutating_targets() {
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
 
         for hardlink in [false, true] {
             let fixture = tempfile::tempdir().expect("private-file alias fixture");
