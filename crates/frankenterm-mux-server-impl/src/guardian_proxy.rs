@@ -4761,6 +4761,9 @@ struct GuardianReplayTailReader {
     pending_terminal_error: Option<GuardianReplayDeferredTerminalError>,
     delivery_failed: bool,
     transport_retry_pending: bool,
+    /// The last exchange failed because a newer lease holds the pane
+    /// ([`GuardianLiveOutputReader::lease_superseded`]).
+    lease_superseded: bool,
     maximum_record_bytes: u32,
     maximum_page_records: u16,
     idle_poll_interval: Duration,
@@ -4786,6 +4789,7 @@ impl fmt::Debug for GuardianReplayTailReader {
             )
             .field("delivery_failed", &self.delivery_failed)
             .field("transport_retry_pending", &self.transport_retry_pending)
+            .field("lease_superseded", &self.lease_superseded)
             .finish_non_exhaustive()
     }
 }
@@ -4825,6 +4829,7 @@ impl GuardianReplayTailReader {
             pending_terminal_error: None,
             delivery_failed: false,
             transport_retry_pending: false,
+            lease_superseded: false,
             maximum_record_bytes,
             maximum_page_records,
             idle_poll_interval: GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL,
@@ -4857,6 +4862,8 @@ impl GuardianReplayTailReader {
         self.transport_retry_pending = !self.delivery_failed
             && (self.pending_replay.is_some() || self.pending_ack.is_some())
             && (replay_error_is_retryable_io(&error) || capacity_refused);
+        // A stale lease or claim generation: another mux claimed the pane.
+        self.lease_superseded = matches!(error, GuardianProxyError::LeaseFenced);
         error.into()
     }
 
@@ -5166,6 +5173,10 @@ impl GuardianLiveOutputReader for GuardianReplayTailReader {
         self.transport_retry_pending
     }
 
+    fn lease_superseded(&self) -> bool {
+        self.lease_superseded
+    }
+
     fn reanchor(
         &mut self,
         checkpoint_id: GuardianCheckpointIdentityDigest,
@@ -5183,6 +5194,7 @@ impl GuardianLiveOutputReader for GuardianReplayTailReader {
         ) -> io::Result<()>,
     ) -> io::Result<GuardianLiveOutputDelivery> {
         self.transport_retry_pending = false;
+        self.lease_superseded = false;
         if self.delivery_failed {
             return Err(io::Error::from(GuardianProxyError::ReplayInvariant(
                 "guardian replay reader is terminal after a failed record delivery",
@@ -15245,6 +15257,91 @@ mod tests {
         let state = replay_state.lock();
         assert_eq!(state.requests.len(), 1);
         assert_eq!(state.acks, Vec::new());
+    }
+
+    #[test]
+    fn live_tail_reports_a_superseded_lease_only_when_a_newer_lease_holds_the_pane() {
+        struct RejectingReplayTransport(GuardianRejectionCode);
+
+        impl GuardianReplayTransport for RejectingReplayTransport {
+            fn replay(
+                &mut self,
+                _request_id: Uuid,
+                _request: GuardianReplayRequestV1,
+            ) -> Result<GuardianReplayPageDelivery, GuardianProxyError> {
+                Err(map_replay_client_error(GuardianClientError::Rejected(
+                    self.0,
+                )))
+            }
+
+            fn replay_ack(
+                &mut self,
+                _request_id: Uuid,
+                _ack: GuardianReplayAckV1,
+            ) -> Result<GuardianReplayAckReceiptV1, GuardianProxyError> {
+                Err(GuardianProxyError::ReplayInvariant(
+                    "no page was delivered to acknowledge",
+                ))
+            }
+        }
+
+        let fixture = capture_record_checkpoint_fixture();
+        let boundary = GuardianReplayBoundary::from_descriptor(fixture.descriptor)
+            .expect("derive tail boundary");
+        let tail_reader = |transport: Box<dyn GuardianReplayTransport>| {
+            GuardianReplayTailReader::new(
+                transport,
+                identity(),
+                fixture.descriptor.checkpoint_id(),
+                fixture.descriptor.capture_generation(),
+                boundary,
+                TerminalCheckpointLimits::default(),
+            )
+            .expect("construct tail reader")
+        };
+        // All of these end the tail with the same BrokenPipe; only a stale
+        // lease or claim generation means another mux now holds the pane.
+        for (code, superseded) in [
+            (GuardianRejectionCode::StaleLease, true),
+            (GuardianRejectionCode::ClaimGenerationMismatch, true),
+            (GuardianRejectionCode::PaneTerminal, false),
+            (GuardianRejectionCode::PaneNotFound, false),
+            (GuardianRejectionCode::GuardianIncarnationMismatch, false),
+        ] {
+            let mut reader = tail_reader(Box::new(RejectingReplayTransport(code)));
+            let error = reader
+                .deliver_next_record(&mut |_, _, _| Ok(()))
+                .expect_err("a refused replay ends the tail");
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe, "{code:?}");
+            assert_eq!(reader.lease_superseded(), superseded, "{code:?}");
+            assert!(!reader.has_pending_transport_retry(), "{code:?}");
+        }
+
+        // The mux's own delivery failure comes back unchanged, so the mux can
+        // still tell a retired registration apart, and it is no lost lease.
+        let mut reader = tail_reader(Box::new(FakeReplayTransport {
+            state: Arc::new(Mutex::new(FakeReplayState {
+                pages: VecDeque::from([tail_output_page(&fixture, b"tail")]),
+                replay_io_failures: 0,
+                ack_io_failures: 0,
+                requests: Vec::new(),
+                acks: Vec::new(),
+            })),
+        }));
+        let error = reader
+            .deliver_next_record(&mut |_, _, _| {
+                Err(io::Error::other(
+                    mux::LiveParserCheckpointError::StaleRegistration,
+                ))
+            })
+            .expect_err("a retired registration ends the tail");
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<mux::LiveParserCheckpointError>()),
+            Some(&mux::LiveParserCheckpointError::StaleRegistration)
+        );
+        assert!(!reader.lease_superseded());
     }
 
     #[test]

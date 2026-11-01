@@ -13389,6 +13389,20 @@ fn guardian_live_adoption_allowed(generation: &PaneRegistrationGeneration) -> bo
             .live_adoption_allowed(GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT)
 }
 
+/// The live tail's delivery error for a registration that is no longer
+/// current, typed so [`delivery_ended_with_registration`] can recognize it
+/// after the reader hands it back.
+fn stale_registration_delivery() -> std::io::Error {
+    std::io::Error::other(LiveParserCheckpointError::StaleRegistration)
+}
+
+fn delivery_ended_with_registration(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<LiveParserCheckpointError>())
+        == Some(&LiveParserCheckpointError::StaleRegistration)
+}
+
 /// This function is run in a separate thread; its purpose is to perform
 /// blocking reads from the pty (non-blocking reads are not portable to
 /// all platforms and pty/tty types), parse the escape sequences and
@@ -13411,22 +13425,17 @@ fn read_from_guardian_live_output(
     while !dead.load(Ordering::Acquire) {
         let mut delivered_boundary = None;
         let result = reader.deliver_next_record(&mut |segment, output, payload| {
-            let _generation_lease = generation.try_acquire().ok_or_else(|| {
-                std::io::Error::other(LiveParserCheckpointError::StaleRegistration.to_string())
-            })?;
-            let expected_pane = pane.upgrade().ok_or_else(|| {
-                std::io::Error::other(LiveParserCheckpointError::StaleRegistration.to_string())
-            })?;
-            let mux = resolve_pane_reader_mux(&expected_pane, &generation).ok_or_else(|| {
-                std::io::Error::other(LiveParserCheckpointError::StaleRegistration.to_string())
-            })?;
-            let operation = mux.capture_pane_operation(pane_id).ok_or_else(|| {
-                std::io::Error::other(LiveParserCheckpointError::StaleRegistration.to_string())
-            })?;
+            let _generation_lease = generation
+                .try_acquire()
+                .ok_or_else(stale_registration_delivery)?;
+            let expected_pane = pane.upgrade().ok_or_else(stale_registration_delivery)?;
+            let mux = resolve_pane_reader_mux(&expected_pane, &generation)
+                .ok_or_else(stale_registration_delivery)?;
+            let operation = mux
+                .capture_pane_operation(pane_id)
+                .ok_or_else(stale_registration_delivery)?;
             if operation.wire_identity() != generation.wire_identity {
-                return Err(std::io::Error::other(
-                    LiveParserCheckpointError::StaleRegistration.to_string(),
-                ));
+                return Err(stale_registration_delivery());
             }
             loop {
                 match operation.authorize_guardian_output_delivery(
@@ -13443,7 +13452,7 @@ fn read_from_guardian_live_output(
                         .live_parser_checkpoint
                         .wait_for_guardian_delivery_slot()
                         .map_err(|error| std::io::Error::other(error.to_string()))?,
-                    Err(error) => return Err(std::io::Error::other(error.to_string())),
+                    Err(error) => return Err(std::io::Error::other(error)),
                 }
             }
             generation
@@ -13464,6 +13473,17 @@ fn read_from_guardian_live_output(
                 // retry without retiring the pane or redelivering parser bytes.
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
+            }
+            Err(error) if reader.lease_superseded() || delivery_ended_with_registration(&error) => {
+                // Another mux took the pane over, or this registration retired
+                // at a handoff or teardown. The guardian keeps what was never
+                // acknowledged for the pane's next owner.
+                log::info!(
+                    "guardian live tail ended with its pane's ownership: pane {} {:?}",
+                    pane_id,
+                    error
+                );
+                break;
             }
             Err(error) => {
                 log::error!(
@@ -25457,6 +25477,21 @@ mod tests {
         schedule.record_outcome(retry, true);
         assert!(!schedule.is_due(retry));
         assert!(schedule.is_due(retry + GUARDIAN_LIVE_CHECKPOINT_INTERVAL));
+    }
+
+    #[test]
+    fn live_tail_recognizes_only_deliveries_that_ended_with_their_registration() {
+        assert!(delivery_ended_with_registration(
+            &stale_registration_delivery()
+        ));
+        // Any other failure stays an error, as does the message without its type.
+        for other in [
+            std::io::Error::other(LiveParserCheckpointError::ReaderDead),
+            std::io::Error::other(LiveParserCheckpointError::StaleRegistration.to_string()),
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+        ] {
+            assert!(!delivery_ended_with_registration(&other), "{:?}", other);
+        }
     }
 
     #[test]

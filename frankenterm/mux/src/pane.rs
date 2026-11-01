@@ -808,6 +808,14 @@ pub trait GuardianLiveOutputReader: Send {
         false
     }
 
+    /// True only when the last failure was the guardian refusing this
+    /// reader's lease because a newer lease holds the pane: another mux took
+    /// it over. The tail ends with its lease, and the guardian replays what
+    /// it never acknowledged to the new owner.
+    fn lease_superseded(&self) -> bool {
+        false
+    }
+
     fn deliver_next_record(
         &mut self,
         deliver: &mut dyn FnMut(
