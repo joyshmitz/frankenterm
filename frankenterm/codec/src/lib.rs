@@ -28240,21 +28240,26 @@ mod test {
 
     #[test]
     fn decode_accepts_valid_non_canonical_leb128_headers() {
-        let wire = [0x84, 0x00, 0x81, 0x00, 0xF5, 0x00];
+        // 117 now names GetPaneIdentityV1 and requires a body. Keep this
+        // framing-only fixture on an explicitly unassigned identifier.
+        assert!(Pdu::pdu_name_for_ident(65535).is_none());
+        let wire = [0x86, 0x00, 0x81, 0x00, 0xFF, 0xFF, 0x83, 0x00];
         let decoded = Pdu::decode(wire.as_slice()).expect("valid non-canonical header");
         assert_eq!(decoded.serial, 1);
-        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 117 });
+        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 65535 });
     }
 
     #[test]
     fn decode_raw_async_accepts_valid_non_canonical_leb128_headers() {
         runtime::block_on(async {
-            let mut reader = runtime::Cursor::new(vec![0x84, 0x00, 0x81, 0x00, 0xF5, 0x00]);
+            assert!(Pdu::pdu_name_for_ident(65535).is_none());
+            let mut reader =
+                runtime::Cursor::new(vec![0x86, 0x00, 0x81, 0x00, 0xFF, 0xFF, 0x83, 0x00]);
             let decoded = Pdu::decode_async(&mut reader, None)
                 .await
                 .expect("valid non-canonical header");
             assert_eq!(decoded.serial, 1);
-            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 117 });
+            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 65535 });
         });
     }
 
