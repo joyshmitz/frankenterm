@@ -27132,6 +27132,8 @@ mod tests {
                 _ => unreachable!("fixture only accepts termination operations"),
             }
             loop {
+                // Drain what the child wrote: on macOS its exit waits for it.
+                let _ = client.read_output(&output_handle, 64, output_deadline);
                 match client
                     .child_status(&output_handle, output_deadline)
                     .unwrap()
@@ -27181,6 +27183,8 @@ mod tests {
             assert!(writer.write(b"duplicate\n").is_err());
             let (mut session, handle) = writer.into_parts();
             loop {
+                // Drain what the child wrote: on macOS its exit waits for it.
+                let _ = session.client.read_output(&handle, 64, output_deadline);
                 match session
                     .client
                     .child_status(&handle, output_deadline)
