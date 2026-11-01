@@ -13,8 +13,8 @@
 use crate::machines::{
     InventoryContext, Machine, MachineInventory, MachineRoute, MachineTheme, RouteTarget,
 };
-use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+use base64::Engine;
 use finl_unicode::categories::CharacterCategories;
 use hmac::{Hmac, KeyInit, Mac};
 use openssl::bn::{BigNum, BigNumContext};
@@ -25,7 +25,7 @@ use openssl::nid::Nid;
 use openssl::pkey::{Id, PKey, Public};
 use openssl::rsa::{Padding, Rsa};
 use openssl::sign::Verifier;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -3324,7 +3324,11 @@ impl EndpointRecords {
             let key = match public_text.and_then(|text| {
                 let mut lines = text.lines().filter(|line| !line.trim().is_empty());
                 let key = PublicKey::parse_line(lines.next()?);
-                if lines.next().is_some() { None } else { key }
+                if lines.next().is_some() {
+                    None
+                } else {
+                    key
+                }
             }) {
                 Some(key) => key,
                 // Disk snapshots establish absent default identities only
@@ -3461,14 +3465,12 @@ impl EndpointRecords {
         });
         let mut trust_capabilities = Vec::new();
         if !resolved.keys.certificate_authorities.is_empty() {
-            trust["certificate_authorities"] = json!(
-                resolved
-                    .keys
-                    .certificate_authorities
-                    .iter()
-                    .map(pin)
-                    .collect::<Vec<_>>()
-            );
+            trust["certificate_authorities"] = json!(resolved
+                .keys
+                .certificate_authorities
+                .iter()
+                .map(pin)
+                .collect::<Vec<_>>());
             trust_capabilities.push(HOST_CERTIFICATE_CAPABILITY);
         }
         for (field, algorithms) in [
@@ -3672,13 +3674,11 @@ pub fn export(
     context: &InventoryContext,
 ) -> anyhow::Result<MobileExport> {
     let groups: Vec<_> = match group {
-        Some(id) => vec![
-            inventory
-                .groups
-                .iter()
-                .find(|g| g.id == id)
-                .ok_or_else(|| anyhow::anyhow!("no group named {:?} in the inventory", id))?,
-        ],
+        Some(id) => vec![inventory
+            .groups
+            .iter()
+            .find(|g| g.id == id)
+            .ok_or_else(|| anyhow::anyhow!("no group named {:?} in the inventory", id))?],
         None => inventory.groups.iter().collect(),
     };
     let wanted: BTreeSet<&str> = groups
@@ -4020,14 +4020,12 @@ pub fn export(
                     .as_str()
                     .is_some_and(|value| fingerprints.contains(value))
             });
-            trust["revoked_keys"] = json!(
-                revoked
-                    .iter()
-                    .map(|key| {
-                        json!({"algorithm": key.algorithm, "fingerprint": key.fingerprint()})
-                    })
-                    .collect::<Vec<_>>()
-            );
+            trust["revoked_keys"] = json!(revoked
+                .iter()
+                .map(|key| {
+                    json!({"algorithm": key.algorithm, "fingerprint": key.fingerprint()})
+                })
+                .collect::<Vec<_>>());
         }
         if unresolved_scopes.contains(scope) {
             let mut required = trust["required_capabilities"]
@@ -4106,12 +4104,10 @@ pub fn export(
         },
     });
     if !retained_revocations.is_empty() {
-        document["workspace"]["host_revocation_sources"] = json!(
-            retained_revocations
-                .iter()
-                .filter_map(|id| revocation_resources.get(id))
-                .collect::<Vec<_>>()
-        );
+        document["workspace"]["host_revocation_sources"] = json!(retained_revocations
+            .iter()
+            .filter_map(|id| revocation_resources.get(id))
+            .collect::<Vec<_>>());
     }
     // Hash exactly the public projection, before adding this self-reference
     // and the fresh per-export bundle identity. Object keys are recursively
@@ -4381,12 +4377,10 @@ mod tests {
             json!([{"serial_ranges": [{"first":1,"last":u64::MAX}], "key_ids":[]} ])
         );
         assert_eq!(parsed.document["krl_version"], 42);
-        assert!(
-            !parsed
-                .document
-                .to_string()
-                .contains("private source comment")
-        );
+        assert!(!parsed
+            .document
+            .to_string()
+            .contains("private source comment"));
         for kind in [4, 6, 254] {
             assert!(parse_host_revocations(&test_krl(&[(kind, Vec::new())])).is_none());
         }
@@ -4424,13 +4418,11 @@ mod tests {
         assert!(parse_host_revocations(&test_certificate_revocation(0x22, empty_bitmap)).is_some());
         let excessive = vec![0; MAX_REVOCATION_SOURCE_BYTES + 1];
         assert!(parse_host_revocations(&excessive).is_none());
-        assert!(
-            parse_host_revocations(&test_krl(&[(
-                2,
-                revocation_string(b"opaque, not a parsed key")
-            )]))
-            .is_some()
-        );
+        assert!(parse_host_revocations(&test_krl(&[(
+            2,
+            revocation_string(b"opaque, not a parsed key")
+        )]))
+        .is_some());
     }
 
     #[test]
@@ -4447,12 +4439,10 @@ mod tests {
         assert!(UserCertificate::from_blob(blob.clone()).is_none());
         let mut bad = blob;
         *bad.last_mut().unwrap() ^= 1;
-        assert!(
-            parse_host_revocations(
-                format!("ssh-ed25519-cert-v01@openssh.com {}", STANDARD.encode(bad)).as_bytes()
-            )
-            .is_none()
-        );
+        assert!(parse_host_revocations(
+            format!("ssh-ed25519-cert-v01@openssh.com {}", STANDARD.encode(bad)).as_bytes()
+        )
+        .is_none());
         let user = certificate_fixtures();
         for fixture in user["certificates"].as_array().unwrap() {
             let certificate = fixture["certificate"].as_str().unwrap();
@@ -4791,11 +4781,9 @@ ssh = "jumped"
             "Threadripper"
         );
         assert!(!first["document"].to_string().contains("/home/me/.ssh"));
-        assert!(
-            !first["document"]
-                .to_string()
-                .contains("/loaded/machines.toml")
-        );
+        assert!(!first["document"]
+            .to_string()
+            .contains("/loaded/machines.toml"));
         let findings = first["portability"].as_array().unwrap();
         assert!(findings.iter().any(|finding| {
             finding["setting"] == "desktop_snapshot.source_scope"
@@ -4804,11 +4792,9 @@ ssh = "jumped"
                     .unwrap()
                     .contains("Later Lua table mutations")
         }));
-        assert!(
-            !findings
-                .iter()
-                .any(|finding| finding["setting"] == "machines_toml.source_scope")
-        );
+        assert!(!findings
+            .iter()
+            .any(|finding| finding["setting"] == "machines_toml.source_scope"));
     }
 
     #[test]
@@ -4876,11 +4862,9 @@ ssh = "jumped"
         assert_eq!(routes[0]["credential_refs"], routes[2]["credential_refs"]);
         let trust = workspace["host_trust"].as_array().unwrap();
         assert_eq!(trust.len(), 2);
-        assert!(
-            trust
-                .iter()
-                .all(|t| t["pins"].as_array().unwrap().len() == 1)
-        );
+        assert!(trust
+            .iter()
+            .all(|t| t["pins"].as_array().unwrap().len() == 1));
 
         let theme = &workspace["themes"][0];
         assert_eq!(theme["background"], "#0A0E14");
@@ -4952,18 +4936,14 @@ ssh = "jumped"
                 finding.entity_id == "m.trj" && finding.reason.contains(setting)
             }));
         }
-        assert!(
-            first
-                .portability
-                .iter()
-                .all(|finding| finding.disposition == 0)
-        );
-        assert!(
-            !first
-                .portability
-                .iter()
-                .any(|finding| finding.entity_id == "m.dark")
-        );
+        assert!(first
+            .portability
+            .iter()
+            .all(|finding| finding.disposition == 0));
+        assert!(!first
+            .portability
+            .iter()
+            .any(|finding| finding.entity_id == "m.dark"));
 
         // A group with only omitted machines is itself absent. Its source
         // findings must still survive on the workspace, never name a dangling
@@ -4983,12 +4963,10 @@ ssh = "jumped"
                 && finding.reason.starts_with("dark")
         }));
         let fleet_only = export(&inventory, Some("fleet"), &ssh, &context()).unwrap();
-        assert!(
-            !fleet_only
-                .portability
-                .iter()
-                .any(|finding| finding.reason.starts_with("dark"))
-        );
+        assert!(!fleet_only
+            .portability
+            .iter()
+            .any(|finding| finding.reason.starts_with("dark")));
     }
 
     #[test]
@@ -5042,14 +5020,12 @@ ssh = "jumped"
         too_many.push(note("one beyond the limit".into()));
         assert!(export_findings(&inventory, &exported.document, &too_many).is_err());
         for invalid in ["control\ntext".into(), "x".repeat(MAX_EXPORT_FINDING_TEXT)] {
-            assert!(
-                export_findings(
-                    &inventory,
-                    &exported.document,
-                    &[notes[0].clone(), note(invalid)]
-                )
-                .is_err()
-            );
+            assert!(export_findings(
+                &inventory,
+                &exported.document,
+                &[notes[0].clone(), note(invalid)]
+            )
+            .is_err());
         }
         let aggregate: Vec<_> = (0..80)
             .map(|index| note(format!("{}{}", index, "x".repeat(4000))))
@@ -5491,12 +5467,10 @@ socket = "/run/frankenterm.sock"
                     .insert(context().home.join(".ssh/second-cert.pub"), invalid);
             }
             let exported = jump_export(&sources).unwrap();
-            assert!(
-                exported.document["workspace"]["credentials"]
-                    .as_array()
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(exported.document["workspace"]["credentials"]
+                .as_array()
+                .unwrap()
+                .is_empty());
             assert!(exported.identity_files.is_empty());
             for id in ["r.app.ssh", "r.app.mux"] {
                 let route = exported_route(&exported, id);
@@ -5517,12 +5491,10 @@ socket = "/run/frankenterm.sock"
                 reference
             )))
             .unwrap();
-            assert!(
-                exported.document["workspace"]["credentials"]
-                    .as_array()
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(exported.document["workspace"]["credentials"]
+                .as_array()
+                .unwrap()
+                .is_empty());
             assert_eq!(
                 exported_route(&exported, "r.app.ssh")["required_capabilities"],
                 json!([UNRESOLVED_POLICY])
@@ -5640,11 +5612,9 @@ socket = "/run/frankenterm.sock"
             );
             assert_eq!(route["required_capabilities"].is_null(), admitted);
             assert!(exported.identity_files.is_empty());
-            assert!(
-                !companion_source(&exported, Path::new("/inventory"))
-                    .to_string()
-                    .contains("PRIVATE-SIBLING-MUST-NOT-BE-READ")
-            );
+            assert!(!companion_source(&exported, Path::new("/inventory"))
+                .to_string()
+                .contains("PRIVATE-SIBLING-MUST-NOT-BE-READ"));
         }
     }
 
@@ -6010,12 +5980,10 @@ socket = "/run/frankenterm.sock"
             note.message
                 .contains("other configured authentication methods")
         }));
-        assert!(
-            !export
-                .notes
-                .iter()
-                .any(|note| note.message.contains("cannot sign in"))
-        );
+        assert!(!export
+            .notes
+            .iter()
+            .any(|note| note.message.contains("cannot sign in")));
         sources.config = Some(
             sources
                 .config
@@ -6024,12 +5992,10 @@ socket = "/run/frankenterm.sock"
         );
         let export = jump_export(&sources).unwrap();
         assert!(exported_route(&export, "r.app.ssh")["required_capabilities"].is_null());
-        assert!(
-            export
-                .notes
-                .iter()
-                .any(|note| note.message.contains("cannot sign in"))
-        );
+        assert!(export
+            .notes
+            .iter()
+            .any(|note| note.message.contains("cannot sign in")));
     }
 
     #[test]
@@ -6174,11 +6140,9 @@ socket = "/run/frankenterm.sock"
             export.routes, 5,
             "the explicit preceding hop overrides second's proxy"
         );
-        assert!(
-            !serde_json::to_string(&export.document)
-                .unwrap()
-                .contains("must-not-execute")
-        );
+        assert!(!serde_json::to_string(&export.document)
+            .unwrap()
+            .contains("must-not-execute"));
         sources.config = Some(JUMP_CONFIG.replace(
             "Host first\n",
             "Host first\n ProxyCommand touch /must-not-execute\n",
@@ -6450,12 +6414,10 @@ socket = "/run/frankenterm.sock"
         let id = exported_route(&denied, "r.app.ssh")["jump_routes"][1]
             .as_str()
             .unwrap();
-        assert!(
-            route_trust(&denied, id)["pins"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(route_trust(&denied, id)["pins"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_eq!(
             route_trust(&denied, id)["revoked_keys"]
                 .as_array()
@@ -6499,16 +6461,12 @@ socket = "/run/frankenterm.sock"
         };
         let inventory = MachineInventory::parse(JUMP_INVENTORY, &context).unwrap();
         let mut snapshot = SshSources::from_disk(&inventory, &context);
-        assert!(
-            snapshot
-                .public_keys
-                .contains_key(&context.home.join(".ssh/selected-user-2200.pub"))
-        );
-        assert!(
-            snapshot
-                .public_keys
-                .contains_key(&context.home.join(".ssh/backup.pub"))
-        );
+        assert!(snapshot
+            .public_keys
+            .contains_key(&context.home.join(".ssh/selected-user-2200.pub")));
+        assert!(snapshot
+            .public_keys
+            .contains_key(&context.home.join(".ssh/backup.pub")));
         assert!(
             !snapshot
                 .public_keys
@@ -6804,13 +6762,11 @@ socket = "/run/frankenterm.sock"
             result.is_err(),
             "an extra graph cannot be partially exported"
         );
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("256-route limit")
-        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("256-route limit"));
     }
 
     #[test]
@@ -6847,11 +6803,9 @@ socket = "/run/frankenterm.sock"
         let inventory = MachineInventory::parse(JUMP_INVENTORY, &context).unwrap();
         let snapshot = SshSources::from_disk(&inventory, &context);
         for alias in ["first", "second", "third", "app"] {
-            assert!(
-                snapshot
-                    .public_keys
-                    .contains_key(&context.home.join(format!(".ssh/{}.pub", alias)))
-            );
+            assert!(snapshot
+                .public_keys
+                .contains_key(&context.home.join(format!(".ssh/{}.pub", alias))));
             assert!(matches!(
                 snapshot
                     .known_hosts
@@ -7106,23 +7060,19 @@ ssh = "bad"
             }
             if alias == "first" {
                 for id in ["r.app.ssh", "r.app.mux"] {
-                    assert!(
-                        exported_route(&export, id)["jump_routes"]
-                            .as_array()
-                            .unwrap()
-                            .contains(&blocked_ids[0])
-                    );
+                    assert!(exported_route(&export, id)["jump_routes"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&blocked_ids[0]));
                 }
             } else {
                 assert_eq!(blocked_ids.len(), 2, "SSH and mux share the refusal");
             }
             assert_eq!(export.identity_files.len(), 3);
-            assert!(
-                !export
-                    .identity_files
-                    .values()
-                    .any(|path| path == &context().home.join(format!(".ssh/{}", alias)))
-            );
+            assert!(!export
+                .identity_files
+                .values()
+                .any(|path| path == &context().home.join(format!(".ssh/{}", alias))));
         }
     }
 
@@ -7190,11 +7140,12 @@ ssh = "bad"
                 state != "absent"
             );
             assert_eq!(export.identity_files.len(), usize::from(state == "absent"));
-            assert!(
-                !serde_json::to_string(&companion_source(&export, Path::new("/machines.toml")))
-                    .unwrap()
-                    .contains("PRIVATE-MATERIAL-NOT-READ")
-            );
+            assert!(!serde_json::to_string(&companion_source(
+                &export,
+                Path::new("/machines.toml")
+            ))
+            .unwrap()
+            .contains("PRIVATE-MATERIAL-NOT-READ"));
         }
     }
 
@@ -7382,24 +7333,20 @@ ssh = "right"
                 1
             );
             assert!(!selected.document.to_string().contains("/private/"));
-            assert!(
-                !selected
-                    .document
-                    .to_string()
-                    .contains("private-revocation-comment")
-            );
+            assert!(!selected
+                .document
+                .to_string()
+                .contains("private-revocation-comment"));
             if same_scope {
                 sources.host_revocations.insert(
                     PathBuf::from("/private/right"),
                     HostRevocationSource::Missing,
                 );
                 let blocked = export(&inventory, Some("only-left"), &sources, &context()).unwrap();
-                assert!(
-                    route_trust(&blocked, "r.left.ssh")["required_capabilities"]
-                        .as_array()
-                        .unwrap()
-                        .contains(&json!(UNRESOLVED_POLICY))
-                );
+                assert!(route_trust(&blocked, "r.left.ssh")["required_capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(UNRESOLVED_POLICY)));
             }
         }
     }
@@ -7433,12 +7380,10 @@ ssh = "right"
                 );
                 assert_eq!(trust["revocation_source_refs"].as_array().unwrap().len(), 2);
             } else {
-                assert!(
-                    trust["required_capabilities"]
-                        .as_array()
-                        .unwrap()
-                        .contains(&json!(UNRESOLVED_POLICY))
-                );
+                assert!(trust["required_capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(UNRESOLVED_POLICY)));
                 assert!(
                     trust["revocation_source_refs"].is_null(),
                     "A usable first file is not a complete source policy"
@@ -7588,7 +7533,7 @@ ssh = "right"
         );
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{PermissionsExt, symlink};
+            use std::os::unix::fs::{symlink, PermissionsExt};
             let original = home.join(".ssh/plain list");
             let link = home.join(".ssh/linked");
             symlink(&original, &link).unwrap();
@@ -7645,17 +7590,13 @@ ssh = "right"
                 .len(),
             1
         );
-        assert!(
-            host_keys(&wildcard, "excluded.corp", 22)
-                .certificate_authorities
-                .is_empty()
-        );
+        assert!(host_keys(&wildcard, "excluded.corp", 22)
+            .certificate_authorities
+            .is_empty());
         let port = format!("@cert-authority [box]:2222 {}\n", fake_key(51));
-        assert!(
-            host_keys(&port, "box", 2223)
-                .certificate_authorities
-                .is_empty()
-        );
+        assert!(host_keys(&port, "box", 2223)
+            .certificate_authorities
+            .is_empty());
     }
 
     #[test]
@@ -7699,12 +7640,10 @@ ssh = "right"
                 json!([HOST_CERTIFICATE_CAPABILITY])
             );
         }
-        assert!(
-            !exported
-                .notes
-                .iter()
-                .any(|note| note.message.contains("remains blocked"))
-        );
+        assert!(!exported
+            .notes
+            .iter()
+            .any(|note| note.message.contains("remains blocked")));
     }
 
     #[test]
@@ -7939,12 +7878,10 @@ ssh = "right"
             let trust = route_trust(&after, route);
             assert_eq!(trust["revoked_keys"][0]["fingerprint"], FINGERPRINT);
         }
-        assert!(
-            route_trust(&after, "r.left.ssh")["pins"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(route_trust(&after, "r.left.ssh")["pins"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_eq!(
             route_trust(&after, "r.right.ssh")["pins"][0]["fingerprint"],
             other_fingerprint
@@ -8103,12 +8040,10 @@ ssh = "right"
             format!("@revoked box ssh-ed25519 {}\n", ED25519),
         );
         let export = trust_export(&sources);
-        assert!(
-            route_trust(&export, "r.left.ssh")["pins"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(route_trust(&export, "r.left.ssh")["pins"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_eq!(
             route_trust(&export, "r.left.ssh")["revoked_keys"][0]["fingerprint"],
             FINGERPRINT
@@ -8186,12 +8121,10 @@ ssh = "right"
                 route_trust(&after, route)["revoked_keys"][0]["fingerprint"],
                 FINGERPRINT
             );
-            assert!(
-                route_trust(&after, route)["pins"]
-                    .as_array()
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(route_trust(&after, route)["pins"]
+                .as_array()
+                .unwrap()
+                .is_empty());
         }
         assert_eq!(
             canonical_host("[2001:0db8:0:0:0:0:0:1]"),
@@ -8273,7 +8206,7 @@ ssh = "right"
         assert_eq!(read_source(&file, 8), KnownHostsSource::Unavailable);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{PermissionsExt, symlink};
+            use std::os::unix::fs::{symlink, PermissionsExt};
             let link = directory.path().join("linked_hosts");
             symlink(&file, &link).unwrap();
             assert_eq!(read_source(&link, 8), KnownHostsSource::Unavailable);
@@ -8422,11 +8355,9 @@ ssh = "right"
         );
         assert!(themes.len() > 1000);
         assert_eq!(themes[0]["name"], "FrankenTerm Azure");
-        assert!(
-            themes
-                .iter()
-                .all(|t| t["ansi"].as_array().unwrap().len() == 16)
-        );
+        assert!(themes
+            .iter()
+            .all(|t| t["ansi"].as_array().unwrap().len() == 16));
     }
 
     /// The app and Kit read these files; they must be what this code writes.
@@ -8999,14 +8930,12 @@ ssh = "right"
         assert!(trust["ca_signature_algorithms"].is_null());
         assert!(trust["required_capabilities"].is_null());
         for keyword in ["hostkeyalgorithms", "casignaturealgorithms"] {
-            assert!(
-                exported
-                    .portability
-                    .iter()
-                    .any(|finding| finding.disposition == 0
-                        && finding.reason.contains(keyword)
-                        && finding.reason.contains("inactive"))
-            );
+            assert!(exported
+                .portability
+                .iter()
+                .any(|finding| finding.disposition == 0
+                    && finding.reason.contains(keyword)
+                    && finding.reason.contains("inactive")));
         }
     }
 
@@ -9073,12 +9002,10 @@ ssh = "right"
         }
         let source = companion_source(&exported, Path::new("/inventory/machines.toml"));
         assert_eq!(source["document"], exported.document);
-        assert!(
-            !exported
-                .notes
-                .iter()
-                .any(|note| note.message.contains("remains blocked"))
-        );
+        assert!(!exported
+            .notes
+            .iter()
+            .any(|note| note.message.contains("remains blocked")));
     }
 
     #[test]
@@ -9194,14 +9121,12 @@ ssh = "right"
             assert!(trust[field].is_null());
         }
         for keyword in ["kexalgorithms", "ciphers", "macs"] {
-            assert!(
-                exported
-                    .portability
-                    .iter()
-                    .any(|finding| finding.disposition == 0
-                        && finding.reason.contains(keyword)
-                        && finding.reason.contains("inactive"))
-            );
+            assert!(exported
+                .portability
+                .iter()
+                .any(|finding| finding.disposition == 0
+                    && finding.reason.contains(keyword)
+                    && finding.reason.contains("inactive")));
         }
     }
 
