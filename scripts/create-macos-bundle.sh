@@ -922,6 +922,12 @@ STORAGE_SCHEMA_VERSION=$(extract_numeric_rust_const "$PROJECT_ROOT/$STORAGE_SCHE
 # Generate only after all package mutation (including ad-hoc codesigning).  The
 # detached manifest can therefore verify final executable bytes and the exact
 # CodeResources inventory without becoming a self-referential signed resource.
+NOTARIZATION_ENTRIES=()
+if [[ -e "$APP_BUNDLE/Contents/CodeResources" || -L "$APP_BUNDLE/Contents/CodeResources" ]]; then
+    # stapler adds this ticket outside _CodeSignature. Catalog its exact bytes;
+    # do not exempt it (or other Contents files) from inventory verification.
+    NOTARIZATION_ENTRIES+=(--entry signature:notarization-ticket:Contents/CodeResources)
+fi
 bash "$ATOMIC_MANIFEST_TOOL" generate \
     --root "$APP_BUNDLE" \
     --source-root "$PROJECT_ROOT" \
@@ -949,6 +955,7 @@ bash "$ATOMIC_MANIFEST_TOOL" generate \
     --optional-tree asset:native-libraries:Contents/Frameworks \
     --tree metadata:native-dependencies:Contents/Resources/native-dependencies \
     --optional-tree signature:codesign:Contents/_CodeSignature \
+    "${NOTARIZATION_ENTRIES[@]}" \
     --source-match Contents/Resources/frankenterm.toml=crates/frankenterm-gui/frankenterm.toml \
     --source-match Contents/Resources/frankenterm.lua=crates/frankenterm-gui/frankenterm.lua \
     --source-match Contents/Resources/ft.icns=assets/macos/ft.icns \
