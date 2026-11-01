@@ -2604,12 +2604,16 @@ pub fn theme_catalog_json() -> Value {
         .enumerate()
         .map(|(index, theme)| theme_json(&format!("catalog.{}", index), theme))
         .collect();
-    json!({
+    let mut catalog = json!({
         "format": "ftthemes",
         "version": 1,
         "distinct": crate::machines::distinct_theme_count(),
         "themes": themes,
-    })
+    });
+    // Workspace feature unification can enable serde_json's preserve_order.
+    // Keep the bundled bytes stable without changing theme or palette order.
+    catalog.sort_all_objects();
+    catalog
 }
 
 struct Endpoint {
