@@ -701,9 +701,9 @@ impl MuxPool {
 
         // Acquiring a connection may be retried, but once this boundary is
         // crossed the non-idempotent operation is invoked exactly once. The
-        // sole determinate exception is a typed outbound rejection that proves
-        // no socket write boundary was reached and no bytes reached the peer.
-        // A local serial may have been consumed and encoding attempted.
+        // Determinate failures retain either local pre-write proof or a
+        // validated, request-bound remote rejection proving no effect. Neither
+        // case replays the operation. Response loss remains indeterminate.
         if let Err(error) = Self::checkpoint_cx(cx) {
             drop(client);
             return Err(error);
@@ -719,6 +719,12 @@ impl MuxPool {
             }
             Err(err) => {
                 let proven_pre_write_rejection = err.is_proven_pre_write_rejection();
+                let proven_remote_no_effect = matches!(
+                    &err,
+                    DirectMuxError::RemoteRejection(response)
+                        if response.validate().is_ok()
+                            && response.effect == codec::MuxErrorEffect::NOT_APPLIED
+                );
                 let decision = mux_recovery_decision(&err);
                 self.record_permanent_failure(decision);
                 tracing::debug!(
@@ -727,11 +733,12 @@ impl MuxPool {
                     kind = ?decision.kind,
                     connection = ?decision.connection,
                     proven_pre_write_rejection,
+                    proven_remote_no_effect,
                     error = %err,
                     "non-idempotent mux pool op failed without replay"
                 );
                 self.return_client_after_error(cx, client, decision).await;
-                if proven_pre_write_rejection {
+                if proven_pre_write_rejection || proven_remote_no_effect {
                     Err(MuxPoolError::Mux(err))
                 } else {
                     Err(MuxPoolError::IndeterminateMutation(err))
@@ -2724,6 +2731,43 @@ mod tests {
                 "follow-up must reuse the seeded connection rather than reconnect"
             );
             assert_eq!(after_reuse.pool.total_acquired, 2);
+        });
+    }
+
+    #[test]
+    fn mutation_remote_no_effect_authority_is_preserved_without_replay() {
+        run_async_test(async {
+            let request = <codec::SendPaste as codec::PduWireIdent>::IDENT;
+            let valid = codec::ErrorResponse::policy_rejected(request);
+            let uncertain = codec::ErrorResponse::indeterminate_mutation(request, None);
+            let mut malformed = uncertain.clone();
+            malformed.effect = codec::MuxErrorEffect::NOT_APPLIED;
+            for (response, determinate) in [(valid, true), (uncertain, false), (malformed, false)] {
+                let temp_dir = tempfile::tempdir().expect("tempdir");
+                let socket_path = spawn_mock_server(&temp_dir).await;
+                let pool = MuxPool::new(pool_config(socket_path, 2));
+                let cx = crate::cx::for_testing();
+                let invocations = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&invocations);
+                let error = pool
+                    .execute_once_with_cx(&cx, "send_paste", move |_client| {
+                        Box::pin(async move {
+                            observed.fetch_add(1, AtomicOrdering::Relaxed);
+                            Err::<(), _>(DirectMuxError::RemoteRejection(response))
+                        })
+                    })
+                    .await
+                    .expect_err("remote refusal must remain an error");
+                assert_eq!(invocations.load(AtomicOrdering::Relaxed), 1);
+                if determinate {
+                    assert!(matches!(
+                        error,
+                        MuxPoolError::Mux(DirectMuxError::RemoteRejection(_))
+                    ));
+                } else {
+                    assert!(matches!(error, MuxPoolError::IndeterminateMutation(_)));
+                }
+            }
         });
     }
 
