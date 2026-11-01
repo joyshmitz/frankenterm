@@ -465,7 +465,8 @@ end_pane() {  # <pane index>
 }
 # The guardian's reason to exist: the mux dies at a moment nobody chose, here
 # in the middle of a capture, and its service manager starts it again.
-for round in $(seq "${E2E_MUX_CRASHES:-2}"); do
+# Not seq: BSD seq counts down, so E2E_MUX_CRASHES=0 would crash it twice.
+for (( round = 1; round <= ${E2E_MUX_CRASHES:-2}; round++ )); do
   step "mux crash $round"
   LOG=$STATE/logs/mux-server.log
   RESTORES=$(image_restores)
