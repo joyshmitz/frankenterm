@@ -112,15 +112,31 @@ const GUARDIAN_CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(5);
 /// mid reconnect. The domain's unresolved-birth fence stays up meanwhile.
 const GUARDIAN_BIRTH_RECONCILE_BUDGET: Duration = Duration::from_secs(30);
 const GUARDIAN_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(10);
+const GUARDIAN_CONNECT_RETRY_MAX_DELAY: Duration = Duration::from_millis(250);
+
+/// The attempts a genesis retry admits within `budget`: at least
+/// [`GUARDIAN_CONNECT_ATTEMPTS`], and enough for its pauses, the largest after
+/// the first six, to fill the budget. So the budget, not the count, ends a
+/// retry against a guardian that keeps closing: 32 attempts paused only ~7 s,
+/// and a birth lost its reply to an adoption holding the protocol for 8-13 s
+/// at 60 panes, long before its 30 s reconciliation budget.
+const fn genesis_retry_attempts(budget: Duration) -> usize {
+    let filled = (budget.as_millis() / GUARDIAN_CONNECT_RETRY_MAX_DELAY.as_millis()) as usize + 6;
+    if filled > GUARDIAN_CONNECT_ATTEMPTS {
+        filled
+    } else {
+        GUARDIAN_CONNECT_ATTEMPTS
+    }
+}
 
 fn wait_for_genesis_retry(started: Instant, budget: Duration, attempts: usize) -> bool {
     let remaining = budget.saturating_sub(started.elapsed());
-    if attempts >= GUARDIAN_CONNECT_ATTEMPTS || remaining.is_zero() {
+    if attempts >= genesis_retry_attempts(budget) || remaining.is_zero() {
         return false;
     }
     let delay = GUARDIAN_CONNECT_RETRY_DELAY
         .saturating_mul(1_u32 << attempts.saturating_sub(1).min(5))
-        .min(Duration::from_millis(250))
+        .min(GUARDIAN_CONNECT_RETRY_MAX_DELAY)
         .min(remaining);
     thread::sleep(delay);
     started.elapsed() < budget
@@ -176,7 +192,7 @@ fn reconcile_genesis_birth(
     // Connection attempts must not consume this phase's exchange allowance.
     // This bounds admission of retries; an admitted exchange retains its own
     // transport timeout, so it is not a hard end-to-end execution deadline.
-    for attempt in 1..=GUARDIAN_CONNECT_ATTEMPTS {
+    for attempt in 1..=genesis_retry_attempts(GUARDIAN_BIRTH_RECONCILE_BUDGET) {
         anyhow::ensure!(
             spawned.elapsed() < GUARDIAN_BIRTH_RECONCILE_BUDGET,
             "guardian exact birth reconciliation retry admission exhausted"
@@ -574,7 +590,7 @@ impl Domain for GuardianDomain {
                         "guardian spawn cancelled before connection"
                     );
                     anyhow::ensure!(
-                        attempts < GUARDIAN_CONNECT_ATTEMPTS && since.elapsed() < budget,
+                        attempts < genesis_retry_attempts(budget) && since.elapsed() < budget,
                         "guardian birth connection retry admission exhausted"
                     );
                     attempts += 1;
@@ -664,7 +680,7 @@ impl Domain for GuardianDomain {
                     "guardian spawn cancelled before checkpoint staging"
                 );
                 anyhow::ensure!(
-                    stage_attempts < GUARDIAN_CONNECT_ATTEMPTS
+                    stage_attempts < genesis_retry_attempts(GUARDIAN_CONNECT_RETRY_BUDGET)
                         && started.elapsed() < GUARDIAN_CONNECT_RETRY_BUDGET,
                     "guardian checkpoint staging retry admission exhausted"
                 );
@@ -14064,6 +14080,7 @@ mod tests {
         for case in [
             "busy-then-ready",
             "busy-past-birth-budget",
+            "busy-past-attempt-count",
             "exhausted",
             "rejected",
         ] {
@@ -14090,7 +14107,7 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let server_stop = Arc::clone(&stop);
             let server = thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(8);
+                let deadline = Instant::now() + Duration::from_secs(15);
                 let mut first_spawn = None;
                 let mut payload = None;
                 let mut exchanges = 0;
@@ -14147,9 +14164,14 @@ mod tests {
                     // Model the real protocol-owned worker's EOF busy fence.
                     // The first exchange represents an already-applied birth;
                     // only its identical receipt can later become available.
+                    // "busy-past-attempt-count" closes more Spawns than
+                    // GUARDIAN_CONNECT_ATTEMPTS, ~7 s of pauses, all well
+                    // within the reconciliation budget.
                     if case == "exhausted"
                         || (matches!(case, "busy-then-ready" | "busy-past-birth-budget")
                             && first.elapsed() < Duration::from_millis(600))
+                        || (case == "busy-past-attempt-count"
+                            && exchanges <= GUARDIAN_CONNECT_ATTEMPTS)
                     {
                         continue;
                     }
@@ -14226,6 +14248,17 @@ mod tests {
                         }
                     );
                     assert!(exchanges > 1 && exchanges < GUARDIAN_CONNECT_ATTEMPTS);
+                }
+                "busy-past-attempt-count" => {
+                    let (_, reply) = result.expect("the budget, not the count, ends the retry");
+                    assert_eq!(
+                        reply,
+                        GuardianReply::Spawned {
+                            pane_id: pane,
+                            generation: 0
+                        }
+                    );
+                    assert_eq!(exchanges, GUARDIAN_CONNECT_ATTEMPTS + 1);
                 }
                 "exhausted" => {
                     assert!(result.is_err());
