@@ -3223,6 +3223,11 @@ pub enum GuardianOutputJournalError {
         "guardian output journal length changed outside its exclusive owner: expected {expected}, observed {observed}"
     )]
     ExternalLengthChange { expected: u64, observed: u64 },
+    /// The file system ran out of space or quota during an append, and the
+    /// journal is back at its last committed record: the same append may be
+    /// retried once space returns.
+    #[error("guardian output storage is full; the record was not written")]
+    StorageFull(#[source] std::io::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -3412,6 +3417,30 @@ fn sync_appended_record(file: &File) -> std::io::Result<()> {
         return Ok(());
     }
     file.sync_all()
+}
+
+/// Out of space or out of quota: what a full disk reports, and a condition
+/// that clears once space returns.
+fn is_storage_full(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static STORAGE_FULL_AFTER_HEADER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Fail this thread's next append with a full disk after its record header
+/// is written, as a disk that fills mid-record does.
+#[cfg(test)]
+fn storage_full_after_header_for_test() -> std::io::Result<()> {
+    if STORAGE_FULL_AFTER_HEADER.with(|armed| armed.replace(false)) {
+        return Err(std::io::ErrorKind::StorageFull.into());
+    }
+    Ok(())
 }
 
 #[cfg(any(
@@ -4414,10 +4443,17 @@ impl GuardianOutputJournal {
         let result = (|| -> std::io::Result<()> {
             self.file.seek(SeekFrom::Start(self.committed_bytes))?;
             self.file.write_all(&header)?;
+            #[cfg(test)]
+            storage_full_after_header_for_test()?;
             self.file.write_all(&ciphertext)?;
             sync_appended_record(&self.file)
         })();
         if let Err(error) = result {
+            // A full disk frees up; cut off whatever part of the record got
+            // written and stay usable. Any other failure is ambiguous.
+            if is_storage_full(&error) && self.restore_committed_length() {
+                return Err(GuardianOutputJournalError::StorageFull(error));
+            }
             self.poisoned = true;
             return Err(GuardianOutputJournalError::Io(error));
         }
@@ -4444,6 +4480,16 @@ impl GuardianOutputJournal {
         };
         self.terminal_receipt = Some(receipt);
         Ok(receipt)
+    }
+
+    /// Cut the file back to its last committed record after a failed append,
+    /// so the next append starts there again.
+    fn restore_committed_length(&mut self) -> bool {
+        self.file.set_len(self.committed_bytes).is_ok()
+            && self
+                .file
+                .metadata()
+                .map_or(false, |metadata| metadata.len() == self.committed_bytes)
     }
 }
 
@@ -9119,5 +9165,50 @@ mod tests {
             journal.append_and_sync(b"no-retry"),
             Err(GuardianOutputJournalError::Poisoned)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_disk_that_fills_mid_record_leaves_the_journal_at_its_last_record() {
+        let directory = tempfile::tempdir().expect("create journal directory");
+        let path = directory.path().join("full.ftgout");
+        let parent = File::open(directory.path()).expect("open parent directory");
+        let limits = GuardianOutputJournalLimits::default();
+        let mut journal = create_new_test_journal(&parent, &path, identity(), cipher(), limits)
+            .expect("initialize journal");
+        journal
+            .sync_parent_directory_and_activate()
+            .expect("activate journal");
+        let first = journal.append_and_sync(b"first").expect("append first");
+        let committed = std::fs::metadata(&path)
+            .expect("inspect committed journal")
+            .len();
+
+        STORAGE_FULL_AFTER_HEADER.with(|armed| armed.set(true));
+        assert!(matches!(
+            journal.append_and_sync(b"second"),
+            Err(GuardianOutputJournalError::StorageFull(_))
+        ));
+        assert!(!journal.is_poisoned());
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("inspect restored journal")
+                .len(),
+            committed
+        );
+
+        // Once space returns the same append lands as the next record.
+        let second = journal.append_and_sync(b"second").expect("retry second");
+        assert_eq!(second.sequence(), first.sequence() + 1);
+        assert_eq!(second.cumulative_plaintext_bytes(), 11);
+        let reader = GuardianOutputJournalReader::open_existing(
+            open_read_only_journal_file(&path),
+            identity(),
+            cipher(),
+            limits,
+        )
+        .expect("authenticate the journal from disk");
+        assert_eq!(reader.record_count(), 2);
+        assert!(reader.tail() == GuardianOutputJournalTail::Clean);
     }
 }

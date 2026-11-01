@@ -9,9 +9,10 @@ use crate::broker::{
 use crate::output::{
     GuardianBrokerOutputSubmitError, GuardianCheckpointStageStore,
     GuardianDurableBrokerOutputAckV1, GuardianGenesisReplayOriginV1, GuardianJournalPreparation,
-    GuardianOutputCompletionState, GuardianOutputPipeline, GuardianOutputSubmitError,
-    GuardianPaneInputCompletionError, GuardianPaneInputJournal, GuardianPaneInputTransaction,
-    GuardianPaneInputTransactionError, GuardianPaneOutputJournal, OUTPUT_RECORD_BYTES,
+    GuardianOutputCommitFailure, GuardianOutputCompletionState, GuardianOutputPipeline,
+    GuardianOutputSubmitError, GuardianPaneInputCompletionError, GuardianPaneInputJournal,
+    GuardianPaneInputTransaction, GuardianPaneInputTransactionError, GuardianPaneOutputJournal,
+    OUTPUT_RECORD_BYTES,
 };
 use crate::transport::{GuardianBrokerEndpoint, GuardianTokenEffectLease};
 use frankenterm_build_identity::SealedAtomicBuildIdentity;
@@ -130,6 +131,8 @@ pub struct GuardianRuntimeCounters {
     pub broker_control_failures: u64,
     pub pty_read_failures: u64,
     pub output_commit_failures: u64,
+    /// Broker records whose commit found the disk full, to be read again.
+    pub output_storage_full_retries: u64,
     pub output_deregister_failures: u64,
     pub output_rearm_failures: u64,
     pub output_worker_disconnects: u64,
@@ -252,6 +255,9 @@ const BROKER_READ_RETRY_MAX: Duration = Duration::from_millis(25);
 /// lease, and twelve idle panes at 25 ms held a broker at ~43% CPU (mac).
 const BROKER_READ_RETRY_IDLE_MAX: Duration = Duration::from_millis(100);
 const BROKER_READ_IDLE_AFTER: Duration = Duration::from_secs(1);
+/// How long a pane waits to read a record again after its commit found the
+/// disk full.
+const OUTPUT_STORAGE_FULL_RETRY: Duration = Duration::from_millis(250);
 /// A pane that delivered output this recently is streaming: a Read that
 /// finds none is most likely waiting on a drain the broker has in flight.
 const BROKER_READ_STREAMING_WINDOW: Duration = Duration::from_millis(20);
@@ -351,6 +357,12 @@ impl StartingBrokerPane {
 
     fn read_due(&self, now: Instant) -> bool {
         self.read_retry_at.is_none_or(|at| at <= now)
+    }
+
+    /// Committing this pane's record found the disk full. The broker keeps
+    /// the record until it is acknowledged, so read it again after a pause.
+    fn retry_after_storage_full(&mut self, now: Instant) {
+        self.read_retry_at = Some(now + OUTPUT_STORAGE_FULL_RETRY);
     }
 }
 
@@ -4106,6 +4118,16 @@ impl GuardianRuntime {
                                     .counters
                                     .pty_records_durably_committed
                                     .saturating_add(1);
+                            }
+                            // The disk was full and the pane's journal is
+                            // unchanged. The record stays unacknowledged in
+                            // the broker, which serves it again.
+                            (Err(GuardianOutputCommitFailure::StorageFull), None)
+                                if valid && remaining.is_some() && !output.failed =>
+                            {
+                                pane.retry_after_storage_full(Instant::now());
+                                self.counters.output_storage_full_retries =
+                                    self.counters.output_storage_full_retries.saturating_add(1);
                             }
                             _ => {
                                 output.failed = true;

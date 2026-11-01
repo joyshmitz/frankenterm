@@ -298,6 +298,14 @@ impl GuardianOutputError {
     fn io(site: &'static str, source: std::io::Error) -> Self {
         Self::Io { site, source }
     }
+
+    /// An append found the disk full and left its journal unchanged.
+    pub(crate) const fn is_storage_full(&self) -> bool {
+        matches!(
+            self,
+            Self::Journal(GuardianOutputJournalError::StorageFull(_))
+        )
+    }
 }
 
 #[derive(Debug, Error)]
@@ -2433,6 +2441,9 @@ struct PaneJournalAuthority {
     /// snapshot's terminal record, which the next live-tail Resume names.
     replay_receipts: VecDeque<ReplayReceipt>,
     failed: bool,
+    /// Appends that find the disk full before they reach the journal.
+    #[cfg(test)]
+    storage_full_appends: u32,
 }
 
 /// A segment prefix a replay snapshot authenticated, with the device and
@@ -2580,7 +2591,8 @@ impl PaneJournalAuthority {
             return Err(OutputCommitError::SegmentManager);
         }
         let result = self.append_and_sync_once(payload);
-        if result.is_err() {
+        // A full disk left the segment at its last record: retry later.
+        if result.as_ref().is_err_and(|error| !error.is_storage_full()) {
             self.failed = true;
         }
         result
@@ -2630,6 +2642,13 @@ impl PaneJournalAuthority {
             .ok_or(OutputCommitError::SegmentManager)?
             .segment_identity
             .segment_id();
+        #[cfg(test)]
+        if self.storage_full_appends > 0 {
+            self.storage_full_appends -= 1;
+            return Err(OutputCommitError::Journal(
+                GuardianOutputJournalError::StorageFull(std::io::ErrorKind::StorageFull.into()),
+            ));
+        }
         let receipt = self.current_journal.append_and_sync(payload)?;
         if receipt.segment_id() != expected_segment_id {
             return Err(OutputCommitError::SegmentManager);
@@ -3212,9 +3231,16 @@ impl GuardianBrokerOutputChainV1 {
                 "guardian broker output read does not extend its chain",
             ));
         }
-        let receipt = authority.append_and_sync(payload).map_err(|_| {
-            GuardianOutputError::FilesystemAuthority("guardian broker output append failed")
-        })?;
+        let receipt = authority
+            .append_and_sync(payload)
+            .map_err(|error| match error {
+                OutputCommitError::Journal(error @ GuardianOutputJournalError::StorageFull(_)) => {
+                    GuardianOutputError::Journal(error)
+                }
+                _ => {
+                    GuardianOutputError::FilesystemAuthority("guardian broker output append failed")
+                }
+            })?;
         if Some(receipt.sequence()) != expected_sequence
             || usize::try_from(receipt.payload_bytes()).ok() != Some(payload.len())
             || Some(receipt.cumulative_plaintext_bytes()) != expected_end
@@ -9760,6 +9786,17 @@ enum OutputCommitError {
     QueueInvariant,
 }
 
+impl OutputCommitError {
+    /// The record was not written for lack of space, and its journal is
+    /// unchanged, so the same append can be retried.
+    const fn is_storage_full(&self) -> bool {
+        matches!(
+            self,
+            Self::Journal(GuardianOutputJournalError::StorageFull(_))
+        )
+    }
+}
+
 pub struct GuardianOutputCompletion {
     pub(crate) pane_id: Uuid,
     pub(crate) payload_bytes: usize,
@@ -9768,7 +9805,12 @@ pub struct GuardianOutputCompletion {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GuardianOutputCommitFailure;
+pub enum GuardianOutputCommitFailure {
+    /// The disk was full and the pane's journal is unchanged: the same
+    /// record can be committed again once space returns.
+    StorageFull,
+    Failed,
+}
 
 #[expect(
     clippy::large_enum_variant,
@@ -10441,7 +10483,13 @@ fn output_worker(
         let completion = GuardianOutputCompletion {
             pane_id: job.pane_id,
             payload_bytes,
-            result: result.map_err(|_| GuardianOutputCommitFailure),
+            result: result.map_err(|error| {
+                if error.is_storage_full() {
+                    GuardianOutputCommitFailure::StorageFull
+                } else {
+                    GuardianOutputCommitFailure::Failed
+                }
+            }),
             broker_ack,
         };
         if completions.send(completion).is_err() {
@@ -11663,6 +11711,8 @@ fn open_or_create_pane_segment_manager(
         replay_prefixes: Vec::new(),
         replay_receipts: VecDeque::new(),
         failed: false,
+        #[cfg(test)]
+        storage_full_appends: 0,
     };
     authority.validate_path_authority().map_err(|_| {
         GuardianOutputError::FilesystemAuthority(
@@ -11808,6 +11858,8 @@ fn open_scanned_pane_segment_manager(
         replay_prefixes: Vec::new(),
         replay_receipts: VecDeque::new(),
         failed: false,
+        #[cfg(test)]
+        storage_full_appends: 0,
     };
     authority.validate_path_authority().map_err(|_| {
         GuardianOutputError::FilesystemAuthority(
@@ -25261,6 +25313,42 @@ mod tests {
             .map_err(|_| "journal authority was poisoned")?;
         assert!(authority.failed);
         assert_eq!(authority.current_journal.record_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_full_disk_leaves_the_pane_journal_open_for_the_same_record()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = kept_private_directory("ft-guardian-output-full-")?;
+        let token_path = directory.join("guardian.token");
+        let poll = Poll::new()?;
+        let waker = Arc::new(Waker::new(poll.registry(), Token(1))?);
+        let pipeline = GuardianOutputPipeline::open(&token_path, 1, waker)?;
+        let pane_id = Uuid::new_v4();
+        let journal = pipeline.prepare_pane(Uuid::new_v4(), pane_id)?;
+        journal
+            .authority
+            .lock()
+            .map_err(|_| "journal authority was poisoned")?
+            .storage_full_appends = 1;
+
+        for expected_records in [0, 1] {
+            pipeline
+                .try_submit(pane_id, journal.clone(), zeroizing_test_bytes(b"retried"))
+                .map_err(|_| "output submission was unexpectedly rejected")?;
+            let result = completion(&pipeline)?.result;
+            if expected_records == 0 {
+                assert_eq!(result.err(), Some(GuardianOutputCommitFailure::StorageFull));
+            } else {
+                assert_eq!(result.map_err(|_| "retry failed")?.sequence(), 1);
+            }
+            let authority = journal
+                .authority
+                .lock()
+                .map_err(|_| "journal authority was poisoned")?;
+            assert!(!authority.failed);
+            assert_eq!(authority.current_journal.record_count(), expected_records);
+        }
         Ok(())
     }
 

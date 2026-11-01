@@ -3808,9 +3808,24 @@ struct BrokerOutputDrainJobV1 {
     reader: Box<dyn PollablePtyReader>,
     journal: BrokerDurableOutputJournalV1,
     bytes: Zeroizing<Vec<u8>>,
-    result: Result<Option<BrokerOutputTerminalReasonV1>, ()>,
+    /// `bytes` are what the pane drained before a full disk stopped their
+    /// append: journal them, and read nothing from the PTY.
+    held: bool,
+    result: Result<Option<BrokerOutputTerminalReasonV1>, BrokerOutputDrainFailureV1>,
     token_lease: GuardianTokenEffectLease,
 }
+
+/// Why a drain job did not extend its pane's journaled output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrokerOutputDrainFailureV1 {
+    /// The disk was full. The journal is unchanged and the pane keeps the
+    /// bytes, held past its readable prefix for a later drain.
+    StorageFull,
+    Failed,
+}
+
+/// How long drains pause after one found the disk full.
+const BROKER_OUTPUT_STORAGE_FULL_RETRY: Duration = Duration::from_millis(250);
 
 /// What one drain job read from its pane's PTY.
 #[derive(Debug, Eq, PartialEq)]
@@ -3896,24 +3911,32 @@ fn drain_pty_reader(
 }
 
 impl BrokerOutputDrainJobV1 {
-    fn run(&mut self) -> Result<Option<BrokerOutputTerminalReasonV1>, ()> {
-        self.token_lease.validate().map_err(|_| ())?;
-        let read = match drain_pty_reader(&mut *self.reader, &mut self.bytes)? {
-            BrokerPtyDrainV1::Empty => {
-                self.bytes.clear();
-                return Ok(None);
-            }
-            BrokerPtyDrainV1::Terminal(reason) => {
-                self.bytes.clear();
-                return Ok(Some(reason));
-            }
-            BrokerPtyDrainV1::Bytes(read) => read,
-        };
-        self.bytes.truncate(read);
+    fn run(&mut self) -> Result<Option<BrokerOutputTerminalReasonV1>, BrokerOutputDrainFailureV1> {
+        use BrokerOutputDrainFailureV1::{Failed, StorageFull};
+        self.token_lease.validate().map_err(|_| Failed)?;
+        if !self.held {
+            let drained =
+                drain_pty_reader(&mut *self.reader, &mut self.bytes).map_err(|()| Failed)?;
+            let read = match drained {
+                BrokerPtyDrainV1::Empty => {
+                    self.bytes.clear();
+                    return Ok(None);
+                }
+                BrokerPtyDrainV1::Terminal(reason) => {
+                    self.bytes.clear();
+                    return Ok(Some(reason));
+                }
+                BrokerPtyDrainV1::Bytes(read) => read,
+            };
+            self.bytes.truncate(read);
+        }
         self.journal
             .append_and_sync(self.sequence, &self.bytes)
-            .map_err(|_| ())?;
-        self.token_lease.validate().map_err(|_| ())?;
+            .map_err(|error| match error {
+                BrokerError::DurableOutputStorageFull => StorageFull,
+                _ => Failed,
+            })?;
+        self.token_lease.validate().map_err(|_| Failed)?;
         Ok(None)
     }
 }
@@ -3940,11 +3963,11 @@ impl BrokerOutputWorkerV1 {
                         RecoverablePanicSite::StorageWriter,
                         AssertUnwindSafe(|| job.run()),
                     )
-                    .unwrap_or(Err(()));
+                    .unwrap_or(Err(BrokerOutputDrainFailureV1::Failed));
                     if job.token_lease.validate().is_err() {
-                        job.result = Err(());
+                        job.result = Err(BrokerOutputDrainFailureV1::Failed);
                     }
-                    if job.result.is_err() {
+                    if job.result == Err(BrokerOutputDrainFailureV1::Failed) {
                         job.journal.failed = true;
                     }
                     if sender.send(job).is_err() {
@@ -4520,6 +4543,8 @@ pub struct BrokerControlServiceV1 {
     quarantined_live_leases: u64,
     lease_submission_cursor: Option<Uuid>,
     pending_output_prefetch: Option<BrokerOutputPrefetchV1>,
+    /// No drain starts before this: the last one found the disk full.
+    output_storage_retry_at: Option<Instant>,
     #[cfg(test)]
     lease_job_probe: Option<BrokerSpawnWorkerEffectLeaseProbeV1>,
     #[cfg(test)]
@@ -4811,6 +4836,7 @@ impl BrokerControlServiceV1 {
             quarantined_live_leases: 0,
             lease_submission_cursor: None,
             pending_output_prefetch: None,
+            output_storage_retry_at: None,
             #[cfg(test)]
             lease_job_probe: None,
             #[cfg(test)]
@@ -5184,6 +5210,9 @@ impl BrokerControlServiceV1 {
         {
             self.output_worker.retained = Some(job);
             return;
+        }
+        if job.result == Err(BrokerOutputDrainFailureV1::StorageFull) {
+            self.output_storage_retry_at = Some(Instant::now() + BROKER_OUTPUT_STORAGE_FULL_RETRY);
         }
         pane.install_output_completion(job);
         self.output_worker.active = None;
@@ -5825,7 +5854,12 @@ impl BrokerControlServiceV1 {
             && live.adoption.pane.output_terminal.is_none()
         {
             header.status = BrokerControlResponseStatusV1::Retryable;
-            if self.output_worker.active.is_some() {
+            // A drain found the disk full a moment ago: let it clear first.
+            if self.output_worker.active.is_some()
+                || self
+                    .output_storage_retry_at
+                    .is_some_and(|retry_at| Instant::now() < retry_at)
+            {
                 return BrokerControlResponseV1::new(header, &[]).map_err(|_| ());
             }
             let pane = &mut live.adoption.pane;
@@ -5895,23 +5929,7 @@ impl BrokerControlServiceV1 {
         token_lease: GuardianTokenEffectLease,
     ) -> Result<(), ()> {
         let pane = &mut self.live_spawns.get_mut(&pane_id).ok_or(())?.adoption.pane;
-        let bytes = Zeroizing::new(vec![0; count]);
-        // Allocate before transferring either irreplaceable facet.
-        let reader = pane.proxy_reader.take().ok_or(())?;
-        let Some(mut journal) = pane.output_journal.take() else {
-            pane.proxy_reader = Some(reader);
-            return Err(());
-        };
-        journal.release_through(pane.buffer_start_sequence);
-        let job = BrokerOutputDrainJobV1 {
-            pane_id,
-            sequence: pane.next_output_sequence,
-            reader,
-            journal,
-            bytes,
-            result: Err(()),
-            token_lease,
-        };
+        let job = pane.take_output_drain_job(pane_id, count, token_lease)?;
         let Some(sender) = self.output_worker.jobs.as_ref() else {
             pane.proxy_reader = Some(job.reader);
             pane.output_journal = Some(job.journal);
@@ -5949,7 +5967,11 @@ impl BrokerControlServiceV1 {
             return;
         }
         self.pending_output_prefetch = None;
-        if self.output_worker.active.is_some() {
+        if self.output_worker.active.is_some()
+            || self
+                .output_storage_retry_at
+                .is_some_and(|retry_at| Instant::now() < retry_at)
+        {
             return;
         }
         let Some(live) = self.live_spawns.get_mut(&prefetch.pane_id) else {
@@ -18476,10 +18498,15 @@ enum BrokerOutputJournalBackendV1 {
 ///
 /// The broker may expose only the synchronized plaintext prefix. A failed
 /// append is sticky because the on-disk disposition can be ambiguous even
-/// though the bytes already drained from the PTY remain in memory.
+/// though the bytes already drained from the PTY remain in memory. The one
+/// exception is a full disk, after which the journal is known unchanged: the
+/// drained bytes stay held and are journaled again later.
 struct BrokerDurableOutputJournalV1 {
     backend: BrokerOutputJournalBackendV1,
     failed: bool,
+    /// Appends that report a full disk before reaching the backend.
+    #[cfg(test)]
+    storage_full_appends: u32,
 }
 
 impl BrokerDurableOutputJournalV1 {
@@ -18493,6 +18520,8 @@ impl BrokerDurableOutputJournalV1 {
         Ok(Self {
             backend: BrokerOutputJournalBackendV1::Chain(chain),
             failed: false,
+            #[cfg(test)]
+            storage_full_appends: 0,
         })
     }
 
@@ -18523,6 +18552,7 @@ impl BrokerDurableOutputJournalV1 {
         Ok(Self {
             backend: BrokerOutputJournalBackendV1::Segment(Box::new(journal)),
             failed: false,
+            storage_full_appends: 0,
         })
     }
 
@@ -18534,16 +18564,30 @@ impl BrokerDurableOutputJournalV1 {
         if self.failed {
             return Err(BrokerError::DurableOutputJournalUnavailable);
         }
+        #[cfg(test)]
+        if self.storage_full_appends != 0 {
+            self.storage_full_appends -= 1;
+            return Err(BrokerError::DurableOutputStorageFull);
+        }
         let result = match &mut self.backend {
             BrokerOutputJournalBackendV1::Chain(chain) => chain
                 .append_read(output_sequence_start, payload)
-                .map_err(|_| BrokerError::DurableOutputJournalUnavailable),
+                .map_err(|error| {
+                    if error.is_storage_full() {
+                        BrokerError::DurableOutputStorageFull
+                    } else {
+                        BrokerError::DurableOutputJournalUnavailable
+                    }
+                }),
             #[cfg(test)]
             BrokerOutputJournalBackendV1::Segment(journal) => {
                 append_to_raw_output_segment(journal, output_sequence_start, payload)
             }
         };
-        if result.is_err() {
+        if result
+            .as_ref()
+            .is_err_and(|error| *error != BrokerError::DurableOutputStorageFull)
+        {
             self.failed = true;
         }
         result
@@ -19641,18 +19685,61 @@ pub struct BrokerAdoptedPaneV1 {
 impl BrokerAdoptedPaneV1 {
     // Caller has matched the retained job's pane/sequence and verified that
     // both facets are still exclusively owned by this completion.
+    /// Move this pane's PTY reader and output journal into one drain job of
+    /// at most `count` bytes. Bytes a full disk left held past the readable
+    /// prefix are journaled first, and the job then reads nothing.
+    fn take_output_drain_job(
+        &mut self,
+        pane_id: Uuid,
+        count: usize,
+        token_lease: GuardianTokenEffectLease,
+    ) -> Result<BrokerOutputDrainJobV1, ()> {
+        let readable = self
+            .next_output_sequence
+            .checked_sub(self.buffer_start_sequence)
+            .and_then(|readable| usize::try_from(readable).ok())
+            .ok_or(())?;
+        let held = self.output_buffer.len() > readable;
+        let bytes = if held {
+            Zeroizing::new(self.output_buffer.iter().skip(readable).copied().collect())
+        } else {
+            Zeroizing::new(vec![0; count])
+        };
+        // Allocate before transferring either irreplaceable facet.
+        let reader = self.proxy_reader.take().ok_or(())?;
+        let Some(mut journal) = self.output_journal.take() else {
+            self.proxy_reader = Some(reader);
+            return Err(());
+        };
+        journal.release_through(self.buffer_start_sequence);
+        Ok(BrokerOutputDrainJobV1 {
+            pane_id,
+            sequence: self.next_output_sequence,
+            reader,
+            journal,
+            bytes,
+            held,
+            result: Err(BrokerOutputDrainFailureV1::Failed),
+            token_lease,
+        })
+    }
+
     fn install_output_completion(&mut self, job: BrokerOutputDrainJobV1) {
         let BrokerOutputDrainJobV1 {
             reader,
             journal,
             bytes,
+            held,
             result,
             ..
         } = job;
         self.proxy_reader = Some(reader);
         self.output_journal = Some(journal);
-        // Ambiguous bytes remain owned but outside the readable prefix.
-        self.output_buffer.extend(bytes.iter().copied());
+        // Ambiguous bytes, and bytes a full disk left unjournaled, remain
+        // owned but outside the readable prefix. Held bytes are there already.
+        if !held {
+            self.output_buffer.extend(bytes.iter().copied());
+        }
         if let Ok(terminal) = result {
             if let Some(end) = u64::try_from(bytes.len())
                 .ok()
@@ -19929,11 +20016,13 @@ impl BrokerAdoptedPaneV1 {
         self.output_buffer.extend(&chunk[..bytes_drained]);
         let durable_journal_sequence = if let Some(journal) = self.output_journal.as_mut() {
             journal.release_through(self.buffer_start_sequence);
-            Some(
-                journal
-                    .append_and_sync(output_sequence_start, &chunk[..bytes_drained])?
-                    .sequence(),
-            )
+            let appended = journal.append_and_sync(output_sequence_start, &chunk[..bytes_drained]);
+            // Only the drain job journals held bytes again after a full disk;
+            // this pump reads the PTY every time, so any failure stays final.
+            if appended.is_err() {
+                journal.failed = true;
+            }
+            Some(appended?.sequence())
         } else {
             None
         };
@@ -20969,6 +21058,8 @@ pub enum BrokerError {
     DurableOutputJournalNotFresh,
     #[error("durable broker output journal is unavailable and requires reconciliation")]
     DurableOutputJournalUnavailable,
+    #[error("durable broker output storage is full; the read was not journaled")]
+    DurableOutputStorageFull,
     #[error("durable broker output journal returned an inconsistent append receipt")]
     DurableOutputJournalReceiptMismatch,
     #[error("requested proxy output is older than the retained sequence window")]
@@ -31786,7 +31877,8 @@ mod tests {
                 reader: pane.proxy_reader.take().unwrap(),
                 journal: pane.output_journal.take().unwrap(),
                 bytes: Zeroizing::new(vec![0; 4]),
-                result: Err(()),
+                held: false,
+                result: Err(BrokerOutputDrainFailureV1::Failed),
                 token_lease: token_authority.acquire_effect_lease().unwrap(),
             };
             assert!(worker.jobs.as_ref().unwrap().send(job).is_ok());
@@ -31887,7 +31979,8 @@ mod tests {
                 reader: pane.proxy_reader.take().unwrap(),
                 journal: pane.output_journal.take().unwrap(),
                 bytes: Zeroizing::new(vec![0; 1]),
-                result: Err(()),
+                held: false,
+                result: Err(BrokerOutputDrainFailureV1::Failed),
                 token_lease: token_authority.acquire_effect_lease().unwrap(),
             };
             assert!(worker.jobs.as_ref().unwrap().send(job).is_ok());
@@ -31908,6 +32001,119 @@ mod tests {
         let mut bytes = [0; 1];
         pane.execute_proxy_read(permit, &mut bytes).unwrap();
         assert_eq!(bytes, *b"z");
+        pane.terminate_and_wait_for_test();
+    }
+
+    #[test]
+    fn a_drain_that_finds_the_disk_full_holds_its_bytes_until_space_returns() {
+        let temp = private_catalog_directory();
+        let sentinel = temp.path().join("unused");
+        let auth = authority(id(131), id(132), id(133), id(134), 0x99, 0x9a);
+        let payload = command_payload("printf abcdefgh", &sentinel);
+        let binding = binding_for(&payload, &auth);
+        let limits = BrokerResourceLimitsV1::with_proxy_bounds(GUARDIAN_MAX_PAYLOAD_BYTES, 1, 4, 8)
+            .expect("valid bounded durable output limits");
+        let (prepared, control) =
+            prepare_for_test(payload, binding, &auth, limits).expect("prepare output pane");
+        let prepared = prepared
+            .bind_fresh_output_journal(create_test_output_journal(
+                temp.path(),
+                binding.durable_pane_id,
+                id(135),
+                GuardianOutputJournalLimits::default(),
+            ))
+            .expect("bind output journal");
+        let BrokerAdoptionV1 {
+            mut pane,
+            attachment,
+        } = commit_for_test(prepared, control, binding).expect("commit output pane");
+        let token_path = temp.path().join("output-worker.token");
+        crate::transport::provision_guardian_token(&token_path).unwrap();
+        let (_, mut token_authority) = load_guardian_secret_with_authority(&token_path).unwrap();
+        let poll = Poll::new().unwrap();
+        let waker = Arc::new(Waker::new(poll.registry(), Token(1)).unwrap());
+        let worker = BrokerOutputWorkerV1::start(waker).unwrap();
+        let mut drain = |pane: &mut BrokerAdoptedPaneV1| {
+            let job = pane
+                .take_output_drain_job(
+                    binding.durable_pane_id,
+                    4,
+                    token_authority.acquire_effect_lease().unwrap(),
+                )
+                .expect("take drain job");
+            let held = job.held.then(|| job.bytes.to_vec());
+            assert!(worker.jobs.as_ref().unwrap().send(job).is_ok());
+            let completion = worker
+                .completions
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            let result = completion.result;
+            pane.install_output_completion(completion);
+            (held, result)
+        };
+
+        pane.output_journal.as_mut().unwrap().storage_full_appends = 1;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "the child never printed");
+            match drain(&mut pane) {
+                (None, Err(BrokerOutputDrainFailureV1::StorageFull)) => break,
+                (None, Ok(None)) => thread::sleep(Duration::from_millis(5)),
+                other => panic!("unexpected first drain: {other:?}"),
+            }
+        }
+        let held_bytes = pane.resource_usage().buffered_output_bytes;
+        assert!(held_bytes > 0 && held_bytes <= 4);
+        assert!(!pane.output_journal.as_ref().unwrap().failed);
+        assert_eq!(
+            pane.next_output_sequence, 0,
+            "an unjournaled read was exposed"
+        );
+        let nothing_durable = pane.admit_proxy_read(&attachment, 1).unwrap();
+        assert_eq!(
+            pane.execute_proxy_read(nothing_durable, &mut [0_u8; 1]),
+            Err(BrokerError::ProxyWouldBlock),
+            "an unjournaled read became guardian-visible"
+        );
+
+        // Space is back: the next drain journals the held bytes, read nothing
+        // new, and leaves them in the buffer once.
+        let (held, result) = drain(&mut pane);
+        assert_eq!(result, Ok(None));
+        let held = held.expect("the drain after a full disk journals the held bytes");
+        assert_eq!(held.as_slice(), &b"abcdefgh"[..held_bytes]);
+        let held_end = u64::try_from(held_bytes).unwrap();
+        assert_eq!(pane.next_output_sequence, held_end);
+        assert_eq!(pane.resource_usage().buffered_output_bytes, held_bytes);
+        let journal = pane.output_journal.as_ref().unwrap();
+        assert_eq!(journal.raw_segment().record_count(), 1);
+        assert_eq!(journal.raw_segment().cumulative_plaintext_bytes(), held_end);
+
+        // Everything the child printed arrives once, in order.
+        let mut delivered = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while delivered.len() < 8 {
+            assert!(Instant::now() < deadline, "output stopped at {delivered:?}");
+            if pane.next_output_sequence == pane.buffer_start_sequence {
+                let (held, result) = drain(&mut pane);
+                assert_eq!((held, result), (None, Ok(None)));
+                if pane.next_output_sequence == pane.buffer_start_sequence {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                continue;
+            }
+            let permit = pane.admit_proxy_read(&attachment, 4).unwrap();
+            let mut bytes = [0_u8; 4];
+            let read = pane.execute_proxy_read(permit, &mut bytes).unwrap();
+            delivered.extend_from_slice(&bytes[..read.bytes_read]);
+            let ack = pane
+                .admit_proxy_output_ack(&attachment, read.output_sequence_end)
+                .unwrap();
+            pane.execute_proxy_output_ack(ack).unwrap();
+        }
+        assert_eq!(delivered, b"abcdefgh");
+        let journal = pane.output_journal.as_ref().unwrap();
+        assert_eq!(journal.raw_segment().cumulative_plaintext_bytes(), 8);
         pane.terminate_and_wait_for_test();
     }
 
