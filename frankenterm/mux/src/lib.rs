@@ -13525,6 +13525,24 @@ fn read_from_guardian_live_output(
                         .record(started_at.elapsed().as_secs_f64());
                     checkpoint_schedule.record_outcome(Instant::now(), true);
                 }
+                // The pane's registration ended under the publication: the
+                // pane closed, or an upgrade handed it to the successor. This
+                // mux has nothing of it left to publish or reconcile.
+                Err(error)
+                    if error.downcast_ref::<LiveParserCheckpointError>()
+                        == Some(&LiveParserCheckpointError::StaleRegistration) =>
+                {
+                    metrics::counter!(
+                        "mux.guardian_checkpoint.publication_total",
+                        "outcome" => "registration_ended"
+                    )
+                    .increment(1);
+                    log::info!(
+                        "guardian checkpoint publication of pane {} skipped: its registration ended",
+                        pane_id
+                    );
+                    checkpoint_schedule.record_outcome(Instant::now(), true);
+                }
                 Err(error) => {
                     metrics::counter!(
                         "mux.guardian_checkpoint.publication_total",

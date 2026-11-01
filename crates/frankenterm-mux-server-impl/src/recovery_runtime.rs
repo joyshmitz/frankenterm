@@ -594,10 +594,18 @@ impl PeriodicRecovery {
                         if let Some(error) = result.error {
                             metrics::counter!("mux.recovery.publication", "outcome" => error)
                                 .increment(1);
-                            log::error!(
-                                "mux periodic recovery outcome={error} disabled={}",
-                                self.failed
-                            );
+                            // A capture that met a spawn in flight, or that
+                            // shutdown cancelled, runs again next period.
+                            if matches!(error, "capture_busy" | "cancelled") && !self.failed {
+                                log::info!(
+                                    "mux periodic recovery outcome={error}; the next period retries"
+                                );
+                            } else {
+                                log::error!(
+                                    "mux periodic recovery outcome={error} disabled={}",
+                                    self.failed
+                                );
+                            }
                         }
                     }
                     Err(_) => {
@@ -727,7 +735,9 @@ impl PeriodicRecovery {
                         ),
                     }
                 }
-                Err(error) if capture_was_busy(&error) => (None, Some("busy"), false, false),
+                Err(error) if capture_was_busy(&error) => {
+                    (None, Some("capture_busy"), false, false)
+                }
                 Err(
                     WholeMuxCaptureError::CaptureDeadline { .. }
                     | WholeMuxCaptureError::StaleCapture(_)
