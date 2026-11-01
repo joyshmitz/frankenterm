@@ -486,7 +486,7 @@ mod live_measurement {
             content_sha256: String,
         }
 
-        #[derive(Clone, Default, Serialize, serde::Deserialize)]
+        #[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
         struct FramePollDiagnostics {
             read_attempts: u64,
             marker_misses: u64,
@@ -536,7 +536,8 @@ mod live_measurement {
                 .await
                 .map_err(|error| {
                     format!(
-                        "capture read deadline: {error}; transient_read_rejections={rejections}"
+                        "capture read deadline: {error}; marker={marker:?}; read_attempts={}; marker_misses={}; transient_read_rejections={rejections}",
+                        diagnostics.read_attempts, diagnostics.marker_misses
                     )
                 })?;
                 diagnostics.read_elapsed_ns = diagnostics
@@ -1810,6 +1811,23 @@ mod live_measurement {
                     .await;
                     assert!(result.is_err());
                     assert_eq!(attempts, 0, "expired deadline must not invoke read");
+
+                    let mut pending_attempts = 0;
+                    let pending_error = poll_frame(
+                        &cx,
+                        "FT LINDLEY READY V1",
+                        Instant::now() + Duration::from_millis(5),
+                        || {
+                            pending_attempts += 1;
+                            std::future::pending::<frankenterm_core::Result<String>>()
+                        },
+                    )
+                    .await
+                    .expect_err("a stuck initial read must fail at the original deadline");
+                    assert_eq!(pending_attempts, 1, "a timed-out read must not retry");
+                    assert!(pending_error.contains("capture read deadline:"));
+                    assert!(pending_error.contains("marker=\"FT LINDLEY READY V1\""));
+                    assert!(pending_error.contains("read_attempts=1; marker_misses=0"));
 
                     let result = poll_frame(
                         &cx,
