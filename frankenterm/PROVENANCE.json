@@ -163,15 +163,15 @@
         "rename": 2,
         "runtime-swap": 4,
         "security-fix": 2,
-        "test": 41
+        "test": 42
       },
-      "fork_side_commit_count": 292,
+      "fork_side_commit_count": 293,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-10-28T03:05:14-04:00",
-        "sha": "ae4cc1cd42a5394b46d3fad6a66c5dca220ab565",
-        "subject": "style: apply the pinned rustfmt across the workspace; one clippy semicolon"
+        "classification": "test",
+        "committed_at": "2026-11-01T07:52:58-05:00",
+        "sha": "9613efc91971f3cf35cd889c94618591ce78367a",
+        "subject": "test(client): await metadata scheduling"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -191,15 +191,15 @@
         "rename": 2,
         "runtime-swap": 5,
         "security-fix": 1,
-        "test": 86
+        "test": 87
       },
-      "fork_side_commit_count": 259,
+      "fork_side_commit_count": 260,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "test",
-        "committed_at": "2026-10-31T13:07:54-04:00",
-        "sha": "bcbb279df17c9d4ca78699beb0188fbec1c296a4",
-        "subject": "test(codec): pass the PDU case number as a format argument"
+        "committed_at": "2026-11-01T08:43:44-05:00",
+        "sha": "7671c6038f3097ffae56581770d19e2b97cda816",
+        "subject": "test(codec): move the non-canonical LEB128 fixture off ident 117"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -232,10 +232,10 @@
       "classification_summary": {
         "chore": 3,
         "cleanup": 1,
-        "cosmetic": 7,
+        "cosmetic": 9,
         "docs": 1,
         "feat": 75,
-        "fix": 61,
+        "fix": 63,
         "other": 17,
         "refactor": 5,
         "rename": 1,
@@ -243,13 +243,13 @@
         "security-fix": 2,
         "test": 15
       },
-      "fork_side_commit_count": 196,
+      "fork_side_commit_count": 200,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-10-31T22:07:12-04:00",
-        "sha": "9e1493d39c0bba896a793bc4049aa0ad4844a575",
-        "subject": "Preserve mandatory SSH transport policy through export and durable authorization"
+        "classification": "fix",
+        "committed_at": "2026-11-01T06:28:42-05:00",
+        "sha": "fc506f17fd61ca428405d616daf1beef1e895d4d",
+        "subject": "fix(mobile): stabilize theme catalog JSON order"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -785,21 +785,21 @@
         "cosmetic": 33,
         "docs": 7,
         "feat": 229,
-        "fix": 339,
-        "other": 81,
+        "fix": 342,
+        "other": 82,
         "refactor": 12,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
         "test": 116
       },
-      "fork_side_commit_count": 842,
+      "fork_side_commit_count": 846,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-31T19:20:29-04:00",
-        "sha": "aaf1afef289b6dd09074ffc39fd56f83cb501b5a",
-        "subject": "fix(recovery): a pane that ended after its root costs only that pane; close exited panes"
+        "committed_at": "2026-11-01T06:00:56-05:00",
+        "sha": "e9bf5b79d705600472acca6d8c884cf10eb14b7f",
+        "subject": "fix(guardian): a full disk stalls a guardian pane's output instead of freezing it for good"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1039,7 +1039,7 @@
       "classification_summary": {
         "chore": 1,
         "cleanup": 3,
-        "cosmetic": 21,
+        "cosmetic": 22,
         "docs": 4,
         "feat": 101,
         "fix": 189,
@@ -1049,13 +1049,13 @@
         "security-fix": 6,
         "test": 87
       },
-      "fork_side_commit_count": 554,
+      "fork_side_commit_count": 555,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-10-30T17:46:42-04:00",
-        "sha": "63b88d16c20e69fccf9dcaea8c233731040f755d",
-        "subject": "feat(mux): publish coherent remote palettes and complete terminal frames"
+        "classification": "cosmetic",
+        "committed_at": "2026-10-31T23:21:57-04:00",
+        "sha": "01d9c7db2abbcd8d051bb0d43ba30b2301c517ce",
+        "subject": "style(term, config): restore edition-2018 formatting the workspace proof checks"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1210,8 +1210,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3457,
-  "generated_at": "2026-11-01T03:10:02.235710Z",
+  "fork_side_commit_total": 3468,
+  "generated_at": "2026-11-01T15:56:29.112223Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
