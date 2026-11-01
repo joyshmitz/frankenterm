@@ -1985,7 +1985,7 @@ where
             &temp_name,
             TxContractStoreErrorKind::Rename,
             format!(
-                "refused to replace transaction contract {} because its basename no longer names the pre-effect authorized inode",
+                "refused to replace transaction contract: basename no longer names the pre-effect authorized inode; path: {}",
                 path.display()
             ),
         ));
@@ -9093,10 +9093,11 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.kind(), TxContractStoreErrorKind::Rename);
-        assert!(
-            err.to_string()
-                .contains("basename no longer names the pre-effect authorized inode")
-        );
+        // Keep the safety reason ahead of the unbounded path so bounded MCP
+        // diagnostics still explain why publication was refused.
+        assert!(err.to_string().starts_with(
+            "refused to replace transaction contract: basename no longer names the pre-effect authorized inode; path: "
+        ));
         assert_eq!(std::fs::read(&path).unwrap(), foreign_sentinel);
         assert_eq!(
             std::fs::read(&original_detached).unwrap(),

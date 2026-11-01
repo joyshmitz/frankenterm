@@ -23886,7 +23886,10 @@ mod tests {
             envelope["error"]
                 .as_str()
                 .expect("error text")
-                .contains("basename no longer names the pre-effect authorized inode")
+                .contains("basename no longer names the pre-effect authorized inode"),
+            "unexpected rollback failure: {} (hint: {})",
+            envelope["error"],
+            envelope["hint"]
         );
         assert!(
             envelope["hint"]
