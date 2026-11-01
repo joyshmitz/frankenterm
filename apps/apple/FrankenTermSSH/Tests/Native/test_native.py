@@ -172,13 +172,22 @@ class LoopbackServer:
     def __init__(self, key, reject=False, family=socket.AF_INET, completion="unknown",
                  auth_mode="normal", connections=1, host_key=None, host_signature=None,
                  forward_to=None, forward_host="target.internal.invalid", password=None, user_signature=None,
-                 interactive_rounds=None, allow_exec=False, sftp_handler=None):
+                 interactive_rounds=None, allow_exec=False, sftp_handler=None, transport_algorithms=None):
         if not isinstance(connections, int) or not 1 <= connections <= 8:
             raise ValueError("test connection count must be bounded")
         if host_signature not in (None, "rsa-sha2-256", "rsa-sha2-512", "ssh-rsa"):
             raise ValueError("test host signature must be an exact supported fixture value")
         if user_signature not in (None, "rsa-sha2-256", "rsa-sha2-512", "ssh-rsa"):
             raise ValueError("test user signature must be an exact supported fixture value")
+        if transport_algorithms is not None:
+            permitted = {"kex", "cipher_c_s", "cipher_s_c", "mac_c_s", "mac_s_c"}
+            if (not isinstance(transport_algorithms, dict) or not transport_algorithms
+                    or not set(transport_algorithms).issubset(permitted)
+                    or any(not isinstance(value, str) or not 1 <= len(value) <= 1023
+                           or not value.isascii() or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-_.@," for c in value)
+                           for value in transport_algorithms.values())):
+                raise ValueError("test transport profile must contain bounded explicit algorithm lists")
+        self.transport_algorithms = dict(transport_algorithms or {})
         if password is not None and (not isinstance(password, bytes) or not 1 <= len(password) <= 1024):
             raise ValueError("test password must be bounded synthetic bytes")
         self.public = public_blob(key)
@@ -292,6 +301,15 @@ class LoopbackServer:
                 algorithm = C.c_char_p(self.user_signature.encode("ascii"))
                 if SERVER.ssh_bind_options_set(server, 17, algorithm) != 0:
                     raise RuntimeError("test user signature selection failed")
+            # Public libssh server.h options 11...15 independently constrain
+            # KEX and each direction's encryption/MAC. No host configuration,
+            # client implementation, or production policy is consulted.
+            for name, option in {"kex": 11, "cipher_c_s": 12, "cipher_s_c": 13,
+                                 "mac_c_s": 14, "mac_s_c": 15}.items():
+                if name in self.transport_algorithms:
+                    value = C.c_char_p(self.transport_algorithms[name].encode("ascii"))
+                    if SERVER.ssh_bind_options_set(server, option, value) != 0:
+                        raise RuntimeError("test transport algorithm selection failed: " + name)
             if SERVER.ssh_bind_accept_fd(server, session, sock.detach()) != 0:
                 raise RuntimeError("test accept failed")
             if SERVER.ssh_handle_key_exchange(session) != 0:

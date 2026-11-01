@@ -179,6 +179,69 @@ still required. The Rust exporter passes pinned rustfmt parsing/format checks
 and eight independent OpenSSH source-configuration checks, but its Cargo tests
 have not run because the required RCH runner is unavailable.
 
+### Mandatory SSH transport algorithms
+
+Both desktop exporters preserve bounded, ordered literal `KexAlgorithms`,
+`Ciphers` and `MACs` lists. Each `host_trust` record carries optional
+`kex_algorithms`, `ciphers` and `macs` arrays under the mandatory
+`ssh_transport_algorithm_policy_v1` capability. The typed fields imply the
+capability even if its explicit marker is absent. A marker without a payload is
+invalid. A missing dimension is unconstrained; `[]` explicitly denies every
+algorithm in that dimension. Each dimension admits at most 64 unique literal
+names of at most 128 bytes. Source readers deduplicate repeated names while
+retaining their first preference position.
+
+Native negotiation intersects each imported list with this existing qualified
+profile, preserving the imported preference order:
+
+| Dimension | Qualified algorithms, in default order |
+| --- | --- |
+| Key exchange | `curve25519-sha256`, `curve25519-sha256@libssh.org`, `ecdh-sha2-nistp256`, `ecdh-sha2-nistp384`, `ecdh-sha2-nistp521` |
+| Cipher, each direction | `aes256-ctr`, `aes128-ctr` |
+| MAC, each direction | `hmac-sha2-256-etm@openssh.com`, `hmac-sha2-512-etm@openssh.com` |
+
+Compression remains `none`. Preserving a recognized legacy, AEAD or
+post-quantum source name does not qualify it for this backend. An empty supported
+intersection makes the route unavailable before opening its SSH connection.
+Default-dependent `+`/`-` expressions, globs, unknown names and malformed lists
+remain required unresolved source policy. Qualified `^` preference-only lists
+remain explicit inactive preferences. Neither export path runs SSH to infer
+the source machine's default algorithm set.
+
+`NativeSSHSession.setTransportAlgorithms` and
+`ftssh_set_transport_algorithms` configure all three dimensions on one fresh
+session. The C boundary checks all lists and actual linked-library support for
+key exchange and both cipher/MAC directions before changing any preference.
+Malformed, duplicate or unsupported input leaves the previous policy intact.
+A native allocation or publication failure terminally fails the session,
+preventing a partially installed policy from starting a handshake. Setters are
+frozen after the first handshake call, including an EAGAIN suspension. Each
+forwarded child session receives its own host's restrictions.
+
+The driver reports actual key exchange, outbound/inbound cipher and
+outbound/inbound MAC names. All three authentication grants retain that complete
+immutable evidence and revalidate it against current policy before credential
+use and later session access. Both raw-key and certificate peers use this check.
+Requested lists alone cannot authorize a connection. Password and MFA routes,
+ordered jump routes, retries and read-only host-key probes use the same native
+configuration and shared verifier.
+
+Catalog version 12 stores transport constraints in the existing bounded
+canonical-scope algorithm-policy history. Current aliases and retained history
+intersect without restoring removed names. Subset export retains restrictions
+from unselected aliases; Rust inventory projection does this for host and CA
+signatures as well as transport dimensions. Reimport, renamed trust records,
+older exports and field removal cannot relax an accepted policy. Older catalog
+versions cannot contain the new policy, and incomplete or weakened history is
+rejected. Trust-field changes also invalidate local key-assignment and
+certificate-renewal witnesses. The Mac enrollment helper remains unavailable
+for a route whose mandatory policy it cannot enforce.
+
+The Mac export preview displays effective restrictions; the iPhone displays
+imported and effective restrictions, including earlier retained policy and
+explicit deny-all intersections. Availability is derived from the linked
+native profile, not from a capability marker alone.
+
 ### Imported host revocation lists and KRLs
 
 Both passive desktop exporters support `RevokedHostKeys` public-key lists and

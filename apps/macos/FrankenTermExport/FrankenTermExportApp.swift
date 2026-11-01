@@ -2507,7 +2507,8 @@ private struct MacExportView: View {
         let related = trust.map { selected in document.hostTrust.filter { $0.canonicalTrustScope == selected.canonicalTrustScope } } ?? []
         let required = Set(route.requiredCapabilities).union(route.requiredExtensions.map { "extension:" + $0 })
             .union(related.flatMap(\.requiredPolicyRequirements))
-            .subtracting([WorkspaceDocument.hostCertificateCapability])
+            .subtracting([WorkspaceDocument.hostCertificateCapability, WorkspaceDocument.hostAlgorithmPolicyCapability,
+                          WorkspaceDocument.transportAlgorithmPolicyCapability])
         let revoked = Array(Set(related.flatMap(\.revokedKeys))).sorted {
             $0.algorithm == $1.algorithm ? $0.fingerprint < $1.fingerprint : $0.algorithm < $1.algorithm
         }
@@ -2530,11 +2531,35 @@ private struct MacExportView: View {
                     Text("Host certificate authority · \(authority.algorithm) · \(authority.fingerprint)")
                         .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                 }
+                if let policy = try? document.hostAlgorithmPolicy(forTrustID: trust.id), policy.isConstrained {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Effective algorithm restrictions").font(.caption.bold())
+                        algorithmPolicyPreview("Host signatures", algorithms: policy.hostKeyAlgorithms)
+                        algorithmPolicyPreview("Certificate authority signatures", algorithms: policy.caSignatureAlgorithms)
+                        algorithmPolicyPreview("Key exchange", algorithms: policy.transport.keyExchangeAlgorithms)
+                        algorithmPolicyPreview("Ciphers", algorithms: policy.transport.ciphers)
+                        algorithmPolicyPreview("Message authentication", algorithms: policy.transport.macs)
+                        Text("Restrictions from all trust records for this host travel with the export. The iPhone also requires support for the selected algorithms; cipher and message authentication limits apply in both directions.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
                 ForEach(revoked, id: \.self) { key in
                     Text("Revoked · \(key.algorithm) · \(key.fingerprint)").font(.system(.caption, design: .monospaced)).foregroundStyle(.red).textSelection(.enabled)
                 }
             }
         }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func algorithmPolicyPreview(_ title: String, algorithms: [String]?) -> some View {
+        if let algorithms {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.caption).foregroundStyle(.secondary)
+                Text(verbatim: algorithms.isEmpty ? "None allowed" : algorithms.joined(separator: ", "))
+                    .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    .foregroundStyle(algorithms.isEmpty ? Color.red : Color.primary)
+            }
+        }
     }
 
     private func identityChoice(_ identity: WorkspaceExportSelection.Identity) -> some View {

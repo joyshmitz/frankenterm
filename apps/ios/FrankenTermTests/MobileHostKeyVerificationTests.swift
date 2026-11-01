@@ -139,6 +139,49 @@ final class MobileHostKeyVerificationTests: XCTestCase {
         XCTAssertTrue(current.deniesKnownKey(f.host))
     }
 
+    func testTransportReviewShowsRetainedDenyAllWithoutInventingSignatureRestrictions() async throws {
+        let f = try await fixture(), document = try f.saved.document()
+        let trust = try XCTUnwrap(document.hostTrust.first { $0.id == "jump-trust" })
+        let retained = try WorkspaceHostAlgorithmPolicy(transport: .init(
+            keyExchangeAlgorithms: ["ecdh-sha2-nistp384"], ciphers: [], macs: ["hmac-sha2-512-etm@openssh.com"]))
+        let shown = try WorkspaceHostAlgorithmPresentation(document: document, trustID: trust.id,
+            historicalPolicies: [trust.canonicalTrustScope: retained])
+        XCTAssertTrue(shown.isVisible)
+        XCTAssertTrue(shown.showsEffective)
+        XCTAssertTrue(shown.historicalRestrictionsApply)
+        XCTAssertFalse(shown.aliasesRestrict)
+        XCTAssertFalse(shown.effective.isSignatureConstrained)
+        XCTAssertEqual(WorkspaceHostAlgorithmPresentation.description(shown.imported.transport.ciphers), "No additional restriction")
+        XCTAssertEqual(WorkspaceHostAlgorithmPresentation.description(shown.effective.transport.ciphers), "None allowed")
+        XCTAssertEqual(WorkspaceHostAlgorithmPresentation.description(shown.effective.transport.keyExchangeAlgorithms), "ecdh-sha2-nistp384")
+        XCTAssertEqual(WorkspaceHostAlgorithmPresentation.description(shown.effective.transport.macs), "hmac-sha2-512-etm@openssh.com")
+        let other = try WorkspaceHostAlgorithmPresentation(document: document, trustID: "target-trust",
+            historicalPolicies: [trust.canonicalTrustScope: retained])
+        XCTAssertFalse(other.isVisible)
+    }
+
+    func testTransportReviewShowsSameHostAliasIntersectionInImportedOrder() async throws {
+        let f = try await fixture(), original = try f.saved.document()
+        var root = try JSONSerialization.jsonObject(with: original.raw) as! [String: Any]
+        var workspace = root["workspace"] as! [String: Any]
+        var trusts = workspace["host_trust"] as! [[String: Any]]
+        let index = try XCTUnwrap(trusts.firstIndex { $0["id"] as? String == "jump-trust" })
+        trusts[index]["ciphers"] = ["aes128-ctr", "aes256-ctr"]
+        var alias = trusts[index]
+        alias["id"] = "jump-policy-alias"; alias["ciphers"] = ["aes256-ctr"]
+        trusts.append(alias); workspace["host_trust"] = trusts; root["workspace"] = workspace
+        let document = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root, options: [.sortedKeys]))
+        let shown = try WorkspaceHostAlgorithmPresentation(document: document, trustID: "jump-trust")
+        XCTAssertTrue(shown.isVisible)
+        XCTAssertTrue(shown.showsEffective)
+        XCTAssertTrue(shown.aliasesRestrict)
+        XCTAssertFalse(shown.historicalRestrictionsApply)
+        XCTAssertEqual(shown.imported.transport.ciphers, ["aes128-ctr", "aes256-ctr"])
+        XCTAssertEqual(shown.effective.transport.ciphers, ["aes256-ctr"])
+        XCTAssertNil(shown.effective.transport.keyExchangeAlgorithms)
+        XCTAssertNil(shown.effective.transport.macs)
+    }
+
     private func password(_ f: Fixture, probe: Bool) async throws -> WorkspaceSSHPasswordIdentity {
         try await f.broker.passwordIdentity(workspaceID: f.saved.id, expectedRevision: f.saved.revision, routeID: "hop",
             presentedHostKey: f.host, transitForRouteID: probe ? "destination" : nil, hostKeyProbe: probe ? f.probe : nil)

@@ -460,6 +460,9 @@ static int result(ftssh_session *s, int rc, int failure) {
  * the raw default for existing callers and first-use fingerprint probes. */
 #define FTSSH_RAW_HOST_ALGORITHMS "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256"
 #define FTSSH_CERT_HOST_ALGORITHMS "ssh-ed25519-cert-v01@openssh.com,ecdsa-sha2-nistp256-cert-v01@openssh.com,ecdsa-sha2-nistp384-cert-v01@openssh.com,ecdsa-sha2-nistp521-cert-v01@openssh.com,rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com"
+#define FTSSH_KEX_ALGORITHMS "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521"
+#define FTSSH_CIPHER_ALGORITHMS "aes256-ctr,aes128-ctr"
+#define FTSSH_MAC_ALGORITHMS "hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com"
 
 int ftssh_supports_host_certificates(void) {
 #if defined(LIBSSH2_FRANKENTERM_HOST_CERTIFICATE_VERSION) && LIBSSH2_FRANKENTERM_HOST_CERTIFICATE_VERSION == 1
@@ -531,6 +534,82 @@ int ftssh_set_host_key_algorithms(ftssh_session *s, const uint8_t *algorithms, s
     return libssh2_session_method_pref(s->ssh, LIBSSH2_METHOD_HOSTKEY, allowed) ? FTSSH_UNSUPPORTED : FTSSH_OK;
 }
 
+int ftssh_supports_transport_algorithm_policy(void) { return 1; }
+
+static int transport_algorithm_list(ftssh_session *s, const uint8_t *bytes, size_t length,
+    const char *const *qualified, size_t count, const int *methods, size_t method_count, char *output) {
+    if(!bytes || !length || length >= 1024 || memchr(bytes, 0, length)) return FTSSH_INVALID;
+    unsigned int selected = 0;
+    for(size_t start = 0; start < length;) {
+        size_t end = start;
+        while(end < length && bytes[end] != ',') ++end;
+        if(end == start || (end < length && end + 1 == length)) return FTSSH_INVALID;
+        size_t name;
+        for(name = 0; name < count; ++name) {
+            if(strlen(qualified[name]) == end - start &&
+               !memcmp(bytes + start, qualified[name], end - start)) break;
+        }
+        if(name == count) return FTSSH_UNSUPPORTED;
+        unsigned int bit = 1u << name;
+        if(selected & bit) return FTSSH_INVALID;
+        selected |= bit;
+        start = end + 1;
+    }
+    /* method_pref silently strips unsupported names. Prove every requested
+     * name is implemented in each direction before allowing it to publish. */
+    for(size_t method = 0; method < method_count; ++method) {
+        const char **supported = NULL;
+        int available_count = libssh2_session_supported_algs(s->ssh, methods[method], &supported);
+        if(available_count <= 0) return FTSSH_UNSUPPORTED;
+        unsigned int available = 0;
+        for(size_t name = 0; name < count; ++name) {
+            if(!(selected & (1u << name))) continue;
+            for(int index = 0; index < available_count; ++index) {
+                if(!strcmp(qualified[name], supported[index])) { available |= 1u << name; break; }
+            }
+        }
+        libssh2_free(s->ssh, supported);
+        if(available != selected) return FTSSH_UNSUPPORTED;
+    }
+    memcpy(output, bytes, length); output[length] = 0;
+    return FTSSH_OK;
+}
+
+int ftssh_set_transport_algorithms(ftssh_session *s,
+    const uint8_t *key_exchange_algorithms, size_t key_exchange_length,
+    const uint8_t *ciphers, size_t ciphers_length, const uint8_t *macs, size_t macs_length) {
+    int rc = check(s, HANDSHAKE); if(rc) return rc;
+    if(s->handshake_started) return FTSSH_STATE;
+    static const char *const exchanges[] = {
+        "curve25519-sha256", "curve25519-sha256@libssh.org", "ecdh-sha2-nistp256",
+        "ecdh-sha2-nistp384", "ecdh-sha2-nistp521"
+    };
+    static const char *const encryptions[] = {"aes256-ctr", "aes128-ctr"};
+    static const char *const authenticators[] = {
+        "hmac-sha2-256-etm@openssh.com", "hmac-sha2-512-etm@openssh.com"
+    };
+    static const int exchange_methods[] = {LIBSSH2_METHOD_KEX};
+    static const int encryption_methods[] = {LIBSSH2_METHOD_CRYPT_CS, LIBSSH2_METHOD_CRYPT_SC};
+    static const int authentication_methods[] = {LIBSSH2_METHOD_MAC_CS, LIBSSH2_METHOD_MAC_SC};
+    char exchange[1024], encryption[1024], authentication[1024];
+    rc = transport_algorithm_list(s, key_exchange_algorithms, key_exchange_length, exchanges, 5,
+        exchange_methods, 1, exchange); if(rc) return rc;
+    rc = transport_algorithm_list(s, ciphers, ciphers_length, encryptions, 2,
+        encryption_methods, 2, encryption); if(rc) return rc;
+    rc = transport_algorithm_list(s, macs, macs_length, authenticators, 2,
+        authentication_methods, 2, authentication); if(rc) return rc;
+    const struct { int method; const char *allowed; } policies[] = {
+        {LIBSSH2_METHOD_KEX, exchange},
+        {LIBSSH2_METHOD_CRYPT_CS, encryption}, {LIBSSH2_METHOD_CRYPT_SC, encryption},
+        {LIBSSH2_METHOD_MAC_CS, authentication}, {LIBSSH2_METHOD_MAC_SC, authentication}
+    };
+    for(size_t index = 0; index < sizeof(policies) / sizeof(policies[0]); ++index) {
+        rc = libssh2_session_method_pref(s->ssh, policies[index].method, policies[index].allowed);
+        if(rc) return fail(s, rc == LIBSSH2_ERROR_ALLOC ? FTSSH_LIMIT : FTSSH_UNSUPPORTED);
+    }
+    return FTSSH_OK;
+}
+
 int ftssh_create(int fd, size_t maximum, ftssh_session **out) {
     if(!out) return FTSSH_INVALID;
     *out = NULL;
@@ -567,12 +646,11 @@ int ftssh_create(int fd, size_t maximum, ftssh_session **out) {
     libssh2_session_callback_set2(s->ssh, LIBSSH2_CALLBACK_RECV, (libssh2_cb_generic *)socket_receive);
     libssh2_session_callback_set2(s->ssh, LIBSSH2_CALLBACK_DISCONNECT, (libssh2_cb_generic *)socket_disconnected);
     const struct { int method; const char *allowed; } policies[] = {
-        {LIBSSH2_METHOD_KEX, "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521"},
+        {LIBSSH2_METHOD_KEX, FTSSH_KEX_ALGORITHMS},
         {LIBSSH2_METHOD_HOSTKEY, FTSSH_RAW_HOST_ALGORITHMS},
         {LIBSSH2_METHOD_SIGN_ALGO, "rsa-sha2-512,rsa-sha2-256"},
-        {LIBSSH2_METHOD_CRYPT_CS, "aes256-ctr,aes128-ctr"}, {LIBSSH2_METHOD_CRYPT_SC, "aes256-ctr,aes128-ctr"},
-        {LIBSSH2_METHOD_MAC_CS, "hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com"},
-        {LIBSSH2_METHOD_MAC_SC, "hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com"},
+        {LIBSSH2_METHOD_CRYPT_CS, FTSSH_CIPHER_ALGORITHMS}, {LIBSSH2_METHOD_CRYPT_SC, FTSSH_CIPHER_ALGORITHMS},
+        {LIBSSH2_METHOD_MAC_CS, FTSSH_MAC_ALGORITHMS}, {LIBSSH2_METHOD_MAC_SC, FTSSH_MAC_ALGORITHMS},
         {LIBSSH2_METHOD_COMP_CS, "none"}, {LIBSSH2_METHOD_COMP_SC, "none"}
     };
     for(size_t i = 0; i < sizeof(policies)/sizeof(policies[0]); i++) {

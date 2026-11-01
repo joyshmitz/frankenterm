@@ -472,6 +472,19 @@ public actor NativeSSHSession {
     public nonisolated static var supportsHostAlgorithmPolicy: Bool {
         ftssh_supports_host_algorithm_policy() == 1
     }
+    public nonisolated static var supportsTransportAlgorithmPolicy: Bool {
+        ftssh_supports_transport_algorithm_policy() == 1
+    }
+    /// The existing qualified defaults, in preference order. A workspace may
+    /// narrow or reorder these lists, but cannot add another transport profile.
+    public nonisolated static let supportedKeyExchangeAlgorithms = [
+        "curve25519-sha256", "curve25519-sha256@libssh.org", "ecdh-sha2-nistp256",
+        "ecdh-sha2-nistp384", "ecdh-sha2-nistp521"
+    ]
+    public nonisolated static let supportedCiphers = ["aes256-ctr", "aes128-ctr"]
+    public nonisolated static let supportedMACs = [
+        "hmac-sha2-256-etm@openssh.com", "hmac-sha2-512-etm@openssh.com"
+    ]
     public nonisolated let transportID: UUID
     /// This session creates at most one shell/command or dedicated SFTP channel.
     /// A replacement connection always gets a new channel identity.
@@ -645,6 +658,35 @@ public actor NativeSSHSession {
         case .certificatesAndRawKeys: value = Int32(FTSSH_HOST_MIXED)
         }
         try requireOK(ftssh_set_host_key_policy(native.pointer, value))
+    }
+
+    /// Install all transport restrictions before this exact session's first
+    /// handshake. Cipher and MAC order applies independently in both directions;
+    /// callers must verify the actual five negotiated names in NativeSSHPeer.
+    /// A forwarded child has its own fresh policy. A rejected list never changes
+    /// another list, and cannot expand the existing qualified native profile.
+    public func setTransportAlgorithms(keyExchangeAlgorithms: [String], ciphers: [String], macs: [String]) throws {
+        try Task.checkCancellation()
+        guard phase == .fresh, operation == nil else { throw NativeSSHError.invalidInput }
+        func encoded(_ values: [String], qualified: [String]) throws -> Data {
+            guard !values.isEmpty, values.count <= qualified.count,
+                  Set(values).count == values.count,
+                  values.allSatisfy({ qualified.contains($0) }) else { throw NativeSSHError.invalidInput }
+            return Data(values.joined(separator: ",").utf8)
+        }
+        let exchange = try encoded(keyExchangeAlgorithms, qualified: Self.supportedKeyExchangeAlgorithms)
+        let encryption = try encoded(ciphers, qualified: Self.supportedCiphers)
+        let authentication = try encoded(macs, qualified: Self.supportedMACs)
+        try exchange.withUnsafeBytes { exchange in
+            try encryption.withUnsafeBytes { encryption in
+                try authentication.withUnsafeBytes { authentication in
+                    try requireOK(ftssh_set_transport_algorithms(native.pointer,
+                        exchange.bindMemory(to: UInt8.self).baseAddress, exchange.count,
+                        encryption.bindMemory(to: UInt8.self).baseAddress, encryption.count,
+                        authentication.bindMemory(to: UInt8.self).baseAddress, authentication.count))
+                }
+            }
+        }
     }
 
     public func authenticate(using authority: any NativeSSHAuthentication, timeout: Duration = .seconds(60)) async throws -> NativeSSHPeer {

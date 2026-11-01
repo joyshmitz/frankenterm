@@ -211,7 +211,7 @@ public actor WorkspaceNativeSSHConnection {
         do {
             try await broker.validateForeground(foreground)
             try Task.checkCancellation()
-            try await session.setHostKeyPolicy(negotiation.profile, allowedAlgorithms: negotiation.algorithms)
+            try await WorkspaceNativeSSHAuthentication.configure(session, negotiation: negotiation)
             let authenticated = try await authenticate(session: session, choice: authentication,
                 route: route, workspaceID: workspaceID, revision: expectedRevision, broker: broker,
                 passwordPrompter: passwordPrompter, keyboardInteractivePrompter: keyboardInteractivePrompter,
@@ -345,7 +345,7 @@ public actor WorkspaceNativeSSHConnection {
                                                                            networkLifetime: lease)
                         }
                         guard let owner = session, owner.endpoint == endpoint else { throw SSHAuthenticationError.denied }
-                        try await owner.setHostKeyPolicy(negotiation.profile, allowedAlgorithms: negotiation.algorithms)
+                        try await WorkspaceNativeSSHAuthentication.configure(owner, negotiation: negotiation)
                         pending = (index, plan, attempt)
                         if attempt.selection.authentication.requiresForegroundPrompt { usedPrompt = true }
                         let authenticated = try await authenticate(session: owner, choice: attempt.selection.authentication,

@@ -80,6 +80,20 @@ int ftssh_set_host_key_policy(ftssh_session *session, int policy);
  * The caller still verifies the negotiated method and mutable trust policy. */
 int ftssh_supports_host_algorithm_policy(void);
 int ftssh_set_host_key_algorithms(ftssh_session *session, const uint8_t *algorithms, size_t length);
+/* Exact nonempty ordered subsets of the existing qualified transport profile:
+ * five Curve25519/ECDH methods, AES-256/128-CTR, and SHA-256/512 encrypt-then-MAC.
+ * Each CSV is at most 1023 bytes. Validate all names, duplicates and linked
+ * backend support before changing any preference; ciphers and MACs apply to
+ * BOTH directions. No wildcards, +/-/^ expressions or new algorithms.
+ * Only before the first handshake call. Malformed/unsupported input preserves
+ * the previous profile; an allocation/publication failure terminally fails the
+ * owner, so a partially installed policy can never enter key exchange.
+ * Negotiated evidence must still pass the current authorization policy. */
+int ftssh_supports_transport_algorithm_policy(void);
+int ftssh_set_transport_algorithms(ftssh_session *session,
+    const uint8_t *key_exchange_algorithms, size_t key_exchange_length,
+    const uint8_t *ciphers, size_t ciphers_length,
+    const uint8_t *macs, size_t macs_length);
 /* FTSSH_NEGOTIATION: the server answered, and no exchange both accept was
  * agreed. A transport that failed or closed first, with no disconnect message
  * from the server, is FTSSH_IO. */

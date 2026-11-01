@@ -309,10 +309,43 @@ The supported source form is an explicit ordered list of algorithm names.
 Default-dependent `+`/`-` expressions and wildcard restrictions remain required
 unresolved settings because a passive export cannot infer the source OpenSSH
 version's defaults. Valid `^` preference lists remain visibly inactive instead
-of creating guessed defaults. KRL files and additional freshness requirements
+of creating guessed defaults. OpenSSH key lists and unsigned version-one KRLs
+use the separate host-revocation capability; additional freshness requirements
 remain unsupported. See the native SSH package's
 [algorithm contract](FrankenTermSSH/README.md#mandatory-host-signature-algorithms)
 for the exact wire fields and enforcement boundaries.
+
+### Mandatory SSH transport policy
+
+Literal `KexAlgorithms`, `Ciphers` and `MACs` restrictions now travel from both
+desktop export paths through workspace review, encrypted transfer and durable
+phone policy. The phone selects a supported ordered subset before each SSH
+exchange, independently for every bastion and the final destination. It checks
+the actual exchanged key-agreement method and both traffic directions' cipher
+and MAC before a public-key offer, signing request, password prompt or MFA
+response. Read-only host-key probes use the same restrictions.
+
+The fields `kex_algorithms`, `ciphers` and `macs` belong to each `host_trust`
+record and require `ssh_transport_algorithm_policy_v1`. Omitting a field adds
+no restriction; an empty list deliberately blocks that dimension. Selecting a
+subset of a fleet retains other aliases' restrictions on the same canonical
+host scope. Catalog version 12 retains their intersection with every earlier
+accepted policy. Removing a field, widening a list, renaming an alias or
+restoring an older export cannot restore an algorithm already excluded on this
+phone. Existing authentication grants retain the exact negotiated evidence for
+later policy revalidation.
+
+The iPhone shows imported and effective restrictions in import, host and route
+review, including historical restrictions and an explicit **None allowed**
+state. The Mac export preview shows the effective lists for the selected
+routes. Valid but unavailable algorithms remain visible; an empty intersection
+with the native profile makes the route unavailable before authentication.
+The current profile includes five Curve25519/ECDH key-exchange methods,
+AES-256/128-CTR, and SHA-256/512 encrypt-then-MAC. These restrictions do not add
+new cryptographic algorithms. Default-dependent expressions and unknown source
+names remain required unresolved findings. See the
+[native transport contract](FrankenTermSSH/README.md#mandatory-ssh-transport-algorithms)
+for exact names, bounds and validation coverage.
 
 ## Phone-generated SSH identities
 

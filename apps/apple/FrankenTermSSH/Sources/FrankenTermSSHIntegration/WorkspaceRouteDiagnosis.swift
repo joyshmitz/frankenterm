@@ -282,7 +282,7 @@ public enum WorkspaceRouteProbe {
         let session: NativeSSHSession, lease: WorkspaceNetworkLease
         let algorithms: WorkspaceHostAlgorithmPolicy
         let revocations: [WorkspaceHostRevocationSource]
-        let negotiation: (profile: NativeSSHHostKeyPolicy, algorithms: [String])
+        let negotiation: WorkspaceNativeSSHAuthentication.PeerNegotiation
         do {
             algorithms = try document.hostAlgorithmPolicy(forTrustID: route.trustID)
             revocations = try document.hostRevocationSources(forTrustID: route.trustID)
@@ -303,13 +303,13 @@ public enum WorkspaceRouteProbe {
                                         document: WorkspaceDocument,
                                         algorithmPolicy: WorkspaceHostAlgorithmPolicy,
                                         revocationSources: [WorkspaceHostRevocationSource],
-                                        negotiation: (profile: NativeSSHHostKeyPolicy, algorithms: [String]),
+                                        negotiation: WorkspaceNativeSSHAuthentication.PeerNegotiation,
                                         timeout: Duration) async -> Result {
         let network = WorkspaceRouteNetwork(host: route.host)
         let witness = PeerWitness(transportID: session.transportID)
         var failure: (any Error)?
         do {
-            try await session.setHostKeyPolicy(negotiation.profile, allowedAlgorithms: negotiation.algorithms)
+            try await WorkspaceNativeSSHAuthentication.configure(session, negotiation: negotiation)
             _ = try await session.authenticate(using: witness, timeout: timeout)
         } catch { failure = error }
         await session.close()
@@ -323,6 +323,7 @@ public enum WorkspaceRouteProbe {
                 presented: identity.key, hostCertificate: identity.certificate,
                 rawHostIdentity: identity.rawIdentity,
                 negotiatedHostSignature: peer.hostSignature,
+                negotiatedTransport: WorkspaceNativeSSHAuthentication.transportAlgorithms(for: peer),
                 reviewedTrustIDs: Set(document.hostTrust.map(\.id)),
                 support: WorkspaceNativeSSHAuthentication.routeSupport,
                 hostAlgorithmPoliciesByTrustScope: [trust.canonicalTrustScope: algorithmPolicy],

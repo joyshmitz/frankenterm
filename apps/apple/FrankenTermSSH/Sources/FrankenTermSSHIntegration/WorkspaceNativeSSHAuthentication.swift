@@ -58,6 +58,7 @@ public actor WorkspaceNativeSSHPasswordAuthentication: NativeSSHPasswordAuthenti
                 routeID: routeID, presentedHostKey: host.key, hostCertificate: host.certificate,
                 rawHostIdentity: host.rawIdentity,
                 negotiatedHostSignature: peer.hostSignature,
+                negotiatedTransport: WorkspaceNativeSSHAuthentication.transportAlgorithms(for: peer),
                 transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
             try checkCurrent()
             try validateRoute(selected.authorization)
@@ -205,6 +206,7 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
                 expectedRevision: revision, routeID: routeID, presentedHostKey: host.key, hostCertificate: host.certificate,
                 rawHostIdentity: host.rawIdentity,
                 negotiatedHostSignature: peer.hostSignature,
+                negotiatedTransport: WorkspaceNativeSSHAuthentication.transportAlgorithms(for: peer),
                 transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
             do {
                 try checkCurrent()
@@ -371,12 +373,15 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
         var capabilities: Set<String> = [WorkspaceDocument.userCertificateCapability, WorkspaceDocument.hostRevocationCapability]
         if NativeSSHSession.supportsHostCertificates { capabilities.insert(WorkspaceDocument.hostCertificateCapability) }
         if NativeSSHSession.supportsHostAlgorithmPolicy { capabilities.insert(WorkspaceDocument.hostAlgorithmPolicyCapability) }
+        if NativeSSHSession.supportsTransportAlgorithmPolicy { capabilities.insert(WorkspaceDocument.transportAlgorithmPolicyCapability) }
         let profile: NativeSSHHostKeyPolicy = NativeSSHSession.supportsHostCertificates ? .certificatesAndRawKeys : .rawKeys
         return .init(routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey, .password, .keyboardInteractive],
             credentialAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"],
             hostKeyAlgorithms: SSHHostCertificate.supportedAuthorityAlgorithms.union(
                 NativeSSHSession.supportsHostCertificates ? SSHHostCertificate.supportedAlgorithms : []),
-            capabilities: capabilities, maximumJumpHops: 3, hostSignatureAlgorithms: Set(profile.algorithms))
+            capabilities: capabilities, maximumJumpHops: 3, hostSignatureAlgorithms: Set(profile.algorithms),
+            keyExchangeAlgorithms: Set(NativeSSHSession.supportedKeyExchangeAlgorithms),
+            ciphers: Set(NativeSSHSession.supportedCiphers), macs: Set(NativeSSHSession.supportedMACs))
     }()
 
     fileprivate final class Retirement: @unchecked Sendable {
@@ -457,6 +462,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
                 routeID: routeID, credentialID: credentialID, presentedHostKey: host.key, hostCertificate: host.certificate,
                 rawHostIdentity: host.rawIdentity,
                 negotiatedHostSignature: peer.hostSignature,
+                negotiatedTransport: Self.transportAlgorithms(for: peer),
                 transitForRouteID: transitForRouteID,
                 hostKeyProbe: hostKeyProbe)
             try await broker.validateForeground(foreground)
@@ -465,6 +471,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
                 routeID: routeID, credentialID: credentialID, presentedHostKey: host.key, hostCertificate: host.certificate,
                 rawHostIdentity: host.rawIdentity,
                 negotiatedHostSignature: peer.hostSignature,
+                negotiatedTransport: Self.transportAlgorithms(for: peer),
                 transportID: transportID,
                 transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
             try await broker.validateForeground(foreground)
@@ -512,6 +519,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
                 hostCertificate: selected.authorization.hostCertificate,
                 rawHostIdentity: selected.authorization.rawHostIdentity,
                 negotiatedHostSignature: selected.authorization.negotiatedHostSignature,
+                negotiatedTransport: selected.authorization.negotiatedTransport,
                 transportID: transportID, sessionIdentifier: challenge.sessionIdentifier, publicBlob: selected.authenticationBlob,
                 signatureAlgorithm: challenge.algorithm,
                 transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
@@ -632,11 +640,17 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
         return trust.pins.isEmpty ? .certificates : .certificatesAndRawKeys
     }
 
+    struct PeerNegotiation: Sendable {
+        let profile: NativeSSHHostKeyPolicy
+        let algorithms: [String]
+        let transport: (keyExchangeAlgorithms: [String], ciphers: [String], macs: [String])?
+    }
+
     /// Exact negotiated names are selected before KEX. Historical constraints
     /// come from WorkspaceStore; a route's current JSON alone cannot relax them.
     static func hostKeyNegotiation(for route: WorkspaceDocument.Route, document: WorkspaceDocument,
                                    algorithmPolicy: WorkspaceHostAlgorithmPolicy)
-        throws -> (profile: NativeSSHHostKeyPolicy, algorithms: [String]) {
+        throws -> PeerNegotiation {
         guard let trust = document.hostTrust.first(where: { $0.id == route.trustID }) else {
             throw SSHAuthenticationError.denied
         }
@@ -654,7 +668,29 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
         }
         let allowed = algorithmPolicy.filterHostKeyAlgorithms(profile.algorithms)
         guard !allowed.isEmpty else { throw SSHAuthenticationError.denied }
-        return (profile, allowed)
+        let transport = algorithmPolicy.transport
+        guard transport.isConstrained else { return .init(profile: profile, algorithms: allowed, transport: nil) }
+        guard NativeSSHSession.supportsTransportAlgorithmPolicy else { throw SSHAuthenticationError.unavailable }
+        let exchanges = transport.filterKeyExchangeAlgorithms(NativeSSHSession.supportedKeyExchangeAlgorithms)
+        let ciphers = transport.filterCiphers(NativeSSHSession.supportedCiphers)
+        let macs = transport.filterMACs(NativeSSHSession.supportedMACs)
+        // Run before any destination or transit socket is opened. Unsupported
+        // imported names cannot broaden the native profile or start a retry.
+        guard !exchanges.isEmpty, !ciphers.isEmpty, !macs.isEmpty else { throw SSHAuthenticationError.denied }
+        return .init(profile: profile, algorithms: allowed, transport: (exchanges, ciphers, macs))
+    }
+
+    static func configure(_ session: NativeSSHSession, negotiation: PeerNegotiation) async throws {
+        try await session.setHostKeyPolicy(negotiation.profile, allowedAlgorithms: negotiation.algorithms)
+        if let transport = negotiation.transport {
+            try await session.setTransportAlgorithms(keyExchangeAlgorithms: transport.keyExchangeAlgorithms,
+                ciphers: transport.ciphers, macs: transport.macs)
+        }
+    }
+
+    static func transportAlgorithms(for peer: NativeSSHPeer) -> SSHTransportAlgorithms {
+        .init(keyExchange: peer.keyExchange, outboundCipher: peer.outboundCipher,
+            inboundCipher: peer.inboundCipher, outboundMAC: peer.outboundMAC, inboundMAC: peer.inboundMAC)
     }
 
     /// Authentication and read-only route diagnosis apply the same negotiated
@@ -664,10 +700,9 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
     /// Actors cache this immutable parse only for the exact same exchanged peer;
     /// the broker continues to revalidate mutable policy at every trust boundary.
     static func hostIdentity(for peer: NativeSSHPeer) throws -> HostIdentity {
-        let exchanges: Set<String> = ["curve25519-sha256", "curve25519-sha256@libssh.org",
-            "ecdh-sha2-nistp256", "ecdh-sha2-nistp384", "ecdh-sha2-nistp521"]
-        let ciphers: Set<String> = ["aes256-ctr", "aes128-ctr"]
-        let macs: Set<String> = ["hmac-sha2-256-etm@openssh.com", "hmac-sha2-512-etm@openssh.com"]
+        let exchanges = Set(NativeSSHSession.supportedKeyExchangeAlgorithms)
+        let ciphers = Set(NativeSSHSession.supportedCiphers)
+        let macs = Set(NativeSSHSession.supportedMACs)
         guard exchanges.contains(peer.keyExchange), ciphers.contains(peer.outboundCipher), ciphers.contains(peer.inboundCipher),
               macs.contains(peer.outboundMAC), macs.contains(peer.inboundMAC),
               peer.outboundCompression == "none", peer.inboundCompression == "none" else {

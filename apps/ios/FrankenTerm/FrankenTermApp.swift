@@ -3789,8 +3789,12 @@ private struct WorkspaceHostAlgorithmPolicyView: View {
                     Text("Other trust records for this host also restrict the algorithms.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                Text("CA signature restrictions apply to host certificates. Only algorithms supported by this phone can be used.")
+                Text("Only algorithms supported by this phone can be used. Cipher and message authentication restrictions apply to both traffic directions, independently at each SSH hop.")
                     .font(.caption).foregroundStyle(.secondary)
+                if policy.imported.caSignatureAlgorithms != nil || policy.effective.caSignatureAlgorithms != nil {
+                    Text("CA signature restrictions apply to the issuer of a host certificate.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -3798,6 +3802,9 @@ private struct WorkspaceHostAlgorithmPolicyView: View {
     @ViewBuilder private func dimensions(_ value: WorkspaceHostAlgorithmPolicy, prefix: String) -> some View {
         dimension("Host signature algorithms", algorithms: value.hostKeyAlgorithms, id: prefix + ".host")
         dimension("CA signature algorithms", algorithms: value.caSignatureAlgorithms, id: prefix + ".ca")
+        dimension("Key exchange algorithms", algorithms: value.transport.keyExchangeAlgorithms, id: prefix + ".kex")
+        dimension("Ciphers", algorithms: value.transport.ciphers, id: prefix + ".ciphers")
+        dimension("Message authentication algorithms", algorithms: value.transport.macs, id: prefix + ".macs")
     }
 
     private func dimension(_ title: String, algorithms: [String]?, id: String) -> some View {
@@ -3846,7 +3853,8 @@ private struct ImportHostPolicyReview: View {
                             Text("\(trust.revokedKeys.count) explicitly revoked host identities remain blocked.").font(.caption)
                         }
                         ForEach(trust.requiredPolicyRequirements.subtracting([WorkspaceDocument.hostCertificateCapability,
-                            WorkspaceDocument.hostAlgorithmPolicyCapability, WorkspaceDocument.hostRevocationCapability]).sorted(), id: \.self) { requirement in
+                            WorkspaceDocument.hostAlgorithmPolicyCapability, WorkspaceDocument.hostRevocationCapability,
+                            WorkspaceDocument.transportAlgorithmPolicyCapability]).sorted(), id: \.self) { requirement in
                             Text(verbatim: "Required policy: \(requirement)").font(.caption)
                         }
                     }
