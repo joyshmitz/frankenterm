@@ -20731,6 +20731,12 @@ impl BrokerAdoptedPaneV1 {
     #[cfg(test)]
     fn terminate_and_wait_for_test(&mut self) {
         let _ = self.child.kill();
+        // A killed child still closes its terminal as it exits, and on macOS
+        // that last close waits until the master reads what the child wrote.
+        // Nothing reads it here, so close the master first, as a release does.
+        drop(self.proxy_reader.take());
+        drop(self.proxy_writer.take());
+        drop(self.broker_master.take());
         let _ = self.child.wait();
     }
 
