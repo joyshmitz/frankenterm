@@ -61,7 +61,9 @@ def sign_bundle(root: pathlib.Path, identity: str) -> None:
 def notarization_paths(root: pathlib.Path):
     archive = root.with_suffix('.notarization.zip')
     receipt = root.with_suffix('.notarization.json')
-    if archive.exists() or receipt.exists():
+    # exists() follows symlinks, so a dangling link also needs an explicit
+    # refusal before signing can change the previously assembled bundle.
+    if any(path.exists() or path.is_symlink() for path in (archive, receipt)):
         raise ValueError('retain prior notarization evidence; use a fresh output directory')
     return archive, receipt
 
