@@ -14679,19 +14679,31 @@ mod tests {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let n = std::sync::Arc::new(notify::Notify::new());
-            let n1 = n.clone();
-            let n2 = n.clone();
-
-            let h1 = task::spawn(async move {
-                n1.notified().await;
-                1
-            });
-            let h2 = task::spawn(async move {
-                n2.notified().await;
-                2
-            });
-
-            sleep(Duration::from_millis(5)).await;
+            let spawn_waiter = |value| {
+                let notify = std::sync::Arc::clone(&n);
+                let (ready_tx, ready_rx) = oneshot::channel();
+                let handle = task::spawn(async move {
+                    let mut notified = std::pin::pin!(notify.notified());
+                    // Broadcasts only wake registered waiters. Poll the real
+                    // future before acknowledging readiness; elapsed time is
+                    // not evidence that a spawned task has been scheduled.
+                    std::future::poll_fn(|cx| {
+                        assert!(std::future::Future::poll(notified.as_mut(), cx).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    oneshot_send(ready_tx, ()).expect("parent awaits registration");
+                    notified.await;
+                    value
+                });
+                (handle, ready_rx)
+            };
+            let (h1, ready1) = spawn_waiter(1);
+            let (h2, ready2) = spawn_waiter(2);
+            oneshot_recv(ready1).await.expect("first waiter registered");
+            oneshot_recv(ready2)
+                .await
+                .expect("second waiter registered");
             n.notify_waiters();
 
             let r1 = h1.await.expect("h1");
