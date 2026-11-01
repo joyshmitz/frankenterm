@@ -2323,7 +2323,7 @@ fn parse_host_revocations(bytes: &[u8]) -> Option<ParsedHostRevocation> {
                 .filter(|word| !word.is_empty());
             let algorithm = std::str::from_utf8(words.next()?).ok()?;
             let base64 = words.next()?;
-            if base64.len() > 4 * ((MAX_CERTIFICATE_BLOB_BYTES + 2) / 3) {
+            if base64.len() > 4 * MAX_CERTIFICATE_BLOB_BYTES.div_ceil(3) {
                 return None;
             }
             let blob = STANDARD.decode(base64).ok()?;
